@@ -74,15 +74,28 @@ export default function HistoryPage() {
   async function showDiff() {
     const ids = Array.from(compareIds);
     if (ids.length !== 2) return;
-    const [a, b] = await Promise.all(
-      ids.map(id => fetch(`/api/history?id=${id}`).then(r => r.json()))
-    );
-    setDiffData({
-      left: safeParseJson(a.response_body),
-      right: safeParseJson(b.response_body),
-      leftLabel: `${a.method} ${a.path} (${new Date(a.created_at).toLocaleString()})`,
-      rightLabel: `${b.method} ${b.path} (${new Date(b.created_at).toLocaleString()})`,
-    });
+    try {
+      const responses = await Promise.all(
+        ids.map(async (id) => {
+          const res = await fetch(`/api/history?id=${encodeURIComponent(id)}`);
+          if (!res.ok) throw new Error(`Failed to fetch history entry ${id}: ${res.status}`);
+          return res.json();
+        })
+      );
+      const [a, b] = responses;
+      if (!a || !b) {
+        alert('Could not load one or both history entries.');
+        return;
+      }
+      setDiffData({
+        left: safeParseJson(a.response_body),
+        right: safeParseJson(b.response_body),
+        leftLabel: `${a.method} ${a.path} (${new Date(a.created_at).toLocaleString()})`,
+        rightLabel: `${b.method} ${b.path} (${new Date(b.created_at).toLocaleString()})`,
+      });
+    } catch (err) {
+      alert(`Compare failed: ${err instanceof Error ? err.message : 'Unknown error'}`);
+    }
   }
 
   return (
@@ -186,7 +199,7 @@ export default function HistoryPage() {
 
           {/* Diff viewer */}
           {diffData && (
-            <div className="mt-6 bg-panel border border-border rounded-lg overflow-hidden">
+            <div className="mt-6 bg-panel border border-border rounded-lg overflow-hidden" ref={el => el?.scrollIntoView({ behavior: 'smooth', block: 'start' })}>
               <div className="p-3 border-b border-border flex items-center justify-between">
                 <span className="text-sm font-medium text-text-primary">Response Comparison</span>
                 <button onClick={() => { setDiffData(null); setCompareIds(new Set()); }}
