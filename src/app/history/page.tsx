@@ -291,37 +291,42 @@ function DiffViewer({ left, right, leftLabel, rightLabel, onClose }: {
   left: unknown; right: unknown; leftLabel: string; rightLabel: string; onClose: () => void;
 }) {
   const diff = computeDiff(left, right);
+  const [expanded, setExpanded] = useState(false);
 
   return (
     <div className="mb-6 bg-panel border border-border rounded-lg overflow-hidden">
-      <div className="p-3 border-b border-border flex items-center justify-between">
+      <div className="p-3 flex items-center justify-between cursor-pointer hover:bg-surface/50 transition-colors"
+        onClick={() => setExpanded(!expanded)}>
         <div className="flex items-center gap-3">
+          <svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor"
+            className={`text-text-muted transition-transform ${expanded ? 'rotate-90' : ''}`}>
+            <path d="M6.22 3.22a.75.75 0 0 1 1.06 0l4.25 4.25a.75.75 0 0 1 0 1.06l-4.25 4.25a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042L9.94 8 6.22 4.28a.75.75 0 0 1 0-1.06Z" />
+          </svg>
           <span className="text-sm font-medium text-text-primary">Response Comparison</span>
           {diff.identical ? (
             <span className="text-xs px-2 py-0.5 rounded bg-success/20 text-success font-medium">Identical</span>
           ) : (
             <span className="text-xs px-2 py-0.5 rounded bg-warning/20 text-warning font-medium">Differences found</span>
           )}
+          <span className="text-xs text-text-muted">{diff.summary}</span>
         </div>
-        <button onClick={onClose} className="text-xs text-text-muted hover:text-text-primary">✕ Close</button>
+        <button onClick={e => { e.stopPropagation(); onClose(); }}
+          className="text-xs text-text-muted hover:text-text-primary">✕ Close</button>
       </div>
 
-      {/* Summary */}
-      <div className="px-4 py-2 border-b border-border text-sm text-text-secondary">
-        {diff.summary}
-      </div>
+      {expanded && (
+        <>
+          {/* Labels */}
+          <div className="flex border-t border-b border-border">
+            <div className="flex-1 px-3 py-1.5 bg-surface text-xs text-text-secondary font-mono truncate border-r border-border">{leftLabel}</div>
+            <div className="flex-1 px-3 py-1.5 bg-surface text-xs text-text-secondary font-mono truncate">{rightLabel}</div>
+          </div>
 
-      {/* Labels */}
-      <div className="flex border-b border-border">
-        <div className="flex-1 px-3 py-1.5 bg-surface text-xs text-text-secondary font-mono truncate border-r border-border">{leftLabel}</div>
-        <div className="flex-1 px-3 py-1.5 bg-surface text-xs text-text-secondary font-mono truncate">{rightLabel}</div>
-      </div>
-
-      {diff.identical ? (
-        <div className="p-6 text-center text-text-muted text-sm">
-          ✓ Both responses are exactly the same.
-        </div>
-      ) : diff.entries.length > 0 ? (
+          {diff.identical ? (
+            <div className="p-6 text-center text-text-muted text-sm">
+              ✓ Both responses are exactly the same.
+            </div>
+          ) : diff.entries.length > 0 ? (
         /* Key-level diff for objects */
         <div className="max-h-96 overflow-auto">
           {diff.entries.map(entry => (
@@ -369,6 +374,8 @@ function DiffViewer({ left, right, leftLabel, rightLabel, onClose }: {
             {typeof right === 'string' ? right : JSON.stringify(right, null, 2)}
           </pre>
         </div>
+      )}
+        </>
       )}
     </div>
   );
