@@ -199,27 +199,13 @@ export default function HistoryPage() {
 
           {/* Diff viewer */}
           {diffData && (
-            <div className="mt-6 bg-panel border border-border rounded-lg overflow-hidden" ref={el => el?.scrollIntoView({ behavior: 'smooth', block: 'start' })}>
-              <div className="p-3 border-b border-border flex items-center justify-between">
-                <span className="text-sm font-medium text-text-primary">Response Comparison</span>
-                <button onClick={() => { setDiffData(null); setCompareIds(new Set()); }}
-                  className="text-xs text-text-muted hover:text-text-primary">✕ Close</button>
-              </div>
-              <div className="flex">
-                <div className="flex-1 border-r border-border">
-                  <div className="px-3 py-2 bg-surface text-xs text-text-secondary font-mono truncate">{diffData.leftLabel}</div>
-                  <pre className="p-3 text-xs font-mono text-text-secondary whitespace-pre-wrap break-all max-h-96 overflow-auto">
-                    {typeof diffData.left === 'string' ? diffData.left : JSON.stringify(diffData.left, null, 2)}
-                  </pre>
-                </div>
-                <div className="flex-1">
-                  <div className="px-3 py-2 bg-surface text-xs text-text-secondary font-mono truncate">{diffData.rightLabel}</div>
-                  <pre className="p-3 text-xs font-mono text-text-secondary whitespace-pre-wrap break-all max-h-96 overflow-auto">
-                    {typeof diffData.right === 'string' ? diffData.right : JSON.stringify(diffData.right, null, 2)}
-                  </pre>
-                </div>
-              </div>
-            </div>
+            <DiffViewer
+              left={diffData.left}
+              right={diffData.right}
+              leftLabel={diffData.leftLabel}
+              rightLabel={diffData.rightLabel}
+              onClose={() => { setDiffData(null); setCompareIds(new Set()); }}
+            />
           )}
         </div>
       </div>
@@ -232,7 +218,170 @@ function safeParseJson(body: string | null | undefined): unknown {
   try {
     return JSON.parse(body);
   } catch {
-    // Truncated or invalid JSON — return as raw string
     return body;
   }
+}
+
+interface DiffEntry {
+  key: string;
+  status: 'same' | 'changed' | 'added' | 'removed';
+  left?: unknown;
+  right?: unknown;
+}
+
+function computeDiff(left: unknown, right: unknown): { identical: boolean; entries: DiffEntry[]; summary: string } {
+  const leftStr = JSON.stringify(left);
+  const rightStr = JSON.stringify(right);
+
+  if (leftStr === rightStr) {
+    return { identical: true, entries: [], summary: 'Responses are identical.' };
+  }
+
+  // Both are objects — do key-level diff
+  if (left && right && typeof left === 'object' && typeof right === 'object' && !Array.isArray(left) && !Array.isArray(right)) {
+    const l = left as Record<string, unknown>;
+    const r = right as Record<string, unknown>;
+    const allKeys = new Set([...Object.keys(l), ...Object.keys(r)]);
+    const entries: DiffEntry[] = [];
+    let changed = 0, added = 0, removed = 0;
+
+    for (const key of allKeys) {
+      const inLeft = key in l;
+      const inRight = key in r;
+      if (inLeft && inRight) {
+        if (JSON.stringify(l[key]) === JSON.stringify(r[key])) {
+          entries.push({ key, status: 'same', left: l[key], right: r[key] });
+        } else {
+          entries.push({ key, status: 'changed', left: l[key], right: r[key] });
+          changed++;
+        }
+      } else if (inLeft) {
+        entries.push({ key, status: 'removed', left: l[key] });
+        removed++;
+      } else {
+        entries.push({ key, status: 'added', right: r[key] });
+        added++;
+      }
+    }
+
+    // Sort: changed first, then added, removed, same
+    const order = { changed: 0, added: 1, removed: 2, same: 3 };
+    entries.sort((a, b) => order[a.status] - order[b.status]);
+
+    const parts: string[] = [];
+    if (changed > 0) parts.push(`${changed} changed`);
+    if (added > 0) parts.push(`${added} added`);
+    if (removed > 0) parts.push(`${removed} removed`);
+    const same = entries.filter(e => e.status === 'same').length;
+    if (same > 0) parts.push(`${same} unchanged`);
+
+    return { identical: false, entries, summary: parts.join(', ') };
+  }
+
+  // Both are arrays — compare counts and items
+  if (Array.isArray(left) && Array.isArray(right)) {
+    const summary = `Left: ${left.length} items, Right: ${right.length} items. ${left.length === right.length ? 'Same count but content differs.' : 'Different counts.'}`;
+    return { identical: false, entries: [], summary };
+  }
+
+  // Different types or primitives
+  return { identical: false, entries: [], summary: `Values differ. Left: ${typeof left}, Right: ${typeof right}` };
+}
+
+function DiffViewer({ left, right, leftLabel, rightLabel, onClose }: {
+  left: unknown; right: unknown; leftLabel: string; rightLabel: string; onClose: () => void;
+}) {
+  const diff = computeDiff(left, right);
+
+  return (
+    <div className="mt-6 bg-panel border border-border rounded-lg overflow-hidden" ref={el => el?.scrollIntoView({ behavior: 'smooth', block: 'start' })}>
+      <div className="p-3 border-b border-border flex items-center justify-between">
+        <div className="flex items-center gap-3">
+          <span className="text-sm font-medium text-text-primary">Response Comparison</span>
+          {diff.identical ? (
+            <span className="text-xs px-2 py-0.5 rounded bg-success/20 text-success font-medium">Identical</span>
+          ) : (
+            <span className="text-xs px-2 py-0.5 rounded bg-warning/20 text-warning font-medium">Differences found</span>
+          )}
+        </div>
+        <button onClick={onClose} className="text-xs text-text-muted hover:text-text-primary">✕ Close</button>
+      </div>
+
+      {/* Summary */}
+      <div className="px-4 py-2 border-b border-border text-sm text-text-secondary">
+        {diff.summary}
+      </div>
+
+      {/* Labels */}
+      <div className="flex border-b border-border">
+        <div className="flex-1 px-3 py-1.5 bg-surface text-xs text-text-secondary font-mono truncate border-r border-border">{leftLabel}</div>
+        <div className="flex-1 px-3 py-1.5 bg-surface text-xs text-text-secondary font-mono truncate">{rightLabel}</div>
+      </div>
+
+      {diff.identical ? (
+        <div className="p-6 text-center text-text-muted text-sm">
+          ✓ Both responses are exactly the same.
+        </div>
+      ) : diff.entries.length > 0 ? (
+        /* Key-level diff for objects */
+        <div className="max-h-96 overflow-auto">
+          {diff.entries.map(entry => (
+            <div key={entry.key} className={`flex border-b border-border/50 text-xs font-mono ${
+              entry.status === 'changed' ? 'bg-warning/5' :
+              entry.status === 'added' ? 'bg-success/5' :
+              entry.status === 'removed' ? 'bg-danger/5' : ''
+            }`}>
+              <div className="w-8 shrink-0 flex items-start justify-center pt-1.5 text-[10px]">
+                {entry.status === 'changed' && <span className="text-warning">≠</span>}
+                {entry.status === 'added' && <span className="text-success">+</span>}
+                {entry.status === 'removed' && <span className="text-danger">−</span>}
+                {entry.status === 'same' && <span className="text-text-muted">=</span>}
+              </div>
+              <div className="flex-1 px-2 py-1 border-r border-border/50 break-all">
+                <span className="text-text-muted">{entry.key}: </span>
+                {entry.left !== undefined ? (
+                  <span className={entry.status === 'changed' ? 'text-danger' : 'text-text-secondary'}>
+                    {formatValue(entry.left)}
+                  </span>
+                ) : (
+                  <span className="text-text-muted italic">—</span>
+                )}
+              </div>
+              <div className="flex-1 px-2 py-1 break-all">
+                <span className="text-text-muted">{entry.key}: </span>
+                {entry.right !== undefined ? (
+                  <span className={entry.status === 'changed' ? 'text-success' : 'text-text-secondary'}>
+                    {formatValue(entry.right)}
+                  </span>
+                ) : (
+                  <span className="text-text-muted italic">—</span>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+      ) : (
+        /* Fallback: raw side-by-side for arrays/primitives */
+        <div className="flex max-h-96">
+          <pre className="flex-1 p-3 text-xs font-mono text-text-secondary whitespace-pre-wrap break-all overflow-auto border-r border-border">
+            {typeof left === 'string' ? left : JSON.stringify(left, null, 2)}
+          </pre>
+          <pre className="flex-1 p-3 text-xs font-mono text-text-secondary whitespace-pre-wrap break-all overflow-auto">
+            {typeof right === 'string' ? right : JSON.stringify(right, null, 2)}
+          </pre>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function formatValue(val: unknown): string {
+  if (val === null) return 'null';
+  if (val === undefined) return 'undefined';
+  if (typeof val === 'string') return val.length > 80 ? `"${val.substring(0, 80)}..."` : `"${val}"`;
+  if (typeof val === 'object') {
+    const s = JSON.stringify(val);
+    return s.length > 80 ? s.substring(0, 80) + '...' : s;
+  }
+  return String(val);
 }
