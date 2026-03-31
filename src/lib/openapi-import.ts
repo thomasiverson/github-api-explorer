@@ -13,6 +13,9 @@ import { v4 as uuidv4 } from 'uuid';
 
 interface OpenApiSpec {
   paths: Record<string, OpenApiPathItem>;
+  components?: {
+    parameters?: Record<string, OpenApiParameter>;
+  };
 }
 
 interface OpenApiPathItem {
@@ -49,6 +52,28 @@ interface OpenApiParameter {
     default?: unknown;
     enum?: string[];
   };
+  '$ref'?: string;
+}
+
+/**
+ * Resolve $ref parameters against components/parameters.
+ * Returns the parameter objects with $ref resolved inline.
+ */
+function resolveParams(
+  params: OpenApiParameter[] | undefined,
+  components: Record<string, OpenApiParameter> | undefined
+): OpenApiParameter[] {
+  if (!params) return [];
+  return params.map(p => {
+    if (p['$ref'] && components) {
+      // e.g. "#/components/parameters/enterprise" → "enterprise"
+      const refName = p['$ref'].split('/').pop();
+      if (refName && components[refName]) {
+        return components[refName];
+      }
+    }
+    return p;
+  }).filter(p => p.name && p.in); // filter out any unresolved refs
 }
 
 interface ImportedEndpoint {
@@ -127,10 +152,14 @@ function simplifySchema(schema: unknown, depth = 0): unknown {
 
 export function parseOpenApiSpec(spec: OpenApiSpec, specVersion: string): ImportedEndpoint[] {
   const endpoints: ImportedEndpoint[] = [];
+  const componentParams = spec.components?.parameters;
 
   for (const [pathTemplate, pathItem] of Object.entries(spec.paths)) {
-    // Path-level parameters (shared across all methods)
-    const pathLevelParams = (pathItem.parameters || []) as OpenApiParameter[];
+    // Path-level parameters (shared across all methods), resolve $ref
+    const pathLevelParams = resolveParams(
+      (pathItem.parameters || []) as OpenApiParameter[],
+      componentParams
+    );
 
     for (const [method, operation] of Object.entries(pathItem)) {
       if (['get', 'post', 'put', 'patch', 'delete'].indexOf(method.toLowerCase()) === -1) continue;
@@ -140,8 +169,8 @@ export function parseOpenApiSpec(spec: OpenApiSpec, specVersion: string): Import
       const category = ghMeta?.category || op.tags?.[0] || 'uncategorized';
       const subcategory = ghMeta?.subcategory || '';
 
-      // Merge path-level and operation-level parameters (operation overrides path)
-      const opParams = op.parameters || [];
+      // Resolve $ref in operation-level parameters, then merge with path-level
+      const opParams = resolveParams(op.parameters, componentParams);
       const opParamNames = new Set(opParams.map(p => `${p.in}:${p.name}`));
       const mergedParams = [
         ...opParams,
