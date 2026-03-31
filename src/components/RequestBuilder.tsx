@@ -123,6 +123,36 @@ export function RequestBuilder() {
 
   const executeRequest = useCallback(async (nextPageUrl?: string) => {
     if (!selectedEndpoint || !activeEnv) return;
+
+    // Validate required params before sending
+    if (!nextPageUrl) {
+      const missingPath = selectedEndpoint.pathParams
+        .filter(p => p.required && !pathValues[p.name]?.trim())
+        .map(p => p.name);
+
+      const missingQuery = selectedEndpoint.queryParams
+        .filter(p => p.required && (!queryValues[p.name]?.enabled || !queryValues[p.name]?.value?.trim()))
+        .map(p => p.name);
+
+      const missing = [...missingPath, ...missingQuery];
+      if (missing.length > 0) {
+        setResponse({
+          status: 0,
+          statusText: 'Validation Error',
+          headers: {},
+          body: {
+            error: `Missing required parameters: ${missing.join(', ')}`,
+            missing,
+            hint: 'Fill in the required fields marked with * before sending.',
+          },
+          timing: 0,
+          rateLimit: null,
+          nextPageUrl: null,
+        });
+        return;
+      }
+    }
+
     setIsLoading(true);
 
     try {
