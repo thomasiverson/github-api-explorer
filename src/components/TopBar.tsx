@@ -137,6 +137,9 @@ export function TopBar() {
         <a href="/collections" className="px-3 py-1 text-sm text-text-secondary hover:text-text-primary hover:bg-surface rounded-md transition-colors">
           Collections
         </a>
+        <a href="/compare" className="px-3 py-1 text-sm text-text-secondary hover:text-text-primary hover:bg-surface rounded-md transition-colors">
+          Compare
+        </a>
         <a href="/settings" className="px-3 py-1 text-sm text-text-secondary hover:text-text-primary hover:bg-surface rounded-md transition-colors">
           Settings
         </a>

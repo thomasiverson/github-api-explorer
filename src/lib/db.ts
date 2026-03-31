@@ -293,6 +293,25 @@ export function insertEndpoint(endpoint: {
   );
 }
 
+// === Version Compare Queries ===
+
+export function getSpecVersions(): Array<{ spec_version: string; count: number }> {
+  return getDb().prepare(`
+    SELECT spec_version, COUNT(*) as count FROM endpoints GROUP BY spec_version ORDER BY spec_version
+  `).all() as Array<{ spec_version: string; count: number }>;
+}
+
+export function getEndpointsByVersion(specVersion: string) {
+  return getDb().prepare(
+    'SELECT * FROM endpoints WHERE spec_version = ? ORDER BY category, path, method'
+  ).all() as Array<{
+    id: string; category: string; subcategory: string; operation_id: string;
+    method: string; path: string; summary: string; description: string;
+    path_params: string; query_params: string; body_schema: string | null;
+    response_schema: string | null; is_deprecated: number; spec_version: string;
+  }>;
+}
+
 // === History CRUD ===
 
 export function addHistory(entry: {
