@@ -23,23 +23,35 @@ export function RequestBuilder() {
   const executeRequestRef = useRef<(() => void) | null>(null);
   activeEnvRef.current = activeEnv;
 
+  // Load environment variables
+  const [envVars, setEnvVars] = useState<Record<string, string>>({});
+  useEffect(() => {
+    if (!activeEnv) return;
+    fetch(`/api/variables?environmentId=${activeEnv.id}`)
+      .then(r => r.json())
+      .then((vars: Array<{ name: string; value: string }>) => {
+        const map: Record<string, string> = {};
+        for (const v of vars) map[v.name] = v.value;
+        setEnvVars(map);
+      });
+  }, [activeEnv]);
+
   // Reset form when endpoint changes
   useEffect(() => {
     if (!selectedEndpoint) return;
     const env = activeEnvRef.current;
+    const allVars: Record<string, string> = { ...envVars };
+    // Built-in variables from environment
+    if (env) {
+      if (env.org_name) { allVars['org'] = env.org_name; allVars['owner'] = env.org_name; }
+      if (env.enterprise_slug) { allVars['enterprise'] = env.enterprise_slug; }
+    }
+
     const pv: Record<string, string> = {};
     for (const p of selectedEndpoint.pathParams) {
-      // Auto-fill common params from active environment
       let defaultVal = p.default || '';
-      if (!defaultVal && env) {
-        const orgSlug = env.org_name || env.enterprise_slug || '';
-        if (p.name === 'org' || p.name === 'organization') {
-          defaultVal = orgSlug;
-        } else if (p.name === 'owner') {
-          defaultVal = orgSlug;
-        } else if (p.name === 'enterprise') {
-          defaultVal = env.enterprise_slug || '';
-        }
+      if (!defaultVal && allVars[p.name]) {
+        defaultVal = allVars[p.name];
       }
       pv[p.name] = defaultVal;
     }
@@ -47,7 +59,9 @@ export function RequestBuilder() {
 
     const qv: Record<string, { value: string; enabled: boolean }> = {};
     for (const p of selectedEndpoint.queryParams) {
-      qv[p.name] = { value: p.default || '', enabled: p.required };
+      let val = p.default || '';
+      if (!val && allVars[p.name]) val = allVars[p.name];
+      qv[p.name] = { value: val, enabled: p.required };
     }
     setQueryValues(qv);
 
@@ -213,6 +227,17 @@ export function RequestBuilder() {
           >
             {curlCopied ? '✓ Copied' : 'cURL'}
           </button>
+          <SaveToCollectionButton
+            method={selectedEndpoint.method}
+            path={selectedEndpoint.path}
+            pathParams={pathValues}
+            queryParams={Object.fromEntries(
+              Object.entries(queryValues).filter(([, v]) => v.enabled && v.value).map(([k, v]) => [k, v.value])
+            )}
+            headers={Object.fromEntries(customHeaders.filter(h => h.enabled && h.key).map(h => [h.key, h.value]))}
+            body={bodyText && ['POST', 'PUT', 'PATCH'].includes(selectedEndpoint.method) ? bodyText : null}
+            operationId={selectedEndpoint.operationId}
+          />
         </div>
         {/* Endpoint info */}
         {selectedEndpoint.summary && (
@@ -567,4 +592,68 @@ function InlineMarkdown({ text }: { text: string }) {
   }
 
   return <>{parts}</>;
+}
+
+function SaveToCollectionButton({
+  method, path, pathParams, queryParams, headers, body, operationId,
+}: {
+  method: string; path: string; pathParams: Record<string, string>;
+  queryParams: Record<string, string>; headers: Record<string, string>;
+  body: string | null; operationId: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const [collections, setCollections] = useState<Array<{ id: string; name: string }>>([]);
+  const [saved, setSaved] = useState(false);
+
+  async function loadCollections() {
+    const res = await fetch('/api/collections');
+    setCollections(await res.json());
+  }
+
+  async function saveToCollection(collectionId: string) {
+    await fetch('/api/collections', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        action: 'add-item',
+        collectionId,
+        operationId,
+        method,
+        path,
+        pathParams,
+        queryParams,
+        headers,
+        body,
+      }),
+    });
+    setSaved(true);
+    setTimeout(() => { setSaved(false); setOpen(false); }, 1500);
+  }
+
+  return (
+    <div className="relative">
+      <button
+        onClick={() => { setOpen(!open); if (!open) loadCollections(); }}
+        className="px-2.5 py-1.5 border border-border text-text-secondary text-sm rounded-md
+                   hover:bg-surface transition-colors shrink-0"
+        title="Save to collection"
+      >
+        {saved ? '✓ Saved' : 'Save'}
+      </button>
+      {open && !saved && (
+        <div className="absolute right-0 top-full mt-1 w-56 bg-panel border border-border rounded-lg shadow-lg z-50 py-1">
+          {collections.length === 0 ? (
+            <div className="px-3 py-2 text-xs text-text-muted">No collections. Create one in Collections page.</div>
+          ) : (
+            collections.map(c => (
+              <button key={c.id} onClick={() => saveToCollection(c.id)}
+                className="w-full text-left px-3 py-1.5 text-sm text-text-primary hover:bg-surface transition-colors">
+                {c.name}
+              </button>
+            ))
+          )}
+        </div>
+      )}
+    </div>
+  );
 }

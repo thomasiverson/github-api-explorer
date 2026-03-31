@@ -34,7 +34,7 @@ const METHOD_COLORS: Record<string, string> = {
 };
 
 export function Sidebar() {
-  const { selectedEndpoint, selectEndpoint, sidebarCollapsed, toggleSidebar } = useApp();
+  const { selectedEndpoint, selectEndpoint, sidebarCollapsed, toggleSidebar, activeEnv } = useApp();
   const [categories, setCategories] = useState<CategoryInfo[]>([]);
   const [totalCount, setTotalCount] = useState(0);
   const [expandedCategories, setExpandedCategories] = useState<Set<string>>(new Set());
@@ -42,6 +42,9 @@ export function Sidebar() {
   const [searchQuery, setSearchQuery] = useState('');
   const [searchResults, setSearchResults] = useState<EndpointRow[]>([]);
   const [isSearching, setIsSearching] = useState(false);
+  const [bulkSelected, setBulkSelected] = useState<Set<string>>(new Set());
+  const [bulkResults, setBulkResults] = useState<Record<string, { status: number; timing: number }>>({});
+  const [isBulkRunning, setIsBulkRunning] = useState(false);
   const searchInputRef = useRef<HTMLInputElement>(null);
   const searchTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -113,6 +116,56 @@ export function Sidebar() {
     });
   }
 
+  function toggleBulkSelect(epId: string, e: React.MouseEvent) {
+    if (!e.ctrlKey && !e.metaKey) return false; // not a bulk-select click
+    e.preventDefault();
+    setBulkSelected(prev => {
+      const next = new Set(prev);
+      if (next.has(epId)) next.delete(epId); else next.add(epId);
+      return next;
+    });
+    return true;
+  }
+
+  async function runBulk() {
+    if (bulkSelected.size === 0 || !activeEnv) return;
+    setIsBulkRunning(true);
+    setBulkResults({});
+
+    // Gather all endpoints that are selected
+    const allEndpoints: EndpointRow[] = [];
+    for (const eps of Object.values(categoryEndpoints)) {
+      allEndpoints.push(...eps);
+    }
+    allEndpoints.push(...searchResults);
+
+    for (const epId of bulkSelected) {
+      const ep = allEndpoints.find(e => e.id === epId);
+      if (!ep) continue;
+      try {
+        const pathParams: Record<string, string> = {};
+        const parsed = JSON.parse(ep.path_params || '[]');
+        for (const p of parsed) {
+          if (p.name === 'org' || p.name === 'owner') pathParams[p.name] = activeEnv.org_name || '';
+          else if (p.name === 'enterprise') pathParams[p.name] = activeEnv.enterprise_slug || '';
+        }
+        const res = await fetch('/api/execute', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            method: ep.method, path: ep.path, pathParams, queryParams: {},
+            operationId: ep.operation_id, category: ep.category,
+          }),
+        });
+        const data = await res.json();
+        setBulkResults(prev => ({ ...prev, [epId]: { status: data.status || 0, timing: data.timing || 0 } }));
+      } catch {
+        setBulkResults(prev => ({ ...prev, [epId]: { status: 0, timing: 0 } }));
+      }
+    }
+    setIsBulkRunning(false);
+  }
+
   const displayEndpoints = searchQuery.trim() ? searchResults : null;
 
   if (sidebarCollapsed) {
@@ -134,19 +187,33 @@ export function Sidebar() {
   return (
     <aside className="w-full h-full border-r border-border bg-panel flex flex-col overflow-hidden">
       {/* Header */}
-      <div className="p-3 border-b border-border flex items-center justify-between">
-        <span className="text-xs font-semibold text-text-secondary uppercase tracking-wider">
-          API Explorer
-          <span className="ml-1.5 text-text-muted font-normal">({totalCount})</span>
-        </span>
-        <button
-          onClick={toggleSidebar}
-          className="p-1 rounded hover:bg-surface text-text-muted hover:text-text-primary"
-        >
+      <div className="p-3 border-b border-border">
+        <div className="flex items-center justify-between">
+          <span className="text-xs font-semibold text-text-secondary uppercase tracking-wider">
+            API Explorer
+            <span className="ml-1.5 text-text-muted font-normal">({totalCount})</span>
+          </span>
+          <button
+            onClick={toggleSidebar}
+            className="p-1 rounded hover:bg-surface text-text-muted hover:text-text-primary"
+          >
           <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
             <path d="M9.78 12.78a.75.75 0 0 1-1.06 0L4.47 8.53a.75.75 0 0 1 0-1.06l4.25-4.25a.751.751 0 0 1 1.042.018.751.751 0 0 1 .018 1.042L6.06 8l3.72 3.72a.75.75 0 0 1 0 1.06Z" />
           </svg>
         </button>
+        </div>
+        {/* Bulk run bar */}
+        {bulkSelected.size > 0 && (
+          <div className="flex items-center gap-2 mt-2">
+            <button onClick={runBulk} disabled={isBulkRunning}
+              className="px-2.5 py-1 bg-accent-emphasis text-white text-[11px] rounded-md hover:opacity-90 disabled:opacity-50">
+              {isBulkRunning ? 'Running...' : `Run ${bulkSelected.size} selected`}
+            </button>
+            <button onClick={() => { setBulkSelected(new Set()); setBulkResults({}); }}
+              className="text-[11px] text-text-muted hover:text-text-primary">Clear</button>
+          </div>
+        )}
+        <p className="text-[10px] text-text-muted mt-1">Ctrl+click to multi-select</p>
       </div>
 
       {/* Search */}
@@ -191,7 +258,12 @@ export function Sidebar() {
                 key={ep.id}
                 endpoint={ep}
                 isActive={selectedEndpoint?.operationId === ep.operation_id}
-                onClick={() => handleSelectEndpoint(ep)}
+                isBulkSelected={bulkSelected.has(ep.id)}
+                bulkResult={bulkResults[ep.id]}
+                onClick={(e) => {
+                  if (toggleBulkSelect(ep.id, e)) return;
+                  handleSelectEndpoint(ep);
+                }}
               />
             ))}
           </div>
@@ -220,7 +292,12 @@ export function Sidebar() {
                         key={ep.id}
                         endpoint={ep}
                         isActive={selectedEndpoint?.operationId === ep.operation_id}
-                        onClick={() => handleSelectEndpoint(ep)}
+                        isBulkSelected={bulkSelected.has(ep.id)}
+                        bulkResult={bulkResults[ep.id]}
+                        onClick={(e) => {
+                          if (toggleBulkSelect(ep.id, e)) return;
+                          handleSelectEndpoint(ep);
+                        }}
                       />
                     ))}
                   </div>
@@ -235,24 +312,34 @@ export function Sidebar() {
 }
 
 function EndpointItem({
-  endpoint, isActive, onClick,
+  endpoint, isActive, isBulkSelected, bulkResult, onClick,
 }: {
-  endpoint: EndpointRow; isActive: boolean; onClick: () => void;
+  endpoint: EndpointRow; isActive: boolean; isBulkSelected: boolean;
+  bulkResult?: { status: number; timing: number }; onClick: (e: React.MouseEvent) => void;
 }) {
   return (
     <button
       onClick={onClick}
       className={`w-full flex items-center gap-2 px-3 py-1 text-left hover:bg-surface/50 transition-colors
-        ${isActive ? 'bg-surface border-l-2 border-accent' : 'border-l-2 border-transparent'}
+        ${isActive ? 'bg-surface border-l-2 border-accent' :
+          isBulkSelected ? 'bg-accent/10 border-l-2 border-accent/50' :
+          'border-l-2 border-transparent'}
         ${endpoint.is_deprecated ? 'opacity-50' : ''}`}
       title={`${endpoint.method} ${endpoint.path}${endpoint.summary ? '\n\n' + endpoint.summary : ''}`}
     >
       <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded ${METHOD_COLORS[endpoint.method] || 'bg-text-muted'} shrink-0 leading-none`}>
         {endpoint.method}
       </span>
-      <span className="text-xs font-mono text-text-secondary truncate">
+      <span className="text-xs font-mono text-text-secondary truncate flex-1">
         {endpoint.path}
       </span>
+      {bulkResult && (
+        <span className={`text-[10px] font-mono font-bold shrink-0 ${
+          bulkResult.status >= 200 && bulkResult.status < 300 ? 'text-success' : 'text-danger'
+        }`}>
+          {bulkResult.status}
+        </span>
+      )}
     </button>
   );
 }

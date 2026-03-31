@@ -8,6 +8,10 @@ interface EnvironmentRow {
   org_name: string; auth_method: string; is_active: number;
 }
 
+interface Variable {
+  id: string; name: string; value: string;
+}
+
 export default function SettingsPage() {
   const [environments, setEnvironments] = useState<EnvironmentRow[]>([]);
   const [editingEnv, setEditingEnv] = useState<Partial<EnvironmentRow> & { token?: string; appId?: string; privateKey?: string; installationId?: string } | null>(null);
@@ -15,12 +19,44 @@ export default function SettingsPage() {
   const [isValidating, setIsValidating] = useState(false);
   const [importStatus, setImportStatus] = useState<string>('');
   const [isImporting, setIsImporting] = useState(false);
+  const [variables, setVariables] = useState<Variable[]>([]);
+  const [selectedEnvForVars, setSelectedEnvForVars] = useState<string>('');
 
   useEffect(() => { loadEnvironments(); }, []);
 
+  useEffect(() => {
+    if (selectedEnvForVars) loadVariables(selectedEnvForVars);
+  }, [selectedEnvForVars]);
+
   async function loadEnvironments() {
     const res = await fetch('/api/environments');
-    setEnvironments(await res.json());
+    const envs = await res.json();
+    setEnvironments(envs);
+    const active = envs.find((e: EnvironmentRow) => e.is_active === 1);
+    if (active && !selectedEnvForVars) setSelectedEnvForVars(active.id);
+  }
+
+  async function loadVariables(envId: string) {
+    const res = await fetch(`/api/variables?environmentId=${envId}`);
+    setVariables(await res.json());
+  }
+
+  async function saveVariable(name: string, value: string, id?: string) {
+    await fetch('/api/variables', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'set', environmentId: selectedEnvForVars, id, name, value }),
+    });
+    loadVariables(selectedEnvForVars);
+  }
+
+  async function deleteVar(id: string) {
+    await fetch('/api/variables', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'delete', id }),
+    });
+    loadVariables(selectedEnvForVars);
   }
 
   async function saveEnvironment() {
@@ -258,6 +294,42 @@ export default function SettingsPage() {
             </section>
           )}
 
+          {/* Environment Variables */}
+          <section className="bg-panel border border-border rounded-lg overflow-hidden">
+            <div className="p-4 border-b border-border">
+              <h2 className="text-lg font-medium text-text-primary">Environment Variables</h2>
+              <p className="text-xs text-text-secondary mt-0.5">
+                Define custom variables like <code className="px-1 py-0.5 bg-surface rounded text-accent text-[11px]">{'{{repo}}'}</code>,{' '}
+                <code className="px-1 py-0.5 bg-surface rounded text-accent text-[11px]">{'{{username}}'}</code> — they auto-fill in any parameter field
+              </p>
+            </div>
+            <div className="p-4">
+              <select
+                value={selectedEnvForVars}
+                onChange={e => setSelectedEnvForVars(e.target.value)}
+                className="bg-surface border border-border rounded-md px-3 py-1.5 text-sm text-text-primary mb-3 focus:outline-none focus:ring-1 focus:ring-accent"
+              >
+                {environments.map(env => (
+                  <option key={env.id} value={env.id}>{env.name}</option>
+                ))}
+              </select>
+              <div className="space-y-2">
+                {variables.map(v => (
+                  <div key={v.id} className="flex items-center gap-2">
+                    <input type="text" defaultValue={v.name} readOnly
+                      className="w-40 bg-surface border border-border rounded-md px-3 py-1.5 text-sm font-mono text-text-primary" />
+                    <input type="text" defaultValue={v.value}
+                      onBlur={e => saveVariable(v.name, e.target.value, v.id)}
+                      className="flex-1 bg-surface border border-border rounded-md px-3 py-1.5 text-sm font-mono text-text-primary focus:outline-none focus:ring-1 focus:ring-accent" />
+                    <button onClick={() => deleteVar(v.id)}
+                      className="text-text-muted hover:text-danger p-1">✕</button>
+                  </div>
+                ))}
+                <VariableAddRow onAdd={(name, value) => saveVariable(name, value)} />
+              </div>
+            </div>
+          </section>
+
           {/* API Catalog */}
           <section className="bg-panel border border-border rounded-lg overflow-hidden">
             <div className="p-4 border-b border-border flex items-center justify-between">
@@ -276,6 +348,31 @@ export default function SettingsPage() {
           </section>
         </div>
       </div>
+    </div>
+  );
+}
+
+function VariableAddRow({ onAdd }: { onAdd: (name: string, value: string) => void }) {
+  const [name, setName] = useState('');
+  const [value, setValue] = useState('');
+
+  function handleAdd() {
+    if (!name.trim()) return;
+    onAdd(name.trim(), value);
+    setName('');
+    setValue('');
+  }
+
+  return (
+    <div className="flex items-center gap-2 mt-2">
+      <input type="text" value={name} onChange={e => setName(e.target.value)}
+        placeholder="variable_name" onKeyDown={e => e.key === 'Enter' && handleAdd()}
+        className="w-40 bg-surface border border-border rounded-md px-3 py-1.5 text-sm font-mono text-text-primary placeholder-text-muted focus:outline-none focus:ring-1 focus:ring-accent" />
+      <input type="text" value={value} onChange={e => setValue(e.target.value)}
+        placeholder="value" onKeyDown={e => e.key === 'Enter' && handleAdd()}
+        className="flex-1 bg-surface border border-border rounded-md px-3 py-1.5 text-sm font-mono text-text-primary placeholder-text-muted focus:outline-none focus:ring-1 focus:ring-accent" />
+      <button onClick={handleAdd}
+        className="px-3 py-1.5 text-sm text-accent border border-border rounded-md hover:bg-surface transition-colors">Add</button>
     </div>
   );
 }

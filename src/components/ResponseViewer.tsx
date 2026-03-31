@@ -106,6 +106,18 @@ export function ResponseViewer() {
           </span>
         )}
         <div className="flex-1" />
+        {/* CSV download — only for array responses */}
+        {Array.isArray(response.body) && response.body.length > 0 && (
+          <button
+            onClick={() => downloadCsv(response.body as Record<string, unknown>[])}
+            className="text-text-muted hover:text-text-primary p-1 rounded hover:bg-surface"
+            title="Download as CSV"
+          >
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
+              <path d="M2.75 14A1.75 1.75 0 0 1 1 12.25v-2.5a.75.75 0 0 1 1.5 0v2.5c0 .138.112.25.25.25h10.5a.25.25 0 0 0 .25-.25v-2.5a.75.75 0 0 1 1.5 0v2.5A1.75 1.75 0 0 1 13.25 14ZM7.25 7.689V2a.75.75 0 0 1 1.5 0v5.689l1.97-1.969a.749.749 0 1 1 1.06 1.06l-3.25 3.25a.749.749 0 0 1-1.06 0L4.22 6.78a.749.749 0 1 1 1.06-1.06l1.97 1.969Z" />
+            </svg>
+          </button>
+        )}
         <button
           onClick={() => navigator.clipboard.writeText(JSON.stringify(response.body, null, 2))}
           className="text-text-muted hover:text-text-primary p-1 rounded hover:bg-surface"
@@ -417,6 +429,38 @@ function PreviewValue({ value }: { value: unknown }) {
     return <span className="text-xs font-mono text-text-secondary break-all">{parts}</span>;
   }
   return <span className="text-xs font-mono text-text-secondary break-all">{str}</span>;
+}
+
+function downloadCsv(data: Record<string, unknown>[]) {
+  if (!data.length) return;
+  // Collect all keys across all objects
+  const keys = new Set<string>();
+  for (const row of data) {
+    for (const key of Object.keys(row)) {
+      const val = row[key];
+      if (val === null || val === undefined || typeof val !== 'object') {
+        keys.add(key);
+      }
+    }
+  }
+  const headers = Array.from(keys);
+  const csvRows = [headers.map(h => `"${h}"`).join(',')];
+  for (const row of data) {
+    const values = headers.map(h => {
+      const val = row[h];
+      if (val === null || val === undefined) return '';
+      const str = String(val).replace(/"/g, '""');
+      return `"${str}"`;
+    });
+    csvRows.push(values.join(','));
+  }
+  const blob = new Blob([csvRows.join('\n')], { type: 'text/csv' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `response-${new Date().toISOString().slice(0, 10)}.csv`;
+  a.click();
+  URL.revokeObjectURL(url);
 }
 
 function filterJson(data: unknown, query: string): unknown {

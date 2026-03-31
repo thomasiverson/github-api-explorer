@@ -110,6 +110,14 @@ function initSchema(db: Database.Database) {
     );
 
     CREATE INDEX IF NOT EXISTS idx_collection_items_coll ON collection_items(collection_id);
+
+    CREATE TABLE IF NOT EXISTS env_variables (
+      id TEXT PRIMARY KEY,
+      environment_id TEXT NOT NULL REFERENCES environments(id) ON DELETE CASCADE,
+      name TEXT NOT NULL,
+      value TEXT NOT NULL DEFAULT '',
+      UNIQUE(environment_id, name)
+    );
   `);
 }
 
@@ -326,4 +334,86 @@ export function clearHistory(environmentId?: string) {
   } else {
     getDb().prepare('DELETE FROM history').run();
   }
+}
+
+// === Environment Variables CRUD ===
+
+export function getVariables(environmentId: string): Array<{ id: string; name: string; value: string }> {
+  return getDb().prepare(
+    'SELECT id, name, value FROM env_variables WHERE environment_id = ? ORDER BY name'
+  ).all(environmentId) as Array<{ id: string; name: string; value: string }>;
+}
+
+export function setVariable(environmentId: string, id: string, name: string, value: string) {
+  getDb().prepare(`
+    INSERT OR REPLACE INTO env_variables (id, environment_id, name, value)
+    VALUES (?, ?, ?, ?)
+  `).run(id, environmentId, name, value);
+}
+
+export function deleteVariable(id: string) {
+  getDb().prepare('DELETE FROM env_variables WHERE id = ?').run(id);
+}
+
+// === Collections CRUD ===
+
+export function getCollections(): Array<{
+  id: string; name: string; description: string; environment_id: string | null;
+  created_at: string; updated_at: string; item_count: number;
+}> {
+  return getDb().prepare(`
+    SELECT c.*, COUNT(ci.id) as item_count
+    FROM collections c LEFT JOIN collection_items ci ON c.id = ci.collection_id
+    GROUP BY c.id ORDER BY c.updated_at DESC
+  `).all() as Array<{
+    id: string; name: string; description: string; environment_id: string | null;
+    created_at: string; updated_at: string; item_count: number;
+  }>;
+}
+
+export function createCollection(id: string, name: string, description: string, environmentId: string | null) {
+  getDb().prepare(`
+    INSERT INTO collections (id, name, description, environment_id) VALUES (?, ?, ?, ?)
+  `).run(id, name, description, environmentId);
+}
+
+export function updateCollection(id: string, name: string, description: string) {
+  getDb().prepare(`
+    UPDATE collections SET name = ?, description = ?, updated_at = datetime('now') WHERE id = ?
+  `).run(name, description, id);
+}
+
+export function deleteCollection(id: string) {
+  getDb().prepare('DELETE FROM collections WHERE id = ?').run(id);
+}
+
+export function getCollectionItems(collectionId: string) {
+  return getDb().prepare(
+    'SELECT * FROM collection_items WHERE collection_id = ? ORDER BY sort_order'
+  ).all(collectionId);
+}
+
+export function addCollectionItem(item: {
+  id: string; collectionId: string; operationId: string | null; method: string;
+  path: string; pathParams: string; queryParams: string; headers: string;
+  body: string | null; sortOrder: number;
+}) {
+  getDb().prepare(`
+    INSERT INTO collection_items (id, collection_id, operation_id, method, path, path_params, query_params, headers, body, sort_order)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(item.id, item.collectionId, item.operationId, item.method, item.path,
+    item.pathParams, item.queryParams, item.headers, item.body, item.sortOrder);
+}
+
+export function deleteCollectionItem(id: string) {
+  getDb().prepare('DELETE FROM collection_items WHERE id = ?').run(id);
+}
+
+export function reorderCollectionItems(collectionId: string, itemIds: string[]) {
+  const db = getDb();
+  const stmt = db.prepare('UPDATE collection_items SET sort_order = ? WHERE id = ? AND collection_id = ?');
+  const tx = db.transaction(() => {
+    itemIds.forEach((id, i) => stmt.run(i, id, collectionId));
+  });
+  tx();
 }

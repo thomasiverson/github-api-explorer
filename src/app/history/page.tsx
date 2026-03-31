@@ -17,6 +17,8 @@ const METHOD_COLORS: Record<string, string> = {
 export default function HistoryPage() {
   const [history, setHistory] = useState<HistoryRow[]>([]);
   const [filter, setFilter] = useState('');
+  const [compareIds, setCompareIds] = useState<Set<string>>(new Set());
+  const [diffData, setDiffData] = useState<{ left: unknown; right: unknown; leftLabel: string; rightLabel: string } | null>(null);
 
   useEffect(() => { loadHistory(); }, []);
 
@@ -58,6 +60,31 @@ export default function HistoryPage() {
     return 'text-success';
   }
 
+  function toggleCompare(id: string) {
+    setCompareIds(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) { next.delete(id); } else {
+        if (next.size >= 2) return prev; // max 2
+        next.add(id);
+      }
+      return next;
+    });
+  }
+
+  async function showDiff() {
+    const ids = Array.from(compareIds);
+    if (ids.length !== 2) return;
+    const [a, b] = await Promise.all(
+      ids.map(id => fetch(`/api/history?id=${id}`).then(r => r.json()))
+    );
+    setDiffData({
+      left: a.response_body ? JSON.parse(a.response_body) : null,
+      right: b.response_body ? JSON.parse(b.response_body) : null,
+      leftLabel: `${a.method} ${a.path} (${new Date(a.created_at).toLocaleString()})`,
+      rightLabel: `${b.method} ${b.path} (${new Date(b.created_at).toLocaleString()})`,
+    });
+  }
+
   return (
     <div className="h-full flex flex-col">
       <TopBar />
@@ -69,6 +96,15 @@ export default function HistoryPage() {
               <p className="text-sm text-text-secondary mt-1">{history.length} requests recorded</p>
             </div>
             <div className="flex items-center gap-3">
+              {compareIds.size === 2 && (
+                <button onClick={showDiff}
+                  className="px-3 py-1.5 bg-accent-emphasis text-white text-sm rounded-md hover:opacity-90 transition-opacity">
+                  Compare ({compareIds.size})
+                </button>
+              )}
+              {compareIds.size > 0 && compareIds.size < 2 && (
+                <span className="text-xs text-text-muted">Select 1 more to compare</span>
+              )}
               <input
                 type="text" value={filter} onChange={e => setFilter(e.target.value)}
                 placeholder="Filter..."
@@ -87,6 +123,7 @@ export default function HistoryPage() {
             <table className="w-full text-sm">
               <thead>
                 <tr className="border-b border-border text-text-secondary text-left">
+                  <th className="px-2 py-2 w-8"></th>
                   <th className="px-4 py-2 font-medium">Method</th>
                   <th className="px-4 py-2 font-medium">Path</th>
                   <th className="px-4 py-2 font-medium">Status</th>
@@ -98,6 +135,11 @@ export default function HistoryPage() {
               <tbody>
                 {filtered.map(h => (
                   <tr key={h.id} className="border-b border-border hover:bg-surface/50 transition-colors">
+                    <td className="px-2 py-2">
+                      <input type="checkbox" checked={compareIds.has(h.id)}
+                        onChange={() => toggleCompare(h.id)} className="accent-accent"
+                        disabled={!compareIds.has(h.id) && compareIds.size >= 2} />
+                    </td>
                     <td className="px-4 py-2">
                       <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded ${METHOD_COLORS[h.method] || 'bg-text-muted'} leading-none`}>
                         {h.method}
@@ -133,7 +175,7 @@ export default function HistoryPage() {
                 ))}
                 {filtered.length === 0 && (
                   <tr>
-                    <td colSpan={6} className="px-4 py-8 text-center text-text-muted">
+                    <td colSpan={7} className="px-4 py-8 text-center text-text-muted">
                       {history.length === 0 ? 'No history yet' : 'No matching results'}
                     </td>
                   </tr>
@@ -141,6 +183,31 @@ export default function HistoryPage() {
               </tbody>
             </table>
           </div>
+
+          {/* Diff viewer */}
+          {diffData && (
+            <div className="mt-6 bg-panel border border-border rounded-lg overflow-hidden">
+              <div className="p-3 border-b border-border flex items-center justify-between">
+                <span className="text-sm font-medium text-text-primary">Response Comparison</span>
+                <button onClick={() => { setDiffData(null); setCompareIds(new Set()); }}
+                  className="text-xs text-text-muted hover:text-text-primary">✕ Close</button>
+              </div>
+              <div className="flex">
+                <div className="flex-1 border-r border-border">
+                  <div className="px-3 py-2 bg-surface text-xs text-text-secondary font-mono truncate">{diffData.leftLabel}</div>
+                  <pre className="p-3 text-xs font-mono text-text-secondary whitespace-pre-wrap break-all max-h-96 overflow-auto">
+                    {JSON.stringify(diffData.left, null, 2)}
+                  </pre>
+                </div>
+                <div className="flex-1">
+                  <div className="px-3 py-2 bg-surface text-xs text-text-secondary font-mono truncate">{diffData.rightLabel}</div>
+                  <pre className="p-3 text-xs font-mono text-text-secondary whitespace-pre-wrap break-all max-h-96 overflow-auto">
+                    {JSON.stringify(diffData.right, null, 2)}
+                  </pre>
+                </div>
+              </div>
+            </div>
+          )}
         </div>
       </div>
     </div>
