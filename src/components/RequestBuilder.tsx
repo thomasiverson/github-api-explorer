@@ -271,7 +271,12 @@ export function RequestBuilder() {
         </div>
         {/* Endpoint info */}
         {selectedEndpoint.summary && (
-          <EndpointInfo summary={selectedEndpoint.summary} description={selectedEndpoint.description} />
+          <EndpointInfo
+            summary={selectedEndpoint.summary}
+            description={selectedEndpoint.description}
+            operationId={selectedEndpoint.operationId}
+            category={selectedEndpoint.category}
+          />
         )}
       </div>
 
@@ -353,17 +358,32 @@ export function RequestBuilder() {
                       <label className="text-sm text-text-primary w-32 shrink-0 font-mono truncate" title={p.name}>
                         {p.name}
                       </label>
-                      <input
-                        type="text"
-                        value={queryValues[p.name]?.value || ''}
-                        onChange={e => setQueryValues(prev => ({
-                          ...prev,
-                          [p.name]: { ...prev[p.name], value: e.target.value }
-                        }))}
-                        placeholder={p.description || p.type}
-                        className="flex-1 bg-surface border border-border rounded-md px-3 py-1.5 text-sm text-text-primary
-                                   placeholder-text-muted focus:outline-none focus:ring-1 focus:ring-accent font-mono"
-                      />
+                      {p.enum ? (
+                        <select
+                          value={queryValues[p.name]?.value || ''}
+                          onChange={e => setQueryValues(prev => ({
+                            ...prev,
+                            [p.name]: { ...prev[p.name], value: e.target.value, enabled: true }
+                          }))}
+                          className="flex-1 bg-surface border border-border rounded-md px-3 py-1.5 text-sm text-text-primary
+                                     focus:outline-none focus:ring-1 focus:ring-accent"
+                        >
+                          <option value="">Select...</option>
+                          {p.enum.map(v => <option key={v} value={v}>{v}</option>)}
+                        </select>
+                      ) : (
+                        <input
+                          type="text"
+                          value={queryValues[p.name]?.value || ''}
+                          onChange={e => setQueryValues(prev => ({
+                            ...prev,
+                            [p.name]: { ...prev[p.name], value: e.target.value }
+                          }))}
+                          placeholder={p.description || p.type}
+                          className="flex-1 bg-surface border border-border rounded-md px-3 py-1.5 text-sm text-text-primary
+                                     placeholder-text-muted focus:outline-none focus:ring-1 focus:ring-accent font-mono"
+                        />
+                      )}
                     </div>
                   ))}
                 </div>
@@ -379,14 +399,22 @@ export function RequestBuilder() {
         {activeTab === 'body' && (
           <div className="h-full">
             {['POST', 'PUT', 'PATCH'].includes(selectedEndpoint.method) ? (
-              <textarea
-                value={bodyText}
-                onChange={e => setBodyText(e.target.value)}
-                placeholder='{"key": "value"}'
-                className="w-full h-64 bg-surface border border-border rounded-md px-3 py-2 text-sm text-text-primary
-                           font-mono resize-y focus:outline-none focus:ring-1 focus:ring-accent"
-                spellCheck={false}
-              />
+              <div>
+                <textarea
+                  value={bodyText}
+                  onChange={e => setBodyText(e.target.value)}
+                  placeholder='{"key": "value"}'
+                  className={`w-full h-64 bg-surface border rounded-md px-3 py-2 text-sm text-text-primary
+                             font-mono resize-y focus:outline-none focus:ring-1 focus:ring-accent
+                             ${bodyText && !isValidJson(bodyText) ? 'border-danger' : 'border-border'}`}
+                  spellCheck={false}
+                />
+                {bodyText && !isValidJson(bodyText) && (
+                  <p className="text-xs text-danger mt-1.5 flex items-center gap-1">
+                    <span>⚠</span> Invalid JSON — fix before sending
+                  </p>
+                )}
+              </div>
             ) : (
               <p className="text-sm text-text-muted text-center py-8">
                 {selectedEndpoint.method} requests don&apos;t have a body
@@ -493,12 +521,33 @@ function getDefaultForType(schema: Record<string, unknown>): unknown {
   }
 }
 
-function EndpointInfo({ summary, description }: { summary: string; description: string }) {
+function isValidJson(text: string): boolean {
+  if (!text.trim()) return true;
+  try { JSON.parse(text); return true; } catch { return false; }
+}
+
+function EndpointInfo({ summary, description, operationId, category }: {
+  summary: string; description: string; operationId: string; category: string;
+}) {
   const hasDescription = description && description.trim().length > 0;
+
+  // Build GitHub docs URL: /rest/{category}/{subcategory}#{operation-id-kebab}
+  // operationId format is usually "category/operation-name"
+  const docsUrl = `https://docs.github.com/rest/${category}/${operationId.includes('/') ? operationId.split('/')[1] : operationId}`
+    .replace(/([A-Z])/g, '-$1').toLowerCase().replace(/--/g, '-');
 
   return (
     <div className="mt-2">
-      <p className="text-xs font-medium text-text-primary">{summary}</p>
+      <div className="flex items-start gap-2">
+        <p className="text-xs font-medium text-text-primary flex-1">{summary}</p>
+        <a href={docsUrl} target="_blank" rel="noopener noreferrer"
+          className="text-[11px] text-accent hover:underline shrink-0 flex items-center gap-0.5">
+          Docs
+          <svg width="10" height="10" viewBox="0 0 16 16" fill="currentColor">
+            <path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z" />
+          </svg>
+        </a>
+      </div>
       {hasDescription && (
         <div className="mt-1.5 p-2.5 bg-surface/50 border border-border rounded-md text-xs text-text-secondary leading-relaxed space-y-1.5">
           <SimpleMarkdown text={description} />

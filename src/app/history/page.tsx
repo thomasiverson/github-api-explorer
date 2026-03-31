@@ -168,7 +168,9 @@ export default function HistoryPage() {
                 </tr>
               </thead>
               <tbody>
-                {filtered.map(h => (
+                {(() => {
+                  const maxTiming = Math.max(...filtered.map(h => h.timing), 1);
+                  return filtered.map(h => (
                   <tr key={h.id} className="border-b border-border hover:bg-surface/50 transition-colors">
                     <td className="px-2 py-2">
                       <input type="checkbox" checked={compareIds.has(h.id)}
@@ -186,7 +188,15 @@ export default function HistoryPage() {
                     <td className={`px-4 py-2 font-mono font-bold ${statusClass(h.status)}`}>
                       {h.status}
                     </td>
-                    <td className="px-4 py-2 text-text-secondary">{h.timing}ms</td>
+                    <td className="px-4 py-2 text-text-secondary">
+                      <div className="flex items-center gap-1.5">
+                        <span className="text-xs w-12">{h.timing}ms</span>
+                        <div className="w-16 h-1.5 rounded-full bg-surface overflow-hidden">
+                          <div className={`h-full rounded-full ${h.timing > 1000 ? 'bg-danger' : h.timing > 500 ? 'bg-warning' : 'bg-success'}`}
+                            style={{ width: `${Math.min(100, (h.timing / maxTiming) * 100)}%` }} />
+                        </div>
+                      </div>
+                    </td>
                     <td className="px-4 py-2 text-text-muted">
                       {new Date(h.created_at).toLocaleString()}
                     </td>
@@ -207,7 +217,8 @@ export default function HistoryPage() {
                       </div>
                     </td>
                   </tr>
-                ))}
+                ));
+                })()}
                 {filtered.length === 0 && (
                   <tr>
                     <td colSpan={7} className="px-4 py-8 text-center text-text-muted">

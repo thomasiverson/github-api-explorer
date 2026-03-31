@@ -45,11 +45,14 @@ export function Sidebar() {
   const [bulkSelected, setBulkSelected] = useState<Set<string>>(new Set());
   const [bulkResults, setBulkResults] = useState<Record<string, { status: number; timing: number }>>({});
   const [isBulkRunning, setIsBulkRunning] = useState(false);
+  const [favorites, setFavorites] = useState<Set<string>>(new Set());
+  const [favoriteEndpoints, setFavoriteEndpoints] = useState<EndpointRow[]>([]);
   const searchInputRef = useRef<HTMLInputElement>(null);
   const searchTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     loadCategories();
+    loadFavorites();
     // Keyboard shortcut: Cmd/Ctrl+K
     const handler = (e: KeyboardEvent) => {
       if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
@@ -66,6 +69,44 @@ export function Sidebar() {
     const data = await res.json();
     setCategories(data.categories);
     setTotalCount(data.total);
+  }
+
+  async function loadFavorites() {
+    const res = await fetch('/api/favorites');
+    const ids: string[] = await res.json();
+    setFavorites(new Set(ids));
+    // Load the full endpoint data for favorites
+    if (ids.length > 0) {
+      const res2 = await fetch(`/api/endpoints?action=search&q=${encodeURIComponent(ids[0])}&limit=100`);
+      const allEndpoints: EndpointRow[] = await res2.json();
+      // Search for all favorite endpoints
+      const favEndpoints: EndpointRow[] = [];
+      for (const id of ids) {
+        const found = allEndpoints.find(e => e.operation_id === id);
+        if (found) favEndpoints.push(found);
+      }
+      // If we didn't find them all via first search, search individually
+      if (favEndpoints.length < ids.length) {
+        for (const id of ids) {
+          if (favEndpoints.find(e => e.operation_id === id)) continue;
+          const res3 = await fetch(`/api/endpoints?action=search&q=${encodeURIComponent(id)}&limit=5`);
+          const results: EndpointRow[] = await res3.json();
+          const found = results.find(e => e.operation_id === id);
+          if (found) favEndpoints.push(found);
+        }
+      }
+      setFavoriteEndpoints(favEndpoints);
+    }
+  }
+
+  async function toggleFavorite(operationId: string) {
+    const isFav = favorites.has(operationId);
+    await fetch('/api/favorites', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: isFav ? 'remove' : 'add', operationId }),
+    });
+    loadFavorites();
   }
 
   async function toggleCategory(cat: string) {
@@ -268,8 +309,32 @@ export function Sidebar() {
             ))}
           </div>
         ) : (
-          /* Category tree */
+          /* Favorites + Category tree */
           <div className="py-1">
+            {/* Favorites section */}
+            {favoriteEndpoints.length > 0 && (
+              <div className="mb-1">
+                <div className="px-3 py-1.5 text-xs font-semibold text-warning uppercase tracking-wider flex items-center gap-1">
+                  ★ Favorites
+                </div>
+                {favoriteEndpoints.map(ep => (
+                  <EndpointItem
+                    key={`fav-${ep.id}`}
+                    endpoint={ep}
+                    isActive={selectedEndpoint?.operationId === ep.operation_id}
+                    isBulkSelected={bulkSelected.has(ep.id)}
+                    bulkResult={bulkResults[ep.id]}
+                    isFavorite={true}
+                    onToggleFavorite={() => toggleFavorite(ep.operation_id)}
+                    onClick={(e) => {
+                      if (toggleBulkSelect(ep.id, e)) return;
+                      handleSelectEndpoint(ep);
+                    }}
+                  />
+                ))}
+                <div className="border-b border-border mx-3 my-1" />
+              </div>
+            )}
             {categories.map(cat => (
               <div key={cat.category}>
                 <button
@@ -294,6 +359,8 @@ export function Sidebar() {
                         isActive={selectedEndpoint?.operationId === ep.operation_id}
                         isBulkSelected={bulkSelected.has(ep.id)}
                         bulkResult={bulkResults[ep.id]}
+                        isFavorite={favorites.has(ep.operation_id)}
+                        onToggleFavorite={() => toggleFavorite(ep.operation_id)}
                         onClick={(e) => {
                           if (toggleBulkSelect(ep.id, e)) return;
                           handleSelectEndpoint(ep);
@@ -312,15 +379,17 @@ export function Sidebar() {
 }
 
 function EndpointItem({
-  endpoint, isActive, isBulkSelected, bulkResult, onClick,
+  endpoint, isActive, isBulkSelected, bulkResult, isFavorite, onToggleFavorite, onClick,
 }: {
   endpoint: EndpointRow; isActive: boolean; isBulkSelected: boolean;
-  bulkResult?: { status: number; timing: number }; onClick: (e: React.MouseEvent) => void;
+  bulkResult?: { status: number; timing: number };
+  isFavorite?: boolean; onToggleFavorite?: () => void;
+  onClick: (e: React.MouseEvent) => void;
 }) {
   return (
     <button
       onClick={onClick}
-      className={`w-full flex items-center gap-2 px-3 py-1 text-left hover:bg-surface/50 transition-colors
+      className={`w-full flex items-center gap-2 px-3 py-1 text-left hover:bg-surface/50 transition-colors group
         ${isActive ? 'bg-surface border-l-2 border-accent' :
           isBulkSelected ? 'bg-accent/10 border-l-2 border-accent/50' :
           'border-l-2 border-transparent'}
@@ -338,6 +407,17 @@ function EndpointItem({
           bulkResult.status >= 200 && bulkResult.status < 300 ? 'text-success' : 'text-danger'
         }`}>
           {bulkResult.status}
+        </span>
+      )}
+      {onToggleFavorite && (
+        <span
+          onClick={e => { e.stopPropagation(); onToggleFavorite(); }}
+          className={`shrink-0 text-xs cursor-pointer transition-opacity ${
+            isFavorite ? 'text-warning opacity-100' : 'text-text-muted opacity-0 group-hover:opacity-50 hover:!opacity-100'
+          }`}
+          title={isFavorite ? 'Remove from favorites' : 'Add to favorites'}
+        >
+          ★
         </span>
       )}
     </button>

@@ -118,6 +118,11 @@ function initSchema(db: Database.Database) {
       value TEXT NOT NULL DEFAULT '',
       UNIQUE(environment_id, name)
     );
+
+    CREATE TABLE IF NOT EXISTS favorites (
+      operation_id TEXT PRIMARY KEY,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
   `);
 }
 
@@ -416,4 +421,24 @@ export function reorderCollectionItems(collectionId: string, itemIds: string[]) 
     itemIds.forEach((id, i) => stmt.run(i, id, collectionId));
   });
   tx();
+}
+
+// === Favorites CRUD ===
+
+export function getFavorites(): string[] {
+  const rows = getDb().prepare('SELECT operation_id FROM favorites ORDER BY created_at').all() as Array<{ operation_id: string }>;
+  return rows.map(r => r.operation_id);
+}
+
+export function addFavorite(operationId: string) {
+  getDb().prepare('INSERT OR IGNORE INTO favorites (operation_id) VALUES (?)').run(operationId);
+}
+
+export function removeFavorite(operationId: string) {
+  getDb().prepare('DELETE FROM favorites WHERE operation_id = ?').run(operationId);
+}
+
+export function isFavorite(operationId: string): boolean {
+  const row = getDb().prepare('SELECT 1 FROM favorites WHERE operation_id = ?').get(operationId);
+  return !!row;
 }
