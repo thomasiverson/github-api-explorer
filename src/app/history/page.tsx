@@ -14,11 +14,24 @@ const METHOD_COLORS: Record<string, string> = {
   PATCH: 'method-patch-bg', DELETE: 'method-delete-bg',
 };
 
+interface DiffDataFull {
+  leftBody: unknown;
+  rightBody: unknown;
+  leftHeaders: Record<string, string>;
+  rightHeaders: Record<string, string>;
+  leftLabel: string;
+  rightLabel: string;
+  leftStatus: number;
+  rightStatus: number;
+  leftTiming: number;
+  rightTiming: number;
+}
+
 export default function HistoryPage() {
   const [history, setHistory] = useState<HistoryRow[]>([]);
   const [filter, setFilter] = useState('');
   const [compareIds, setCompareIds] = useState<Set<string>>(new Set());
-  const [diffData, setDiffData] = useState<{ left: unknown; right: unknown; leftLabel: string; rightLabel: string } | null>(null);
+  const [diffData, setDiffData] = useState<DiffDataFull | null>(null);
 
   useEffect(() => { loadHistory(); }, []);
 
@@ -88,10 +101,16 @@ export default function HistoryPage() {
         return;
       }
       setDiffData({
-        left: safeParseJson(a.response_body),
-        right: safeParseJson(b.response_body),
+        leftBody: safeParseJson(a.response_body),
+        rightBody: safeParseJson(b.response_body),
+        leftHeaders: safeParseJson(a.response_headers) as Record<string, string> || {},
+        rightHeaders: safeParseJson(b.response_headers) as Record<string, string> || {},
         leftLabel: `${a.method} ${a.path} (${new Date(a.created_at).toLocaleString()})`,
         rightLabel: `${b.method} ${b.path} (${new Date(b.created_at).toLocaleString()})`,
+        leftStatus: a.status,
+        rightStatus: b.status,
+        leftTiming: a.timing,
+        rightTiming: b.timing,
       });
     } catch (err) {
       alert(`Compare failed: ${err instanceof Error ? err.message : 'Unknown error'}`);
@@ -133,13 +152,7 @@ export default function HistoryPage() {
           </div>
           {/* Diff viewer - above the table */}
           {diffData && (
-            <DiffViewer
-              left={diffData.left}
-              right={diffData.right}
-              leftLabel={diffData.leftLabel}
-              rightLabel={diffData.rightLabel}
-              onClose={() => { setDiffData(null); setCompareIds(new Set()); }}
-            />
+            <DiffViewer data={diffData} onClose={() => { setDiffData(null); setCompareIds(new Set()); }} />
           )}
           <div className="bg-panel border border-border rounded-lg overflow-hidden">
             <table className="w-full text-sm">
@@ -287,14 +300,17 @@ function computeDiff(left: unknown, right: unknown): { identical: boolean; entri
   return { identical: false, entries: [], summary: `Values differ. Left: ${typeof left}, Right: ${typeof right}` };
 }
 
-function DiffViewer({ left, right, leftLabel, rightLabel, onClose }: {
-  left: unknown; right: unknown; leftLabel: string; rightLabel: string; onClose: () => void;
-}) {
-  const diff = computeDiff(left, right);
+function DiffViewer({ data, onClose }: { data: DiffDataFull; onClose: () => void }) {
+  const diff = computeDiff(data.leftBody, data.rightBody);
+  const headerDiff = computeDiff(data.leftHeaders, data.rightHeaders);
   const [expanded, setExpanded] = useState(false);
+  const [activeTab, setActiveTab] = useState<'diff' | 'headers' | 'raw' | 'preview'>('diff');
+
+  const statusColor = (s: number) => s >= 500 ? 'text-danger' : s >= 400 ? 'text-warning' : 'text-success';
 
   return (
     <div className="mb-6 bg-panel border border-border rounded-lg overflow-hidden">
+      {/* Collapsible header */}
       <div className="p-3 flex items-center justify-between cursor-pointer hover:bg-surface/50 transition-colors"
         onClick={() => setExpanded(!expanded)}>
         <div className="flex items-center gap-3">
@@ -316,67 +332,163 @@ function DiffViewer({ left, right, leftLabel, rightLabel, onClose }: {
 
       {expanded && (
         <>
-          {/* Labels */}
+          {/* Status + label bar */}
           <div className="flex border-t border-b border-border">
-            <div className="flex-1 px-3 py-1.5 bg-surface text-xs text-text-secondary font-mono truncate border-r border-border">{leftLabel}</div>
-            <div className="flex-1 px-3 py-1.5 bg-surface text-xs text-text-secondary font-mono truncate">{rightLabel}</div>
+            <div className="flex-1 px-3 py-1.5 bg-surface text-xs font-mono truncate border-r border-border flex items-center gap-2">
+              <span className={`font-bold ${statusColor(data.leftStatus)}`}>{data.leftStatus}</span>
+              <span className="text-text-muted">{data.leftTiming}ms</span>
+              <span className="text-text-secondary truncate">{data.leftLabel}</span>
+            </div>
+            <div className="flex-1 px-3 py-1.5 bg-surface text-xs font-mono truncate flex items-center gap-2">
+              <span className={`font-bold ${statusColor(data.rightStatus)}`}>{data.rightStatus}</span>
+              <span className="text-text-muted">{data.rightTiming}ms</span>
+              <span className="text-text-secondary truncate">{data.rightLabel}</span>
+            </div>
           </div>
 
-          {diff.identical ? (
-            <div className="p-6 text-center text-text-muted text-sm">
-              ✓ Both responses are exactly the same.
-            </div>
-          ) : diff.entries.length > 0 ? (
-        /* Key-level diff for objects */
-        <div className="max-h-96 overflow-auto">
-          {diff.entries.map(entry => (
-            <div key={entry.key} className={`flex border-b border-border/50 text-xs font-mono ${
-              entry.status === 'changed' ? 'bg-warning/5' :
-              entry.status === 'added' ? 'bg-success/5' :
-              entry.status === 'removed' ? 'bg-danger/5' : ''
-            }`}>
-              <div className="w-8 shrink-0 flex items-start justify-center pt-1.5 text-[10px]">
-                {entry.status === 'changed' && <span className="text-warning">≠</span>}
-                {entry.status === 'added' && <span className="text-success">+</span>}
-                {entry.status === 'removed' && <span className="text-danger">−</span>}
-                {entry.status === 'same' && <span className="text-text-muted">=</span>}
+          {/* Tabs */}
+          <div className="flex border-b border-border">
+            {(['diff', 'headers', 'raw', 'preview'] as const).map(tab => (
+              <button key={tab} onClick={() => setActiveTab(tab)}
+                className={`px-4 py-2 text-xs font-medium transition-colors border-b-2 ${
+                  activeTab === tab
+                    ? 'text-text-primary border-accent'
+                    : 'text-text-secondary border-transparent hover:text-text-primary'
+                }`}>
+                {tab === 'diff' ? `Body Diff${!diff.identical ? ` (${diff.entries.filter(e => e.status !== 'same').length})` : ''}` :
+                 tab === 'headers' ? `Headers${!headerDiff.identical ? ' ≠' : ''}` :
+                 tab === 'raw' ? 'Raw' : 'Preview'}
+              </button>
+            ))}
+          </div>
+
+          {/* Tab content */}
+          <div className="max-h-96 overflow-auto">
+            {activeTab === 'diff' && (
+              diff.identical ? (
+                <div className="p-6 text-center text-text-muted text-sm">✓ Both response bodies are exactly the same.</div>
+              ) : diff.entries.length > 0 ? (
+                <div>
+                  {diff.entries.map(entry => (
+                    <div key={entry.key} className={`flex border-b border-border/50 text-xs font-mono ${
+                      entry.status === 'changed' ? 'bg-warning/5' :
+                      entry.status === 'added' ? 'bg-success/5' :
+                      entry.status === 'removed' ? 'bg-danger/5' : ''
+                    }`}>
+                      <div className="w-8 shrink-0 flex items-start justify-center pt-1.5 text-[10px]">
+                        {entry.status === 'changed' && <span className="text-warning">≠</span>}
+                        {entry.status === 'added' && <span className="text-success">+</span>}
+                        {entry.status === 'removed' && <span className="text-danger">−</span>}
+                        {entry.status === 'same' && <span className="text-text-muted">=</span>}
+                      </div>
+                      <div className="flex-1 px-2 py-1 border-r border-border/50 break-all">
+                        <span className="text-text-muted">{entry.key}: </span>
+                        {entry.left !== undefined ? (
+                          <span className={entry.status === 'changed' ? 'text-danger' : 'text-text-secondary'}>{formatValue(entry.left)}</span>
+                        ) : <span className="text-text-muted italic">—</span>}
+                      </div>
+                      <div className="flex-1 px-2 py-1 break-all">
+                        <span className="text-text-muted">{entry.key}: </span>
+                        {entry.right !== undefined ? (
+                          <span className={entry.status === 'changed' ? 'text-success' : 'text-text-secondary'}>{formatValue(entry.right)}</span>
+                        ) : <span className="text-text-muted italic">—</span>}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="flex">
+                  <pre className="flex-1 p-3 text-xs font-mono text-text-secondary whitespace-pre-wrap break-all overflow-auto border-r border-border">
+                    {typeof data.leftBody === 'string' ? data.leftBody : JSON.stringify(data.leftBody, null, 2)}
+                  </pre>
+                  <pre className="flex-1 p-3 text-xs font-mono text-text-secondary whitespace-pre-wrap break-all overflow-auto">
+                    {typeof data.rightBody === 'string' ? data.rightBody : JSON.stringify(data.rightBody, null, 2)}
+                  </pre>
+                </div>
+              )
+            )}
+
+            {activeTab === 'headers' && (
+              headerDiff.identical ? (
+                <div className="p-6 text-center text-text-muted text-sm">✓ Both sets of headers are exactly the same.</div>
+              ) : (
+                <div className="flex">
+                  <div className="flex-1 p-3 border-r border-border space-y-0.5">
+                    {Object.entries(data.leftHeaders).map(([k, v]) => {
+                      const changed = data.rightHeaders[k] !== v;
+                      const removed = !(k in data.rightHeaders);
+                      return (
+                        <div key={k} className={`text-xs font-mono ${removed ? 'bg-danger/10' : changed ? 'bg-warning/10' : ''} px-1 rounded`}>
+                          <span className="text-accent">{k}:</span> <span className="text-text-secondary">{v}</span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                  <div className="flex-1 p-3 space-y-0.5">
+                    {Object.entries(data.rightHeaders).map(([k, v]) => {
+                      const changed = data.leftHeaders[k] !== v;
+                      const added = !(k in data.leftHeaders);
+                      return (
+                        <div key={k} className={`text-xs font-mono ${added ? 'bg-success/10' : changed ? 'bg-warning/10' : ''} px-1 rounded`}>
+                          <span className="text-accent">{k}:</span> <span className="text-text-secondary">{v}</span>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              )
+            )}
+
+            {activeTab === 'raw' && (
+              <div className="flex">
+                <pre className="flex-1 p-3 text-xs font-mono text-text-secondary whitespace-pre-wrap break-all overflow-auto border-r border-border">
+                  {typeof data.leftBody === 'string' ? data.leftBody : JSON.stringify(data.leftBody, null, 2)}
+                </pre>
+                <pre className="flex-1 p-3 text-xs font-mono text-text-secondary whitespace-pre-wrap break-all overflow-auto">
+                  {typeof data.rightBody === 'string' ? data.rightBody : JSON.stringify(data.rightBody, null, 2)}
+                </pre>
               </div>
-              <div className="flex-1 px-2 py-1 border-r border-border/50 break-all">
-                <span className="text-text-muted">{entry.key}: </span>
-                {entry.left !== undefined ? (
-                  <span className={entry.status === 'changed' ? 'text-danger' : 'text-text-secondary'}>
-                    {formatValue(entry.left)}
-                  </span>
-                ) : (
-                  <span className="text-text-muted italic">—</span>
-                )}
+            )}
+
+            {activeTab === 'preview' && (
+              <div className="flex">
+                <div className="flex-1 p-3 border-r border-border">
+                  <DiffPreviewSide data={data.leftBody} />
+                </div>
+                <div className="flex-1 p-3">
+                  <DiffPreviewSide data={data.rightBody} />
+                </div>
               </div>
-              <div className="flex-1 px-2 py-1 break-all">
-                <span className="text-text-muted">{entry.key}: </span>
-                {entry.right !== undefined ? (
-                  <span className={entry.status === 'changed' ? 'text-success' : 'text-text-secondary'}>
-                    {formatValue(entry.right)}
-                  </span>
-                ) : (
-                  <span className="text-text-muted italic">—</span>
-                )}
-              </div>
-            </div>
-          ))}
-        </div>
-      ) : (
-        /* Fallback: raw side-by-side for arrays/primitives */
-        <div className="flex max-h-96">
-          <pre className="flex-1 p-3 text-xs font-mono text-text-secondary whitespace-pre-wrap break-all overflow-auto border-r border-border">
-            {typeof left === 'string' ? left : JSON.stringify(left, null, 2)}
-          </pre>
-          <pre className="flex-1 p-3 text-xs font-mono text-text-secondary whitespace-pre-wrap break-all overflow-auto">
-            {typeof right === 'string' ? right : JSON.stringify(right, null, 2)}
-          </pre>
-        </div>
-      )}
+            )}
+          </div>
         </>
       )}
+    </div>
+  );
+}
+
+function DiffPreviewSide({ data }: { data: unknown }) {
+  if (!data || typeof data !== 'object') {
+    return <span className="text-xs text-text-muted font-mono">{String(data ?? 'null')}</span>;
+  }
+  const entries = Object.entries(data as Record<string, unknown>);
+  const urlRegex = /^https?:\/\//;
+  return (
+    <div className="space-y-0.5 text-xs font-mono">
+      {entries.map(([key, val]) => {
+        const strVal = typeof val === 'object' ? JSON.stringify(val) : String(val ?? '');
+        const isUrl = typeof val === 'string' && urlRegex.test(val);
+        return (
+          <div key={key} className="flex gap-1">
+            <span className="text-text-muted shrink-0">{key}:</span>
+            {isUrl ? (
+              <a href={val as string} target="_blank" rel="noopener noreferrer" className="text-accent hover:underline truncate">{val as string}</a>
+            ) : (
+              <span className="text-text-secondary truncate">{strVal.length > 100 ? strVal.slice(0, 100) + '...' : strVal}</span>
+            )}
+          </div>
+        );
+      })}
     </div>
   );
 }
