@@ -15,9 +15,12 @@ export function RequestBuilder() {
   const [bodyText, setBodyText] = useState('');
   const [activeTab, setActiveTab] = useState<'params' | 'body' | 'headers'>('params');
   const [customHeaders, setCustomHeaders] = useState<Array<{ key: string; value: string; enabled: boolean }>>([]);
+  const [curlCopied, setCurlCopied] = useState(false);
 
   // Keep a ref to activeEnv so the effect always reads the latest value
   const activeEnvRef = useRef(activeEnv);
+  // Ref for keyboard shortcut to call latest executeRequest
+  const executeRequestRef = useRef<(() => void) | null>(null);
   activeEnvRef.current = activeEnv;
 
   // Reset form when endpoint changes
@@ -56,9 +59,53 @@ export function RequestBuilder() {
     setActiveTab(selectedEndpoint.pathParams.length > 0 || selectedEndpoint.queryParams.length > 0 ? 'params' : 'body');
   }, [selectedEndpoint]);
 
+  // Ctrl+Enter / Cmd+Enter to send
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') {
+        e.preventDefault();
+        executeRequestRef.current?.();
+      }
+    };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, []);
+
   const resolvedPath = selectedEndpoint
     ? selectedEndpoint.path.replace(/\{(\w+)\}/g, (_, key) => pathValues[key] || `{${key}}`)
     : '';
+
+  const buildResolvedUrl = useCallback(() => {
+    if (!selectedEndpoint || !activeEnv) return '';
+    const enabledQueries: Record<string, string> = {};
+    for (const [k, v] of Object.entries(queryValues)) {
+      if (v.enabled && v.value) enabledQueries[k] = v.value;
+    }
+    const queryString = Object.entries(enabledQueries)
+      .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
+      .join('&');
+    return `${activeEnv.base_url}${resolvedPath}${queryString ? '?' + queryString : ''}`;
+  }, [selectedEndpoint, activeEnv, queryValues, resolvedPath]);
+
+  const copyAsCurl = useCallback(() => {
+    if (!selectedEndpoint || !activeEnv) return;
+    const url = buildResolvedUrl();
+    const parts = ['curl'];
+    if (selectedEndpoint.method !== 'GET') {
+      parts.push(`-X ${selectedEndpoint.method}`);
+    }
+    parts.push(`"${url}"`);
+    parts.push('-H "Accept: application/vnd.github+json"');
+    parts.push('-H "Authorization: token YOUR_TOKEN"');
+    parts.push('-H "X-GitHub-Api-Version: 2022-11-28"');
+    for (const h of customHeaders) {
+      if (h.enabled && h.key) parts.push(`-H "${h.key}: ${h.value}"`);
+    }
+    if (bodyText && ['POST', 'PUT', 'PATCH'].includes(selectedEndpoint.method)) {
+      parts.push(`-d '${bodyText.replace(/\n/g, '')}'`);
+    }
+    navigator.clipboard.writeText(parts.join(' \\\n  '));
+  }, [selectedEndpoint, activeEnv, buildResolvedUrl, customHeaders, bodyText]);
 
   const executeRequest = useCallback(async (nextPageUrl?: string) => {
     if (!selectedEndpoint || !activeEnv) return;
@@ -115,6 +162,9 @@ export function RequestBuilder() {
     }
   }, [selectedEndpoint, activeEnv, pathValues, queryValues, bodyText, customHeaders, setResponse, setIsLoading]);
 
+  // Keep ref in sync for keyboard shortcut
+  executeRequestRef.current = () => executeRequest();
+
   if (!selectedEndpoint) {
     return (
       <div className="flex-1 flex items-center justify-center bg-canvas">
@@ -153,6 +203,15 @@ export function RequestBuilder() {
               </svg>
             ) : null}
             Send
+          </button>
+          <button
+            onClick={() => { copyAsCurl(); setCurlCopied(true); setTimeout(() => setCurlCopied(false), 2000); }}
+            disabled={!activeEnv}
+            className="px-2.5 py-1.5 border border-border text-text-secondary text-sm rounded-md
+                       hover:bg-surface disabled:opacity-50 transition-colors shrink-0"
+            title="Copy as cURL command"
+          >
+            {curlCopied ? '✓ Copied' : 'cURL'}
           </button>
         </div>
         {/* Endpoint info */}

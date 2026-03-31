@@ -103,8 +103,8 @@ export default function HistoryPage() {
                         {h.method}
                       </span>
                     </td>
-                    <td className="px-4 py-2 font-mono text-text-primary truncate max-w-md">
-                      <a href={`/?replay=${h.id}`} className="hover:text-accent transition-colors">{h.path}</a>
+                    <td className="px-4 py-2 font-mono text-text-primary truncate max-w-md" title={h.path}>
+                      {h.path}
                     </td>
                     <td className={`px-4 py-2 font-mono font-bold ${statusClass(h.status)}`}>
                       {h.status}
@@ -114,12 +114,20 @@ export default function HistoryPage() {
                       {new Date(h.created_at).toLocaleString()}
                     </td>
                     <td className="px-4 py-2">
-                      <button onClick={() => deleteEntry(h.id)}
-                        className="text-text-muted hover:text-danger transition-colors p-1">
-                        <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
-                          <path d="M11 1.75V3h2.25a.75.75 0 0 1 0 1.5H2.75a.75.75 0 0 1 0-1.5H5V1.75C5 .784 5.784 0 6.75 0h2.5C10.216 0 11 .784 11 1.75ZM4.496 6.675l.66 6.6a.25.25 0 0 0 .249.225h5.19a.25.25 0 0 0 .249-.225l.66-6.6a.75.75 0 0 1 1.492.149l-.66 6.6A1.748 1.748 0 0 1 10.595 15h-5.19a1.75 1.75 0 0 1-1.741-1.575l-.66-6.6a.75.75 0 1 1 1.492-.15ZM6.5 1.75V3h3V1.75a.25.25 0 0 0-.25-.25h-2.5a.25.25 0 0 0-.25.25Z" />
-                        </svg>
-                      </button>
+                      <div className="flex items-center gap-1">
+                        <a href={`/?replay=${h.id}`}
+                          className="text-text-muted hover:text-accent transition-colors p-1" title="Replay">
+                          <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
+                            <path d="M1.705 8.005a.75.75 0 0 1 .834.656 5.5 5.5 0 0 0 9.592 2.97l-1.204-1.204a.25.25 0 0 1 .177-.427h3.646a.25.25 0 0 1 .25.25v3.646a.25.25 0 0 1-.427.177l-1.38-1.38A7.002 7.002 0 0 1 1.05 8.84a.75.75 0 0 1 .656-.834ZM8 2.5a5.487 5.487 0 0 0-4.131 1.869l1.204 1.204A.25.25 0 0 1 4.896 6H1.25A.25.25 0 0 1 1 5.75V2.104a.25.25 0 0 1 .427-.177l1.38 1.38A7.002 7.002 0 0 1 14.95 7.16a.75.75 0 0 1-1.49.178A5.5 5.5 0 0 0 8 2.5Z" />
+                          </svg>
+                        </a>
+                        <button onClick={() => deleteEntry(h.id)}
+                          className="text-text-muted hover:text-danger transition-colors p-1" title="Delete">
+                          <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
+                            <path d="M11 1.75V3h2.25a.75.75 0 0 1 0 1.5H2.75a.75.75 0 0 1 0-1.5H5V1.75C5 .784 5.784 0 6.75 0h2.5C10.216 0 11 .784 11 1.75ZM4.496 6.675l.66 6.6a.25.25 0 0 0 .249.225h5.19a.25.25 0 0 0 .249-.225l.66-6.6a.75.75 0 0 1 1.492.149l-.66 6.6A1.748 1.748 0 0 1 10.595 15h-5.19a1.75 1.75 0 0 1-1.741-1.575l-.66-6.6a.75.75 0 1 1 1.492-.15ZM6.5 1.75V3h3V1.75a.25.25 0 0 0-.25-.25h-2.5a.25.25 0 0 0-.25.25Z" />
+                          </svg>
+                        </button>
+                      </div>
                     </td>
                   </tr>
                 ))}

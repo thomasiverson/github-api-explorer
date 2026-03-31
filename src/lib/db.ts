@@ -312,6 +312,10 @@ export function getHistory(environmentId?: string, limit = 100, offset = 0) {
   ).all(limit, offset);
 }
 
+export function getHistoryEntry(id: string) {
+  return getDb().prepare('SELECT * FROM history WHERE id = ?').get(id);
+}
+
 export function deleteHistory(id: string) {
   getDb().prepare('DELETE FROM history WHERE id = ?').run(id);
 }

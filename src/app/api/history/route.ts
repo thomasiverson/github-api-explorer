@@ -1,8 +1,13 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { getHistory, deleteHistory, clearHistory } from '@/lib/db';
+import { getHistory, getHistoryEntry, deleteHistory, clearHistory } from '@/lib/db';
 
 export async function GET(request: NextRequest) {
   const { searchParams } = new URL(request.url);
+  const id = searchParams.get('id');
+  if (id) {
+    const entry = getHistoryEntry(id);
+    return NextResponse.json(entry || null);
+  }
   const environmentId = searchParams.get('environmentId') || undefined;
   const limit = parseInt(searchParams.get('limit') || '100');
   const offset = parseInt(searchParams.get('offset') || '0');

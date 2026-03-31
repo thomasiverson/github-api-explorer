@@ -245,7 +245,7 @@ function EndpointItem({
       className={`w-full flex items-center gap-2 px-3 py-1 text-left hover:bg-surface/50 transition-colors
         ${isActive ? 'bg-surface border-l-2 border-accent' : 'border-l-2 border-transparent'}
         ${endpoint.is_deprecated ? 'opacity-50' : ''}`}
-      title={endpoint.summary || endpoint.path}
+      title={`${endpoint.method} ${endpoint.path}${endpoint.summary ? '\n\n' + endpoint.summary : ''}`}
     >
       <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded ${METHOD_COLORS[endpoint.method] || 'bg-text-muted'} shrink-0 leading-none`}>
         {endpoint.method}

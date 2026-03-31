@@ -8,6 +8,7 @@ export function ResponseViewer() {
   const [activeTab, setActiveTab] = useState<'body' | 'headers' | 'raw' | 'preview'>('body');
   const [pages, setPages] = useState<unknown[]>([]);
   const [loadingMore, setLoadingMore] = useState(false);
+  const [bodyFilter, setBodyFilter] = useState('');
 
   // Track paginated data
   const displayBody = pages.length > 0
@@ -146,7 +147,18 @@ export function ResponseViewer() {
       <div className="flex-1 overflow-auto p-3">
         {activeTab === 'body' && (
           <div>
-            <JsonViewer data={displayBody} />
+            {/* Body search */}
+            <div className="mb-2">
+              <input
+                type="text"
+                value={bodyFilter}
+                onChange={e => setBodyFilter(e.target.value)}
+                placeholder="Filter response... (key or value)"
+                className="w-full bg-surface border border-border rounded-md px-3 py-1.5 text-xs text-text-primary
+                           placeholder-text-muted focus:outline-none focus:ring-1 focus:ring-accent font-mono"
+              />
+            </div>
+            <JsonViewer data={bodyFilter ? filterJson(displayBody, bodyFilter) : displayBody} />
             {response.nextPageUrl && (
               <div className="mt-4 text-center">
                 <button
@@ -405,4 +417,43 @@ function PreviewValue({ value }: { value: unknown }) {
     return <span className="text-xs font-mono text-text-secondary break-all">{parts}</span>;
   }
   return <span className="text-xs font-mono text-text-secondary break-all">{str}</span>;
+}
+
+function filterJson(data: unknown, query: string): unknown {
+  if (!query) return data;
+  const q = query.toLowerCase();
+
+  if (data === null || data === undefined) return null;
+  if (typeof data === 'string') return data.toLowerCase().includes(q) ? data : undefined;
+  if (typeof data === 'number' || typeof data === 'boolean') {
+    return String(data).toLowerCase().includes(q) ? data : undefined;
+  }
+
+  if (Array.isArray(data)) {
+    const filtered = data
+      .map(item => filterJson(item, query))
+      .filter(item => item !== undefined);
+    return filtered.length > 0 ? filtered : undefined;
+  }
+
+  if (typeof data === 'object') {
+    const obj = data as Record<string, unknown>;
+    const result: Record<string, unknown> = {};
+    let hasMatch = false;
+    for (const [key, value] of Object.entries(obj)) {
+      if (key.toLowerCase().includes(q)) {
+        result[key] = value; // key matches — keep entire value
+        hasMatch = true;
+      } else {
+        const filtered = filterJson(value, query);
+        if (filtered !== undefined) {
+          result[key] = filtered;
+          hasMatch = true;
+        }
+      }
+    }
+    return hasMatch ? result : undefined;
+  }
+
+  return undefined;
 }
