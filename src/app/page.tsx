@@ -30,6 +30,7 @@ function ReplayHandler() {
         path: entry.path,
         summary: '',
         description: '',
+        specVersion: '',
         pathParams: extractPathParams(entry.path),
         queryParams: [],
         bodySchema: null,

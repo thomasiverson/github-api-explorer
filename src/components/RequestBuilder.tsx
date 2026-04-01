@@ -276,6 +276,7 @@ export function RequestBuilder() {
             description={selectedEndpoint.description}
             operationId={selectedEndpoint.operationId}
             category={selectedEndpoint.category}
+            specVersion={selectedEndpoint.specVersion}
           />
         )}
       </div>
@@ -526,14 +527,21 @@ function isValidJson(text: string): boolean {
   try { JSON.parse(text); return true; } catch { return false; }
 }
 
-function EndpointInfo({ summary, description, operationId, category }: {
-  summary: string; description: string; operationId: string; category: string;
+function EndpointInfo({ summary, description, operationId, category, specVersion }: {
+  summary: string; description: string; operationId: string; category: string; specVersion: string;
 }) {
   const hasDescription = description && description.trim().length > 0;
 
-  // Link to GitHub docs search with the endpoint summary as the query
-  const searchQuery = summary || operationId.split('/').pop() || category;
-  const docsUrl = `https://docs.github.com/rest/${encodeURIComponent(category)}`;
+  // Build version-aware GitHub docs URL
+  // Cloud: /rest/{category} | GHES: /enterprise-server@3.10/rest/{category}
+  let docsBase = 'https://docs.github.com';
+  if (specVersion && specVersion.startsWith('ghes-')) {
+    const ver = specVersion.replace('ghes-', '');
+    docsBase = `https://docs.github.com/enterprise-server@${ver}`;
+  } else if (specVersion === 'ghec') {
+    docsBase = 'https://docs.github.com/enterprise-cloud@latest';
+  }
+  const docsUrl = `${docsBase}/rest/${encodeURIComponent(category)}`;
 
   return (
     <div className="mt-2">

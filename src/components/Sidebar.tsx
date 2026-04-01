@@ -23,6 +23,7 @@ interface EndpointRow {
   body_schema: string | null;
   response_schema: string | null;
   is_deprecated: number;
+  spec_version: string;
 }
 
 const METHOD_COLORS: Record<string, string> = {
@@ -161,6 +162,7 @@ export function Sidebar() {
       path: ep.path,
       summary: ep.summary,
       description: ep.description,
+      specVersion: ep.spec_version || selectedVersion || '',
       pathParams: JSON.parse(ep.path_params || '[]'),
       queryParams: JSON.parse(ep.query_params || '[]'),
       bodySchema: ep.body_schema ? JSON.parse(ep.body_schema) : null,

@@ -10,6 +10,7 @@ interface EndpointSelection {
   path: string;
   summary: string;
   description: string;
+  specVersion: string;
   pathParams: Array<{ name: string; description: string; required: boolean; type: string; default?: string; enum?: string[] }>;
   queryParams: Array<{ name: string; description: string; required: boolean; type: string; default?: string; enum?: string[] }>;
   bodySchema: unknown | null;
