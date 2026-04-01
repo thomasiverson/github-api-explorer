@@ -15,8 +15,8 @@ interface DiffEntry {
   status: 'added' | 'removed' | 'changed' | 'unchanged';
   summary: string;
   changes?: string[];
-  fromEndpoint?: EndpointRow;
-  toEndpoint?: EndpointRow;
+  fromEndpoint?: Record<string, unknown>;
+  toEndpoint?: Record<string, unknown>;
 }
 
 export async function GET(request: NextRequest) {

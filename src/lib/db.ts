@@ -239,20 +239,38 @@ export function getCredential(environmentId: string): { authType: string; data: 
 
 // === Endpoint Queries ===
 
-export function getEndpointCategories(): Array<{ category: string; count: number }> {
+export function getEndpointCategories(specVersion?: string): Array<{ category: string; count: number }> {
+  if (specVersion) {
+    return getDb().prepare(`
+      SELECT category, COUNT(*) as count FROM endpoints WHERE spec_version = ? GROUP BY category ORDER BY category
+    `).all(specVersion) as Array<{ category: string; count: number }>;
+  }
   return getDb().prepare(`
     SELECT category, COUNT(*) as count FROM endpoints GROUP BY category ORDER BY category
   `).all() as Array<{ category: string; count: number }>;
 }
 
-export function getEndpointsByCategory(category: string) {
+export function getEndpointsByCategory(category: string, specVersion?: string) {
+  if (specVersion) {
+    return getDb().prepare(
+      'SELECT * FROM endpoints WHERE category = ? AND spec_version = ? ORDER BY path, method'
+    ).all(category, specVersion);
+  }
   return getDb().prepare(
     'SELECT * FROM endpoints WHERE category = ? ORDER BY path, method'
   ).all(category);
 }
 
-export function searchEndpoints(query: string, limit = 50) {
+export function searchEndpoints(query: string, limit = 50, specVersion?: string) {
   const pattern = `%${query}%`;
+  if (specVersion) {
+    return getDb().prepare(`
+      SELECT * FROM endpoints
+      WHERE spec_version = ? AND (operation_id LIKE ? OR path LIKE ? OR summary LIKE ? OR category LIKE ?)
+      ORDER BY category, path, method
+      LIMIT ?
+    `).all(specVersion, pattern, pattern, pattern, pattern, limit);
+  }
   return getDb().prepare(`
     SELECT * FROM endpoints
     WHERE operation_id LIKE ? OR path LIKE ? OR summary LIKE ? OR category LIKE ?
@@ -261,7 +279,11 @@ export function searchEndpoints(query: string, limit = 50) {
   `).all(pattern, pattern, pattern, pattern, limit);
 }
 
-export function getEndpointCount(): number {
+export function getEndpointCount(specVersion?: string): number {
+  if (specVersion) {
+    const row = getDb().prepare('SELECT COUNT(*) as count FROM endpoints WHERE spec_version = ?').get(specVersion) as { count: number };
+    return row.count;
+  }
   const row = getDb().prepare('SELECT COUNT(*) as count FROM endpoints').get() as { count: number };
   return row.count;
 }

@@ -47,6 +47,8 @@ export function Sidebar() {
   const [isBulkRunning, setIsBulkRunning] = useState(false);
   const [favorites, setFavorites] = useState<Set<string>>(new Set());
   const [favoriteEndpoints, setFavoriteEndpoints] = useState<EndpointRow[]>([]);
+  const [specVersions, setSpecVersions] = useState<Array<{ spec_version: string; count: number }>>([]);
+  const [selectedVersion, setSelectedVersion] = useState<string>('');
   const searchInputRef = useRef<HTMLInputElement>(null);
   const searchTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -64,11 +66,17 @@ export function Sidebar() {
     return () => window.removeEventListener('keydown', handler);
   }, []);
 
-  async function loadCategories() {
-    const res = await fetch('/api/endpoints?action=categories');
+  async function loadCategories(version?: string) {
+    const vParam = version || selectedVersion;
+    const vQuery = vParam ? `&version=${encodeURIComponent(vParam)}` : '';
+    const res = await fetch(`/api/endpoints?action=categories${vQuery}`);
     const data = await res.json();
     setCategories(data.categories);
     setTotalCount(data.total);
+    if (data.versions) setSpecVersions(data.versions);
+    // Reset expanded categories when version changes
+    setExpandedCategories(new Set());
+    setCategoryEndpoints({});
   }
 
   async function loadFavorites() {
@@ -116,7 +124,8 @@ export function Sidebar() {
     } else {
       next.add(cat);
       if (!categoryEndpoints[cat]) {
-        const res = await fetch(`/api/endpoints?action=by-category&category=${encodeURIComponent(cat)}`);
+        const vQuery = selectedVersion ? `&version=${encodeURIComponent(selectedVersion)}` : '';
+        const res = await fetch(`/api/endpoints?action=by-category&category=${encodeURIComponent(cat)}${vQuery}`);
         const endpoints = await res.json();
         setCategoryEndpoints(prev => ({ ...prev, [cat]: endpoints }));
       }
@@ -136,7 +145,8 @@ export function Sidebar() {
 
     setIsSearching(true);
     searchTimeoutRef.current = setTimeout(async () => {
-      const res = await fetch(`/api/endpoints?action=search&q=${encodeURIComponent(query)}&limit=50`);
+      const vQuery = selectedVersion ? `&version=${encodeURIComponent(selectedVersion)}` : '';
+      const res = await fetch(`/api/endpoints?action=search&q=${encodeURIComponent(query)}&limit=50${vQuery}`);
       const results = await res.json();
       setSearchResults(results);
       setIsSearching(false);
@@ -255,6 +265,20 @@ export function Sidebar() {
           </div>
         )}
         <p className="text-[10px] text-text-muted mt-1">Ctrl+click to multi-select</p>
+        {/* Version filter */}
+        {specVersions.length > 1 && (
+          <select
+            value={selectedVersion}
+            onChange={e => { setSelectedVersion(e.target.value); loadCategories(e.target.value); }}
+            className="mt-2 w-full bg-surface border border-border rounded-md px-2 py-1 text-[11px] text-text-primary
+                       focus:outline-none focus:ring-1 focus:ring-accent"
+          >
+            <option value="">All versions ({totalCount})</option>
+            {specVersions.map(v => (
+              <option key={v.spec_version} value={v.spec_version}>{v.spec_version} ({v.count})</option>
+            ))}
+          </select>
+        )}
       </div>
 
       {/* Search */}
