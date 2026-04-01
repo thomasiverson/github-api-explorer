@@ -182,10 +182,10 @@ export default function ComparePage() {
             <>
               {/* Summary cards */}
               <div className="grid grid-cols-4 gap-3">
-                <SummaryCard label="Added" count={diffResult.summary.added} color="text-success" bg="bg-success/10" />
-                <SummaryCard label="Removed" count={diffResult.summary.removed} color="text-danger" bg="bg-danger/10" />
-                <SummaryCard label="Changed" count={diffResult.summary.changed} color="text-warning" bg="bg-warning/10" />
-                <SummaryCard label="Unchanged" count={diffResult.summary.unchanged} color="text-text-muted" bg="bg-surface" />
+                <SummaryCard label="Added" count={diffResult.summary.added} color="text-success" bg="bg-success/10" active={filterStatus === 'added'} onClick={() => setFilterStatus(filterStatus === 'added' ? 'all' : 'added')} />
+                <SummaryCard label="Removed" count={diffResult.summary.removed} color="text-danger" bg="bg-danger/10" active={filterStatus === 'removed'} onClick={() => setFilterStatus(filterStatus === 'removed' ? 'all' : 'removed')} />
+                <SummaryCard label="Changed" count={diffResult.summary.changed} color="text-warning" bg="bg-warning/10" active={filterStatus === 'changed'} onClick={() => setFilterStatus(filterStatus === 'changed' ? 'all' : 'changed')} />
+                <SummaryCard label="Unchanged" count={diffResult.summary.unchanged} color="text-text-muted" bg="bg-surface" active={filterStatus === 'unchanged'} onClick={() => setFilterStatus(filterStatus === 'unchanged' ? 'all' : 'unchanged')} />
               </div>
 
               {/* Filters */}
@@ -278,12 +278,16 @@ export default function ComparePage() {
   );
 }
 
-function SummaryCard({ label, count, color, bg }: { label: string; count: number; color: string; bg: string }) {
+function SummaryCard({ label, count, color, bg, active, onClick }: {
+  label: string; count: number; color: string; bg: string; active: boolean; onClick: () => void;
+}) {
   return (
-    <div className={`${bg} border border-border rounded-lg p-4 text-center`}>
+    <button onClick={onClick}
+      className={`${bg} border rounded-lg p-4 text-center w-full transition-all cursor-pointer hover:opacity-80
+        ${active ? 'border-accent ring-2 ring-accent/30' : 'border-border'}`}>
       <div className={`text-2xl font-bold ${color}`}>{count}</div>
       <div className="text-xs text-text-secondary mt-1">{label}</div>
-    </div>
+    </button>
   );
 }
 
