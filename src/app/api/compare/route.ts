@@ -43,21 +43,54 @@ export async function GET(request: NextRequest) {
       return NextResponse.json({ error: 'from and to required' }, { status: 400 });
     }
 
-    const fromEndpoints = getEndpointsByVersion(from);
-    const toEndpoints = getEndpointsByVersion(to);
+    try {
+      const fromEndpoints = getEndpointsByVersion(from);
+      const toEndpoints = getEndpointsByVersion(to);
 
-    if (fromEndpoints.length === 0) {
-      return NextResponse.json({ error: `No endpoints found for version "${from}". Import it first.` }, { status: 400 });
-    }
-    if (toEndpoints.length === 0) {
-      return NextResponse.json({ error: `No endpoints found for version "${to}". Import it first.` }, { status: 400 });
-    }
+      if (fromEndpoints.length === 0) {
+        return NextResponse.json({ error: `No endpoints found for version "${from}". Import it first.` }, { status: 400 });
+      }
+      if (toEndpoints.length === 0) {
+        return NextResponse.json({ error: `No endpoints found for version "${to}". Import it first.` }, { status: 400 });
+      }
 
-    const diff = computeDiff(fromEndpoints, toEndpoints);
-    return NextResponse.json(diff);
+      const diff = computeDiff(fromEndpoints, toEndpoints);
+
+      // Don't include unchanged entries' full data to keep response small
+      const slimEntries = diff.entries.map(e => {
+        if (e.status === 'unchanged') {
+          return { method: e.method, path: e.path, category: e.category, status: e.status, summary: e.summary };
+        }
+        return e;
+      });
+
+      return NextResponse.json({ entries: slimEntries, summary: diff.summary });
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : 'Unknown error';
+      return NextResponse.json({ error: message }, { status: 500 });
+    }
   }
 
   return NextResponse.json({ error: 'Unknown action' }, { status: 400 });
+}
+
+function slimEndpoint(ep: EndpointRow): Record<string, unknown> {
+  return {
+    method: ep.method,
+    path: ep.path,
+    category: ep.category,
+    summary: ep.summary,
+    path_params: ep.path_params,
+    query_params: ep.query_params,
+    body_schema: ep.body_schema ? truncateJson(ep.body_schema, 2000) : null,
+    response_schema: ep.response_schema ? truncateJson(ep.response_schema, 2000) : null,
+    is_deprecated: ep.is_deprecated,
+  };
+}
+
+function truncateJson(json: string, maxLen: number): string {
+  if (json.length <= maxLen) return json;
+  return json.substring(0, maxLen) + '..."truncated"}';
 }
 
 function computeDiff(from: EndpointRow[], to: EndpointRow[]) {
@@ -78,7 +111,8 @@ function computeDiff(from: EndpointRow[], to: EndpointRow[]) {
     if (!fromEp) {
       entries.push({
         method: toEp.method, path: toEp.path, category: toEp.category,
-        status: 'added', summary: toEp.summary, toEndpoint: toEp,
+        status: 'added', summary: toEp.summary,
+        toEndpoint: slimEndpoint(toEp),
       });
     } else {
       const changes = diffEndpoints(fromEp, toEp);
@@ -86,7 +120,7 @@ function computeDiff(from: EndpointRow[], to: EndpointRow[]) {
         entries.push({
           method: toEp.method, path: toEp.path, category: toEp.category,
           status: 'changed', summary: toEp.summary, changes,
-          fromEndpoint: fromEp, toEndpoint: toEp,
+          fromEndpoint: slimEndpoint(fromEp), toEndpoint: slimEndpoint(toEp),
         });
       } else {
         entries.push({
@@ -103,7 +137,7 @@ function computeDiff(from: EndpointRow[], to: EndpointRow[]) {
     if (!toMap.has(key)) {
       entries.push({
         method: fromEp.method, path: fromEp.path, category: fromEp.category,
-        status: 'removed', summary: fromEp.summary, fromEndpoint: fromEp,
+        status: 'removed', summary: fromEp.summary, fromEndpoint: slimEndpoint(fromEp),
       });
     }
   }
