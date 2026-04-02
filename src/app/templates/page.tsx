@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { TopBar } from '@/components/TopBar';
 import { templates } from '@/lib/templates';
 
@@ -13,6 +13,20 @@ export default function TemplatesPage() {
   const [importing, setImporting] = useState<string | null>(null);
   const [imported, setImported] = useState<Set<string>>(new Set());
   const [expandedId, setExpandedId] = useState<string | null>(null);
+
+  // Check which templates are already imported by matching collection names
+  useEffect(() => {
+    (async () => {
+      const res = await fetch('/api/collections');
+      const collections: Array<{ name: string }> = await res.json();
+      const collNames = new Set(collections.map(c => c.name));
+      const alreadyImported = new Set<string>();
+      for (const t of templates) {
+        if (collNames.has(t.name)) alreadyImported.add(t.id);
+      }
+      setImported(alreadyImported);
+    })();
+  }, []);
 
   async function importTemplate(templateId: string) {
     const template = templates.find(t => t.id === templateId);
@@ -102,17 +116,20 @@ export default function TemplatesPage() {
                         <p className="text-xs text-text-secondary mt-0.5">{t.description}</p>
                         <p className="text-[10px] text-text-muted mt-1">{t.items.length} requests</p>
                       </div>
-                      <button
-                        onClick={() => importTemplate(t.id)}
-                        disabled={importing !== null || isImported}
-                        className={`px-3 py-1.5 text-xs font-medium rounded-md transition-all shrink-0 ${
-                          isImported
-                            ? 'bg-success/20 text-success'
-                            : 'bg-accent-emphasis text-white hover:opacity-90 disabled:opacity-50'
-                        }`}
-                      >
-                        {importing === t.id ? 'Importing...' : isImported ? '✓ Imported' : 'Import'}
-                      </button>
+                      {isImported ? (
+                        <a href="/collections"
+                          className="px-3 py-1.5 text-xs font-medium rounded-md bg-success/20 text-success shrink-0 hover:bg-success/30 transition-colors">
+                          ✓ Imported → Collections
+                        </a>
+                      ) : (
+                        <button
+                          onClick={() => importTemplate(t.id)}
+                          disabled={importing !== null}
+                          className="px-3 py-1.5 text-xs font-medium rounded-md bg-accent-emphasis text-white hover:opacity-90 disabled:opacity-50 transition-all shrink-0"
+                        >
+                          {importing === t.id ? 'Importing...' : 'Import'}
+                        </button>
+                      )}
                     </div>
                   </div>
 
