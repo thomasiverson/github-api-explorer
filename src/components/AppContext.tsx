@@ -1,6 +1,6 @@
 'use client';
 
-import React, { createContext, useContext, useState, useCallback, ReactNode } from 'react';
+import React, { createContext, useContext, useState, useCallback, useEffect, ReactNode } from 'react';
 import type { HttpMethod } from '@/lib/types';
 
 interface EndpointSelection {
@@ -67,7 +67,33 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [isLoading, setIsLoading] = useState(false);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [responseCollapsed, setResponseCollapsed] = useState(false);
-  const [theme, setTheme] = useState<'dark' | 'light'>('dark');
+  const [theme, setTheme] = useState<'dark' | 'light'>(() => {
+    // Check localStorage first, then system preference
+    if (typeof window !== 'undefined') {
+      const saved = localStorage.getItem('theme');
+      if (saved === 'dark' || saved === 'light') return saved;
+      if (window.matchMedia('(prefers-color-scheme: light)').matches) return 'light';
+    }
+    return 'dark';
+  });
+
+  // Apply theme on mount and listen for system changes
+  useEffect(() => {
+    document.documentElement.setAttribute('data-theme', theme);
+  }, [theme]);
+
+  useEffect(() => {
+    const mq = window.matchMedia('(prefers-color-scheme: dark)');
+    const handler = (e: MediaQueryListEvent) => {
+      // Only auto-switch if user hasn't manually set a preference
+      if (!localStorage.getItem('theme')) {
+        const next = e.matches ? 'dark' : 'light';
+        setTheme(next);
+      }
+    };
+    mq.addEventListener('change', handler);
+    return () => mq.removeEventListener('change', handler);
+  }, []);
 
   const selectEndpoint = useCallback((ep: EndpointSelection) => {
     setSelectedEndpoint(ep);
@@ -80,6 +106,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
     setTheme(prev => {
       const next = prev === 'dark' ? 'light' : 'dark';
       document.documentElement.setAttribute('data-theme', next);
+      localStorage.setItem('theme', next);
       return next;
     });
   }, []);
