@@ -41,6 +41,8 @@ export default function CollectionsPage() {
   useEffect(() => { loadCollections(); }, []);
 
   useEffect(() => {
+    setRunResults([]);
+    setExpandedItem(null);
     if (selectedId) loadItems(selectedId);
   }, [selectedId]);
 
