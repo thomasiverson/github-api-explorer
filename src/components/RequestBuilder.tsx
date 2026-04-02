@@ -17,6 +17,8 @@ export function RequestBuilder() {
   const [customHeaders, setCustomHeaders] = useState<Array<{ key: string; value: string; enabled: boolean }>>([]);
   const [curlCopied, setCurlCopied] = useState(false);
   const [showBatch, setShowBatch] = useState(false);
+  const [batchParam, setBatchParam] = useState('');
+  const [batchValues, setBatchValues] = useState('');
 
   // Keep a ref to activeEnv so the effect always reads the latest value
   const activeEnvRef = useRef(activeEnv);
@@ -207,8 +209,74 @@ export function RequestBuilder() {
     }
   }, [selectedEndpoint, activeEnv, pathValues, queryValues, bodyText, customHeaders, setResponse, setIsLoading]);
 
+  // Batch execution — runs the endpoint for each value and displays results in response pane
+  const executeBatch = useCallback(async () => {
+    if (!selectedEndpoint || !activeEnv) return;
+    const lines = batchValues.split('\n').map(l => l.trim()).filter(Boolean);
+    const param = batchParam || selectedEndpoint.pathParams[0]?.name;
+    if (lines.length === 0 || !param) return;
+
+    setIsLoading(true);
+    const results: Array<{ value: string; status: number; timing: number; body: unknown; error?: string }> = [];
+
+    for (const value of lines) {
+      const params = { ...pathValues, [param]: value };
+      try {
+        const enabledQueries: Record<string, string> = {};
+        for (const [k, v] of Object.entries(queryValues)) {
+          if (v.enabled && v.value) enabledQueries[k] = v.value;
+        }
+        const res = await fetch('/api/execute', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            environmentId: activeEnv.id,
+            method: selectedEndpoint.method,
+            path: selectedEndpoint.path,
+            pathParams: params,
+            queryParams: enabledQueries,
+          }),
+        });
+        const data = await res.json();
+        results.push({ value, status: data.status || 0, timing: data.timing || 0, body: data.body, error: data.error });
+      } catch (err) {
+        results.push({ value, status: 0, timing: 0, body: null, error: err instanceof Error ? err.message : 'Unknown' });
+      }
+
+      // Update response pane progressively
+      const passed = results.filter(r => r.status >= 200 && r.status < 300).length;
+      const failed = results.length - passed;
+      const totalTime = results.reduce((a, r) => a + r.timing, 0);
+      setResponse({
+        status: failed > 0 ? 207 : 200,
+        statusText: `Batch: ${passed} passed, ${failed} failed (${results.length}/${lines.length})`,
+        headers: {},
+        body: {
+          _batch: true,
+          param,
+          total: lines.length,
+          completed: results.length,
+          passed,
+          failed,
+          totalTime,
+          results: results.map(r => ({
+            [param]: r.value,
+            status: r.status,
+            timing: `${r.timing}ms`,
+            ...(r.error ? { error: r.error } : {}),
+            response: r.body,
+          })),
+        },
+        timing: totalTime,
+        rateLimit: null,
+        nextPageUrl: null,
+      });
+    }
+    setIsLoading(false);
+  }, [selectedEndpoint, activeEnv, pathValues, queryValues, batchParam, batchValues, setResponse, setIsLoading]);
+
   // Keep ref in sync for keyboard shortcut
-  executeRequestRef.current = () => executeRequest();
+  executeRequestRef.current = () => showBatch ? executeBatch() : executeRequest();
 
   if (!selectedEndpoint) {
     return (
@@ -236,7 +304,7 @@ export function RequestBuilder() {
             {resolvedPath}
           </div>
           <button
-            onClick={() => executeRequest()}
+            onClick={() => showBatch ? executeBatch() : executeRequest()}
             disabled={isLoading || !activeEnv}
             className="px-4 py-1.5 bg-accent-emphasis text-white text-sm font-medium rounded-md
                        hover:opacity-90 disabled:opacity-50 disabled:cursor-not-allowed transition-opacity flex items-center gap-2"
@@ -247,7 +315,7 @@ export function RequestBuilder() {
                 <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
               </svg>
             ) : null}
-            Send
+            {showBatch ? `Run Batch (${batchValues.split('\n').filter(l => l.trim()).length})` : 'Send'}
           </button>
           <button
             onClick={() => { copyAsCurl(); setCurlCopied(true); setTimeout(() => setCurlCopied(false), 2000); }}
@@ -292,17 +360,8 @@ export function RequestBuilder() {
       </div>
 
       {/* Batch panel */}
-      {showBatch && selectedEndpoint && activeEnv && (
-        <BatchRunner
-          method={selectedEndpoint.method}
-          path={selectedEndpoint.path}
-          pathParams={selectedEndpoint.pathParams.map(p => p.name)}
-          queryParams={Object.fromEntries(
-            Object.entries(queryValues).filter(([, v]) => v.enabled && v.value).map(([k, v]) => [k, v.value])
-          )}
-          environmentId={activeEnv.id}
-        />
-      )}
+      {/* Batch values input - shown in place of the batch runner panel */}
+      {/* (now integrated into params tab below) */}
 
       {/* Tabs */}
       <div className="flex border-b border-border">
@@ -416,6 +475,39 @@ export function RequestBuilder() {
 
             {selectedEndpoint.pathParams.length === 0 && selectedEndpoint.queryParams.length === 0 && (
               <p className="text-sm text-text-muted text-center py-8">No parameters for this endpoint</p>
+            )}
+
+            {/* Batch values input */}
+            {showBatch && selectedEndpoint.pathParams.length > 0 && (
+              <div className="border-t border-border pt-4">
+                <h3 className="text-xs font-semibold text-text-secondary uppercase tracking-wider mb-2">
+                  Batch Values
+                  <span className="font-normal text-text-muted ml-1">— run this endpoint once per value</span>
+                </h3>
+                <div className="space-y-2">
+                  <div className="flex items-center gap-2">
+                    <label className="text-sm text-text-secondary">Vary parameter:</label>
+                    <select value={batchParam || selectedEndpoint.pathParams[0]?.name || ''}
+                      onChange={e => setBatchParam(e.target.value)}
+                      className="bg-surface border border-border rounded-md px-2 py-1 text-sm text-text-primary font-mono focus:outline-none focus:ring-1 focus:ring-accent">
+                      {selectedEndpoint.pathParams.map(p => (
+                        <option key={p.name} value={p.name}>{p.name}</option>
+                      ))}
+                    </select>
+                  </div>
+                  <textarea
+                    value={batchValues}
+                    onChange={e => setBatchValues(e.target.value)}
+                    placeholder={`Enter one value per line, e.g.:\ntpi-test-org\ntpi-innersource\ntpitest-research`}
+                    rows={4}
+                    className="w-full bg-surface border border-border rounded-md px-3 py-2 text-sm text-text-primary font-mono
+                               resize-y focus:outline-none focus:ring-1 focus:ring-accent placeholder-text-muted"
+                  />
+                  <p className="text-[10px] text-text-muted">
+                    The Send button above will run {batchValues.split('\n').filter(l => l.trim()).length} requests. Results appear in the response panel →
+                  </p>
+                </div>
+              </div>
             )}
           </div>
         )}
@@ -701,152 +793,6 @@ function InlineMarkdown({ text }: { text: string }) {
   }
 
   return <>{parts}</>;
-}
-
-interface BatchResult {
-  params: Record<string, string>;
-  status: number;
-  timing: number;
-  error?: string;
-  bodyPreview?: string;
-}
-
-function BatchRunner({ method, path, pathParams, queryParams, environmentId }: {
-  method: string; path: string; pathParams: string[];
-  queryParams: Record<string, string>; environmentId: string;
-}) {
-  const [paramName, setParamName] = useState(pathParams[0] || '');
-  const [values, setValues] = useState('');
-  const [results, setResults] = useState<BatchResult[]>([]);
-  const [isRunning, setIsRunning] = useState(false);
-
-  async function runBatch() {
-    const lines = values.split('\n').map(l => l.trim()).filter(Boolean);
-    if (lines.length === 0 || !paramName) return;
-
-    setIsRunning(true);
-    setResults([]);
-    const batchResults: BatchResult[] = [];
-
-    for (const value of lines) {
-      const params: Record<string, string> = {};
-      // Fill all path params — use the batch value for the selected param
-      for (const p of pathParams) {
-        params[p] = p === paramName ? value : '';
-      }
-
-      try {
-        const res = await fetch('/api/execute', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            environmentId,
-            method,
-            path,
-            pathParams: params,
-            queryParams,
-          }),
-        });
-        const data = await res.json();
-        const bodyStr = typeof data.body === 'string' ? data.body : JSON.stringify(data.body);
-        batchResults.push({
-          params: { [paramName]: value },
-          status: data.status || 0,
-          timing: data.timing || 0,
-          error: data.error,
-          bodyPreview: bodyStr?.substring(0, 100),
-        });
-      } catch (err) {
-        batchResults.push({
-          params: { [paramName]: value },
-          status: 0,
-          timing: 0,
-          error: err instanceof Error ? err.message : 'Unknown error',
-        });
-      }
-      setResults([...batchResults]);
-    }
-    setIsRunning(false);
-  }
-
-  function exportCsv() {
-    const headers = ['param_value', 'status', 'timing_ms', 'response_preview'];
-    const rows = results.map(r => [
-      r.params[paramName],
-      String(r.status),
-      String(r.timing),
-      `"${(r.bodyPreview || r.error || '').replace(/"/g, '""')}"`,
-    ]);
-    const csv = [headers.join(','), ...rows.map(r => r.join(','))].join('\n');
-    const blob = new Blob([csv], { type: 'text/csv' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `batch-${paramName}-${new Date().toISOString().slice(0, 10)}.csv`;
-    a.click();
-    URL.revokeObjectURL(url);
-  }
-
-  return (
-    <div className="p-3 border-b border-border bg-surface/30">
-      <div className="flex items-end gap-3 mb-2">
-        <div>
-          <label className="text-[11px] text-text-secondary block mb-1">Param to batch</label>
-          <select value={paramName} onChange={e => setParamName(e.target.value)}
-            className="bg-surface border border-border rounded-md px-2 py-1 text-xs text-text-primary focus:outline-none focus:ring-1 focus:ring-accent">
-            {pathParams.map(p => <option key={p} value={p}>{p}</option>)}
-          </select>
-        </div>
-        <div className="flex-1">
-          <label className="text-[11px] text-text-secondary block mb-1">Values (one per line)</label>
-          <textarea value={values} onChange={e => setValues(e.target.value)}
-            placeholder={`value1\nvalue2\nvalue3`} rows={3}
-            className="w-full bg-surface border border-border rounded-md px-2 py-1 text-xs text-text-primary font-mono
-                       resize-y focus:outline-none focus:ring-1 focus:ring-accent" />
-        </div>
-        <div className="flex flex-col gap-1">
-          <button onClick={runBatch} disabled={isRunning || !values.trim()}
-            className="px-3 py-1.5 bg-accent-emphasis text-white text-xs rounded-md hover:opacity-90 disabled:opacity-50">
-            {isRunning ? `Running...` : `Run ${values.split('\n').filter(l => l.trim()).length}`}
-          </button>
-          {results.length > 0 && (
-            <button onClick={exportCsv}
-              className="px-3 py-1 border border-border text-text-secondary text-[10px] rounded-md hover:bg-surface">
-              Export CSV
-            </button>
-          )}
-        </div>
-      </div>
-
-      {/* Results */}
-      {results.length > 0 && (
-        <div className="mt-2 border border-border rounded-md overflow-hidden max-h-48 overflow-y-auto">
-          <table className="w-full text-xs">
-            <thead>
-              <tr className="bg-surface text-text-secondary">
-                <th className="px-2 py-1 text-left font-medium">{paramName}</th>
-                <th className="px-2 py-1 text-left font-medium">Status</th>
-                <th className="px-2 py-1 text-left font-medium">Time</th>
-                <th className="px-2 py-1 text-left font-medium">Preview</th>
-              </tr>
-            </thead>
-            <tbody>
-              {results.map((r, i) => (
-                <tr key={i} className="border-t border-border/50">
-                  <td className="px-2 py-1 font-mono text-text-primary">{r.params[paramName]}</td>
-                  <td className={`px-2 py-1 font-mono font-bold ${
-                    r.status >= 200 && r.status < 300 ? 'text-success' : 'text-danger'
-                  }`}>{r.status || 'ERR'}</td>
-                  <td className="px-2 py-1 text-text-muted">{r.timing}ms</td>
-                  <td className="px-2 py-1 text-text-muted truncate max-w-xs">{r.error || r.bodyPreview}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      )}
-    </div>
-  );
 }
 
 function SaveToCollectionButton({
