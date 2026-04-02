@@ -2,6 +2,7 @@
 
 import React, { useState, useEffect } from 'react';
 import { TopBar } from '@/components/TopBar';
+import { useApp } from '@/components/AppContext';
 
 interface Collection {
   id: string; name: string; description: string; item_count: number;
@@ -23,6 +24,7 @@ const METHOD_COLORS: Record<string, string> = {
 };
 
 export default function CollectionsPage() {
+  const { activeEnv } = useApp();
   const [collections, setCollections] = useState<Collection[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [items, setItems] = useState<CollectionItem[]>([]);
@@ -125,13 +127,30 @@ export default function CollectionsPage() {
 
     for (const item of items) {
       try {
+        // Auto-fill path params from active environment
+        const storedParams = JSON.parse(item.path_params || '{}');
+        const pathParams: Record<string, string> = { ...storedParams };
+        if (activeEnv) {
+          // Extract {param} placeholders from path and fill known ones
+          const placeholders = item.path.match(/\{(\w+)\}/g) || [];
+          for (const ph of placeholders) {
+            const name = ph.slice(1, -1);
+            if (pathParams[name]) continue; // already has a value
+            if (name === 'org' || name === 'organization' || name === 'owner') {
+              pathParams[name] = activeEnv.org_name || activeEnv.enterprise_slug || '';
+            } else if (name === 'enterprise') {
+              pathParams[name] = activeEnv.enterprise_slug || '';
+            }
+          }
+        }
+
         const res = await fetch('/api/execute', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             method: item.method,
             path: item.path,
-            pathParams: JSON.parse(item.path_params || '{}'),
+            pathParams,
             queryParams: JSON.parse(item.query_params || '{}'),
             headers: JSON.parse(item.headers || '{}'),
             body: item.body ? JSON.parse(item.body) : null,
