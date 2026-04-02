@@ -67,6 +67,26 @@ export default function TemplatesPage() {
             </p>
           </div>
 
+          {/* How it works */}
+          <div className="bg-surface/50 border border-border rounded-lg p-4 flex gap-6">
+            <div className="flex items-center gap-2 text-xs text-text-secondary">
+              <span className="w-5 h-5 rounded-full bg-accent-emphasis text-white flex items-center justify-center text-[10px] font-bold shrink-0">1</span>
+              <span><strong>Import</strong> a template below</span>
+            </div>
+            <div className="flex items-center gap-2 text-xs text-text-secondary">
+              <span className="w-5 h-5 rounded-full bg-accent-emphasis text-white flex items-center justify-center text-[10px] font-bold shrink-0">2</span>
+              <span>Go to <a href="/collections" className="text-accent hover:underline">Collections</a></span>
+            </div>
+            <div className="flex items-center gap-2 text-xs text-text-secondary">
+              <span className="w-5 h-5 rounded-full bg-accent-emphasis text-white flex items-center justify-center text-[10px] font-bold shrink-0">3</span>
+              <span><strong>Run All</strong> to execute every request</span>
+            </div>
+            <div className="flex items-center gap-2 text-xs text-text-secondary">
+              <span className="w-5 h-5 rounded-full bg-accent-emphasis text-white flex items-center justify-center text-[10px] font-bold shrink-0">4</span>
+              <span><strong>Review</strong> the summary &amp; expand results</span>
+            </div>
+          </div>
+
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             {templates.map(t => {
               const isExpanded = expandedId === t.id;

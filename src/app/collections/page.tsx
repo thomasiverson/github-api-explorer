@@ -16,6 +16,7 @@ interface CollectionItem {
 
 interface RunResult {
   itemId: string; status: number; timing: number; error?: string;
+  responseBody?: unknown; path?: string;
 }
 
 const METHOD_COLORS: Record<string, string> = {
@@ -28,6 +29,7 @@ export default function CollectionsPage() {
   const [collections, setCollections] = useState<Collection[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [items, setItems] = useState<CollectionItem[]>([]);
+  const [expandedItem, setExpandedItem] = useState<string | null>(null);
   const [editingName, setEditingName] = useState('');
   const [editingDesc, setEditingDesc] = useState('');
   const [showNewForm, setShowNewForm] = useState(false);
@@ -157,9 +159,15 @@ export default function CollectionsPage() {
           }),
         });
         const data = await res.json();
-        results.push({ itemId: item.id, status: data.status || 0, timing: data.timing || 0, error: data.error });
+        // Extract error message from response body for failed requests
+        let errorMsg = data.error;
+        if (!errorMsg && data.status >= 400 && data.body) {
+          const body = data.body as Record<string, unknown>;
+          errorMsg = (body.message as string) || `HTTP ${data.status}`;
+        }
+        results.push({ itemId: item.id, status: data.status || 0, timing: data.timing || 0, error: errorMsg, responseBody: data.body, path: item.path });
       } catch (err: unknown) {
-        results.push({ itemId: item.id, status: 0, timing: 0, error: err instanceof Error ? err.message : 'Unknown' });
+        results.push({ itemId: item.id, status: 0, timing: 0, error: err instanceof Error ? err.message : 'Unknown', path: item.path });
       }
       setRunResults([...results]);
     }
@@ -244,11 +252,28 @@ export default function CollectionsPage() {
 
               {/* Run results summary */}
               {runResults.length > 0 && (
-                <div className="mb-4 p-3 bg-surface border border-border rounded-lg">
-                  <div className="flex gap-4 text-sm">
-                    <span className="text-success">{runResults.filter(r => r.status >= 200 && r.status < 300).length} passed</span>
-                    <span className="text-danger">{runResults.filter(r => r.status === 0 || r.status >= 400).length} failed</span>
+                <div className="mb-4 bg-surface border border-border rounded-lg overflow-hidden">
+                  <div className="p-3 flex gap-4 text-sm border-b border-border">
+                    <span className="text-success font-medium">{runResults.filter(r => r.status >= 200 && r.status < 300).length} passed</span>
+                    <span className="text-danger font-medium">{runResults.filter(r => r.status === 0 || r.status >= 400).length} failed</span>
                     <span className="text-text-muted">{Math.round(runResults.reduce((a, r) => a + r.timing, 0))}ms total</span>
+                  </div>
+                  {/* Key findings from successful responses */}
+                  <div className="p-3 space-y-1.5">
+                    {runResults.filter(r => r.status >= 200 && r.status < 300 && r.responseBody).map(r => (
+                      <div key={r.itemId} className="text-xs text-text-secondary flex gap-2">
+                        <span className="text-success shrink-0">✓</span>
+                        <span className="font-mono text-text-muted shrink-0">{r.path?.split('/').pop()}</span>
+                        <span>{summarizeResponse(r.path || '', r.responseBody)}</span>
+                      </div>
+                    ))}
+                    {runResults.filter(r => r.status === 0 || r.status >= 400).map(r => (
+                      <div key={r.itemId} className="text-xs text-danger flex gap-2">
+                        <span className="shrink-0">✗</span>
+                        <span className="font-mono text-text-muted shrink-0">{r.path?.split('/').pop()}</span>
+                        <span>{r.error || `HTTP ${r.status}`}</span>
+                      </div>
+                    ))}
                   </div>
                 </div>
               )}
@@ -257,28 +282,50 @@ export default function CollectionsPage() {
               <div className="space-y-1">
                 {items.map((item, i) => {
                   const result = runResults.find(r => r.itemId === item.id);
+                  const isExpanded = expandedItem === item.id;
                   return (
-                    <div key={item.id}
-                      className="flex items-center gap-2 p-2 bg-panel border border-border rounded-md hover:bg-surface/50 transition-colors">
-                      <div className="flex flex-col gap-0.5">
-                        <button onClick={() => moveItem(i, -1)} disabled={i === 0}
-                          className="text-text-muted hover:text-text-primary disabled:opacity-20 text-xs">▲</button>
-                        <button onClick={() => moveItem(i, 1)} disabled={i === items.length - 1}
-                          className="text-text-muted hover:text-text-primary disabled:opacity-20 text-xs">▼</button>
-                      </div>
-                      <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded ${METHOD_COLORS[item.method] || 'bg-text-muted'} shrink-0`}>
-                        {item.method}
-                      </span>
-                      <span className="text-sm font-mono text-text-primary flex-1 truncate">{item.path}</span>
-                      {result && (
-                        <span className={`text-xs font-mono font-bold ${
-                          result.status >= 200 && result.status < 300 ? 'text-success' : 'text-danger'
-                        }`}>
-                          {result.status || 'ERR'} {result.timing}ms
+                    <div key={item.id}>
+                      <div
+                        className={`flex items-center gap-2 p-2 bg-panel border border-border rounded-md hover:bg-surface/50 transition-colors ${result ? 'cursor-pointer' : ''}`}
+                        onClick={() => result && setExpandedItem(isExpanded ? null : item.id)}
+                      >
+                        <div className="flex flex-col gap-0.5" onClick={e => e.stopPropagation()}>
+                          <button onClick={() => moveItem(i, -1)} disabled={i === 0}
+                            className="text-text-muted hover:text-text-primary disabled:opacity-20 text-xs">▲</button>
+                          <button onClick={() => moveItem(i, 1)} disabled={i === items.length - 1}
+                            className="text-text-muted hover:text-text-primary disabled:opacity-20 text-xs">▼</button>
+                        </div>
+                        <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded ${METHOD_COLORS[item.method] || 'bg-text-muted'} shrink-0`}>
+                          {item.method}
                         </span>
+                        <span className="text-sm font-mono text-text-primary flex-1 truncate">{item.path}</span>
+                        {result && (
+                          <>
+                            <span className={`text-xs font-mono font-bold ${
+                              result.status >= 200 && result.status < 300 ? 'text-success' : 'text-danger'
+                            }`}>
+                              {result.status || 'ERR'} {result.timing}ms
+                            </span>
+                            <svg width="10" height="10" viewBox="0 0 16 16" fill="currentColor"
+                              className={`text-text-muted transition-transform ${isExpanded ? 'rotate-90' : ''}`}>
+                              <path d="M6.22 3.22a.75.75 0 0 1 1.06 0l4.25 4.25a.75.75 0 0 1 0 1.06l-4.25 4.25a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042L9.94 8 6.22 4.28a.75.75 0 0 1 0-1.06Z" />
+                            </svg>
+                          </>
+                        )}
+                        <button onClick={e => { e.stopPropagation(); deleteItem(item.id); }}
+                          className="text-text-muted hover:text-danger p-1 text-xs">✕</button>
+                      </div>
+                      {/* Expanded response */}
+                      {isExpanded && result && (
+                        <div className="ml-8 mt-1 mb-2 p-3 bg-surface/50 border border-border rounded-md">
+                          {result.error && (
+                            <div className="text-xs text-danger mb-2">Error: {result.error}</div>
+                          )}
+                          <pre className="text-[11px] font-mono text-text-secondary whitespace-pre-wrap break-all max-h-64 overflow-auto">
+                            {JSON.stringify(result.responseBody, null, 2)}
+                          </pre>
+                        </div>
                       )}
-                      <button onClick={() => deleteItem(item.id)}
-                        className="text-text-muted hover:text-danger p-1 text-xs">✕</button>
                     </div>
                   );
                 })}
@@ -295,4 +342,28 @@ export default function CollectionsPage() {
       </div>
     </div>
   );
+}
+
+function summarizeResponse(path: string, body: unknown): string {
+  if (!body || typeof body !== 'object') return String(body || '');
+  const b = body as Record<string, unknown>;
+
+  // Try to extract meaningful summary based on common response patterns
+  if (b.total_seats !== undefined) return `${b.total_seats} total Copilot seats assigned`;
+  if (b.seat_breakdown) {
+    const sb = b.seat_breakdown as Record<string, unknown>;
+    return `${sb.total || 0} seats (${sb.active_this_cycle || 0} active, ${sb.inactive_this_cycle || 0} inactive)`;
+  }
+  if (b.total_count !== undefined) return `${b.total_count} total items`;
+  if (Array.isArray(b)) return `${b.length} items returned`;
+  if (b.seats && Array.isArray(b.seats)) return `${(b.seats as unknown[]).length} seats in response`;
+  if (b.enabled !== undefined) return `enabled: ${b.enabled}`;
+  if (b.organization) return `org: ${(b.organization as Record<string, unknown>).login || 'unknown'}`;
+  if (b.login) return `user: ${b.login}`;
+  if (b.name) return String(b.name);
+
+  // Count top-level keys as a fallback
+  const keys = Object.keys(b);
+  if (keys.length <= 5) return keys.join(', ');
+  return `${keys.length} fields returned`;
 }
