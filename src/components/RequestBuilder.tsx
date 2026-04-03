@@ -94,7 +94,7 @@ export function RequestBuilder() {
   }, []);
 
   const resolvedPath = selectedEndpoint
-    ? selectedEndpoint.path.replace(/\{(\w+)\}/g, (_, key) => pathValues[key] || `{${key}}`)
+    ? selectedEndpoint.path.replace(/\{([\w-]+)\}/g, (_, key) => pathValues[key] || `{${key}}`)
     : '';
 
   const buildResolvedUrl = useCallback(() => {

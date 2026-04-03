@@ -100,7 +100,7 @@ export default function Home() {
 }
 
 function extractPathParams(path: string) {
-  const matches = path.match(/\{(\w+)\}/g);
+  const matches = path.match(/\{([\w-]+)\}/g);
   if (!matches) return [];
   return matches.map(m => ({
     name: m.slice(1, -1),
@@ -119,7 +119,7 @@ function extractPathValues(pathTemplate: string, resolvedUrl: string): Record<st
     const resolvedPath = url.pathname;
     
     const paramNames: string[] = [];
-    const regexStr = pathTemplate.replace(/\{(\w+)\}/g, (_, name) => {
+    const regexStr = pathTemplate.replace(/\{([\w-]+)\}/g, (_, name) => {
       paramNames.push(name);
       return '([^/]+)';
     });

@@ -136,7 +136,7 @@ export default function CollectionsPage() {
         const pathParams: Record<string, string> = { ...storedParams };
         if (activeEnv) {
           // Extract {param} placeholders from path and fill known ones
-          const placeholders = item.path.match(/\{(\w+)\}/g) || [];
+          const placeholders = item.path.match(/\{([\w-]+)\}/g) || [];
           for (const ph of placeholders) {
             const name = ph.slice(1, -1);
             if (pathParams[name]) continue; // already has a value

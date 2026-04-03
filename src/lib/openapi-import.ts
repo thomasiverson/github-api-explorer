@@ -183,7 +183,7 @@ export function parseOpenApiSpec(spec: OpenApiSpec, specVersion: string): Import
 
       // Fallback: infer path params from {param} segments if none were extracted
       if (pathParams.length === 0) {
-        const matches = pathTemplate.match(/\{(\w+)\}/g);
+        const matches = pathTemplate.match(/\{([\w-]+)\}/g);
         if (matches) {
           pathParams = matches.map(m => ({
             name: m.slice(1, -1),
