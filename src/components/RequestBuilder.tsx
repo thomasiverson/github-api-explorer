@@ -52,7 +52,8 @@ export function RequestBuilder() {
 
     const pv: Record<string, string> = {};
     for (const p of selectedEndpoint.pathParams) {
-      let defaultVal = p.default || '';
+      // Priority: initialPathValues (replay) > env vars > defaults
+      let defaultVal = selectedEndpoint.initialPathValues?.[p.name] || p.default || '';
       if (!defaultVal && allVars[p.name]) {
         defaultVal = allVars[p.name];
       }
@@ -62,13 +63,17 @@ export function RequestBuilder() {
 
     const qv: Record<string, { value: string; enabled: boolean }> = {};
     for (const p of selectedEndpoint.queryParams) {
-      let val = p.default || '';
+      // Priority: initialQueryValues (replay) > env vars > defaults
+      const initVal = selectedEndpoint.initialQueryValues?.[p.name];
+      let val = initVal || p.default || '';
       if (!val && allVars[p.name]) val = allVars[p.name];
-      qv[p.name] = { value: val, enabled: p.required };
+      qv[p.name] = { value: val, enabled: p.required || !!initVal };
     }
     setQueryValues(qv);
 
-    if (selectedEndpoint.bodySchema) {
+    if (selectedEndpoint.initialBody) {
+      setBodyText(selectedEndpoint.initialBody);
+    } else if (selectedEndpoint.bodySchema) {
       setBodyText(generateExampleBody(selectedEndpoint.bodySchema));
     } else {
       setBodyText('');

@@ -14,6 +14,10 @@ interface EndpointSelection {
   pathParams: Array<{ name: string; description: string; required: boolean; type: string; default?: string; enum?: string[] }>;
   queryParams: Array<{ name: string; description: string; required: boolean; type: string; default?: string; enum?: string[] }>;
   bodySchema: unknown | null;
+  // Optional: pre-filled values for replay from history
+  initialPathValues?: Record<string, string>;
+  initialQueryValues?: Record<string, string>;
+  initialBody?: string;
 }
 
 interface ResponseData {

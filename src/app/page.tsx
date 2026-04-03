@@ -23,6 +23,11 @@ function ReplayHandler() {
       const entry = await res.json();
       if (!entry) return;
 
+      // Extract param values from the resolved URL
+      const pathParamDefs = extractPathParams(entry.path);
+      const pathValues = extractPathValues(entry.path, entry.resolved_url);
+      const queryValues = extractQueryValues(entry.resolved_url);
+
       selectEndpoint({
         operationId: entry.operation_id || '',
         category: entry.category || '',
@@ -31,9 +36,14 @@ function ReplayHandler() {
         summary: '',
         description: '',
         specVersion: '',
-        pathParams: extractPathParams(entry.path),
-        queryParams: [],
+        pathParams: pathParamDefs,
+        queryParams: Object.keys(queryValues).map(name => ({
+          name, description: '', required: false, type: 'string',
+        })),
         bodySchema: null,
+        initialPathValues: pathValues,
+        initialQueryValues: queryValues,
+        initialBody: entry.request_body || undefined,
       });
 
       if (entry.response_body) {
@@ -98,4 +108,40 @@ function extractPathParams(path: string) {
     required: true,
     type: 'string',
   }));
+}
+
+function extractPathValues(pathTemplate: string, resolvedUrl: string): Record<string, string> {
+  // Convert template like /orgs/{org}/copilot/billing to a regex
+  // and extract the actual values from the resolved URL
+  const values: Record<string, string> = {};
+  try {
+    const url = new URL(resolvedUrl);
+    const resolvedPath = url.pathname;
+    
+    const paramNames: string[] = [];
+    const regexStr = pathTemplate.replace(/\{(\w+)\}/g, (_, name) => {
+      paramNames.push(name);
+      return '([^/]+)';
+    });
+    
+    const regex = new RegExp('^' + regexStr + '$');
+    const match = resolvedPath.match(regex);
+    if (match) {
+      paramNames.forEach((name, i) => {
+        values[name] = decodeURIComponent(match[i + 1]);
+      });
+    }
+  } catch { /* ignore URL parse errors */ }
+  return values;
+}
+
+function extractQueryValues(resolvedUrl: string): Record<string, string> {
+  const values: Record<string, string> = {};
+  try {
+    const url = new URL(resolvedUrl);
+    url.searchParams.forEach((value, key) => {
+      values[key] = value;
+    });
+  } catch { /* ignore */ }
+  return values;
 }
