@@ -61,6 +61,7 @@ export default function HistoryPage() {
   const filtered = filter
     ? history.filter(h =>
         h.path.toLowerCase().includes(filter.toLowerCase()) ||
+        h.resolved_url.toLowerCase().includes(filter.toLowerCase()) ||
         h.method.toLowerCase().includes(filter.toLowerCase()) ||
         (h.category || '').toLowerCase().includes(filter.toLowerCase())
       )
@@ -182,8 +183,8 @@ export default function HistoryPage() {
                         {h.method}
                       </span>
                     </td>
-                    <td className="px-4 py-2 font-mono text-text-primary truncate max-w-md" title={h.path}>
-                      {h.path}
+                    <td className="px-4 py-2 font-mono text-text-primary truncate max-w-md" title={`${h.resolved_url}\n\nTemplate: ${h.path}`}>
+                      {getDisplayPath(h.resolved_url, h.path)}
                     </td>
                     <td className={`px-4 py-2 font-mono font-bold ${statusClass(h.status)}`}>
                       {h.status}
@@ -234,6 +235,15 @@ export default function HistoryPage() {
       </div>
     </div>
   );
+}
+
+function getDisplayPath(resolvedUrl: string, templatePath: string): string {
+  try {
+    const url = new URL(resolvedUrl);
+    return url.pathname + (url.search || '');
+  } catch {
+    return templatePath;
+  }
 }
 
 function safeParseJson(body: string | null | undefined): unknown {
