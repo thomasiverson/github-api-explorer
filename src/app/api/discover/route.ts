@@ -128,6 +128,22 @@ export async function GET(request: NextRequest) {
         break;
       }
 
+      case 'enterprise-teams': {
+        const enterprise = searchParams.get('enterprise') || env.enterprise_slug;
+        if (!enterprise) {
+          return NextResponse.json({ error: 'enterprise param required for enterprise-teams' }, { status: 400 });
+        }
+        const { data } = await octokit.request('GET /enterprises/{enterprise}/teams', {
+          enterprise,
+          per_page: 100,
+        });
+        results = (data as Array<{ slug: string; name: string; description?: string | null }>).map(t => ({
+          value: t.slug,
+          label: t.description ? `${t.name} — ${t.description}` : t.name,
+        }));
+        break;
+      }
+
       default:
         return NextResponse.json({ error: `Unknown discovery type: ${type}` }, { status: 400 });
     }

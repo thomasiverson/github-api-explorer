@@ -17,9 +17,9 @@ const PARAM_DISCOVERY: Record<string, {
   organization: { type: 'orgs' },
   owner: { type: 'orgs' },
   enterprise: { type: 'enterprises' },
+  'enterprise-team': { type: 'enterprise-teams', dependsOn: ['enterprise'], paramMapping: { enterprise: 'enterprise' } },
   repo: { type: 'repos', dependsOn: ['owner', 'org', 'organization'], paramMapping: { owner: 'owner', org: 'org', organization: 'org' } },
   team_slug: { type: 'teams', dependsOn: ['org', 'organization'], paramMapping: { org: 'org', organization: 'org' } },
-  'enterprise-team': { type: 'teams', dependsOn: ['org', 'organization'], paramMapping: { org: 'org', organization: 'org' } },
   username: { type: 'members', dependsOn: ['org', 'organization'], paramMapping: { org: 'org', organization: 'org' } },
   branch: { type: 'branches', dependsOn: ['owner', 'org', 'repo'], paramMapping: { owner: 'owner', org: 'owner', repo: 'repo' } },
 };
@@ -148,7 +148,6 @@ export function ParamCombobox({ paramName, value, onChange, allParamValues, plac
           onChange={e => { onChange(e.target.value); setFilter(e.target.value); }}
           onFocus={() => { if (depsReady) setOpen(true); }}
           placeholder={placeholder || (depsReady ? `type or select ${paramName}...` : `fill ${config.dependsOn?.join(' or ')} first`)}
-          disabled={!depsReady && !value}
           className={className}
         />
         {depsReady && (
