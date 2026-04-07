@@ -82,7 +82,7 @@ export default function Home() {
         defaultLeftWidth={288}
         defaultRightWidth={480}
         minLeftWidth={200}
-        maxLeftWidth={800}
+        maxLeftWidth={500}
         minRightWidth={300}
         maxRightWidth={900}
         minCenterWidth={300}
