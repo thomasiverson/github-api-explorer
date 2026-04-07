@@ -7,7 +7,6 @@ interface HistoryRow {
   id: string; method: string; path: string; resolved_url: string;
   status: number; timing: number; created_at: string;
   operation_id: string | null; category: string | null;
-  request_body: string | null;
 }
 
 interface Collection {
@@ -40,7 +39,9 @@ export default function HistoryPage() {
   const [collections, setCollections] = useState<Collection[]>([]);
   const [addingToCollection, setAddingToCollection] = useState<string | null>(null);
   const [addedFeedback, setAddedFeedback] = useState<string | null>(null);
-  const [expandedRow, setExpandedRow] = useState<string | null>(null);
+  const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [expandedDetail, setExpandedDetail] = useState<{ response_body: string | null; response_headers: string | null; request_body: string | null } | null>(null);
+  const [detailLoading, setDetailLoading] = useState(false);
 
   useEffect(() => { loadHistory(); loadCollections(); }, []);
 
@@ -51,22 +52,6 @@ export default function HistoryPage() {
 
   async function addToCollection(collectionId: string, entries: HistoryRow[]) {
     for (const h of entries) {
-      // Fetch full history entry to get request body
-      const fullRes = await fetch(`/api/history?id=${encodeURIComponent(h.id)}`);
-      const full = await fullRes.json();
-
-      // Extract path param values from resolved URL vs template
-      const pathParams = extractPathParamValues(h.path, h.resolved_url);
-
-      // Extract query params from resolved URL
-      const queryParams = extractQueryParams(h.resolved_url);
-
-      // Parse request body
-      let requestBody: string | null = null;
-      if (full?.request_body) {
-        requestBody = typeof full.request_body === 'string' ? full.request_body : JSON.stringify(full.request_body);
-      }
-
       await fetch('/api/collections', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -76,9 +61,6 @@ export default function HistoryPage() {
           method: h.method,
           path: h.path,
           operationId: h.operation_id,
-          pathParams,
-          queryParams,
-          body: requestBody,
         }),
       });
     }
@@ -92,6 +74,30 @@ export default function HistoryPage() {
   async function loadHistory() {
     const res = await fetch('/api/history?limit=200');
     setHistory(await res.json());
+  }
+
+  async function toggleExpand(id: string) {
+    if (expandedId === id) {
+      setExpandedId(null);
+      setExpandedDetail(null);
+      return;
+    }
+    setExpandedId(id);
+    setExpandedDetail(null);
+    setDetailLoading(true);
+    try {
+      const res = await fetch(`/api/history?id=${encodeURIComponent(id)}`);
+      if (res.ok) {
+        const data = await res.json();
+        setExpandedDetail({
+          response_body: data?.response_body ?? null,
+          response_headers: data?.response_headers ?? null,
+          request_body: data?.request_body ?? null,
+        });
+      }
+    } finally {
+      setDetailLoading(false);
+    }
   }
 
   async function deleteEntry(id: string) {
@@ -251,21 +257,16 @@ export default function HistoryPage() {
                   const maxTiming = Math.max(...filtered.map(h => h.timing), 1);
                   return filtered.map(h => (
                   <React.Fragment key={h.id}>
-                  <tr className="border-b border-border hover:bg-surface/50 transition-colors cursor-pointer"
-                    onClick={() => setExpandedRow(expandedRow === h.id ? null : h.id)}>
-                    <td className="px-2 py-2" onClick={e => e.stopPropagation()}>
+                  <tr className={`border-b border-border hover:bg-surface/50 transition-colors cursor-pointer ${expandedId === h.id ? 'bg-surface/50' : ''}`}
+                    onClick={() => toggleExpand(h.id)}>
+                    <td className="px-2 py-2">
                       <input type="checkbox" checked={compareIds.has(h.id)}
                         onChange={() => toggleCompare(h.id)} className="accent-accent" />
                     </td>
                     <td className="px-4 py-2">
-                      <div className="flex items-center gap-1.5">
-                        <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded ${METHOD_COLORS[h.method] || 'bg-text-muted'} shrink-0`}>
-                          {h.method}
-                        </span>
-                        {h.request_body && ['POST', 'PUT', 'PATCH'].includes(h.method) && (
-                          <span className="text-[10px] px-1.5 py-0.5 bg-accent/15 border border-accent/30 rounded text-accent font-bold">BODY</span>
-                        )}
-                      </div>
+                      <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded ${METHOD_COLORS[h.method] || 'bg-text-muted'} leading-none`}>
+                        {h.method}
+                      </span>
                     </td>
                     <td className="px-4 py-2 text-xs text-text-secondary">
                       {h.category || '—'}
@@ -326,53 +327,13 @@ export default function HistoryPage() {
                       </div>
                     </td>
                   </tr>
-                  {expandedRow === h.id && (() => {
-                    const pathParams = extractPathParamValues(h.path, h.resolved_url);
-                    const queryParams = extractQueryParams(h.resolved_url);
-                    const hasPathParams = Object.keys(pathParams).length > 0;
-                    const hasQueryParams = Object.keys(queryParams).length > 0;
-                    const hasBody = h.request_body && ['POST', 'PUT', 'PATCH'].includes(h.method);
-                    return (
+                  {expandedId === h.id && (
                     <tr className="border-b border-border">
-                      <td colSpan={8} className="px-4 py-3 bg-surface/30">
-                        <div className="space-y-3">
-                          {hasPathParams && (
-                            <div>
-                              <div className="text-[10px] font-semibold text-text-muted uppercase mb-1">Path Parameters</div>
-                              <div className="flex flex-wrap gap-3">
-                                {Object.entries(pathParams).map(([k, v]) => (
-                                  <span key={k} className="text-xs font-mono">
-                                    <span className="text-text-muted">{k}:</span> <span className="text-text-primary">{v}</span>
-                                  </span>
-                                ))}
-                              </div>
-                            </div>
-                          )}
-                          {hasQueryParams && (
-                            <div>
-                              <div className="text-[10px] font-semibold text-text-muted uppercase mb-1">Query Parameters</div>
-                              <div className="flex flex-wrap gap-3">
-                                {Object.entries(queryParams).map(([k, v]) => (
-                                  <span key={k} className="text-xs font-mono">
-                                    <span className="text-text-muted">{k}:</span> <span className="text-text-primary">{v}</span>
-                                  </span>
-                                ))}
-                              </div>
-                            </div>
-                          )}
-                          {hasBody && (
-                            <div>
-                              <div className="text-[10px] font-semibold text-text-muted uppercase mb-1">Request Body</div>
-                              <pre className="text-[11px] font-mono text-text-secondary whitespace-pre-wrap break-all max-h-48 overflow-auto bg-canvas rounded p-2 border border-border">
-                                {(() => { try { return JSON.stringify(JSON.parse(h.request_body!), null, 2); } catch { return h.request_body; } })()}
-                              </pre>
-                            </div>
-                          )}
-                        </div>
+                      <td colSpan={8} className="p-0">
+                        <HistoryDetail detail={expandedDetail} loading={detailLoading} entry={h} />
                       </td>
                     </tr>
-                    );
-                  })()}
+                  )}
                   </React.Fragment>
                 ));
                 })()}
@@ -400,34 +361,6 @@ function getDisplayPath(resolvedUrl: string, templatePath: string): string {
   } catch {
     return templatePath;
   }
-}
-
-function extractPathParamValues(templatePath: string, resolvedUrl: string): Record<string, string> {
-  const params: Record<string, string> = {};
-  try {
-    const url = new URL(resolvedUrl);
-    const resolvedPath = url.pathname;
-    const templateParts = templatePath.split('/');
-    const resolvedParts = resolvedPath.split('/');
-    for (let i = 0; i < templateParts.length; i++) {
-      const match = templateParts[i].match(/^\{([\w-]+)\}$/);
-      if (match && resolvedParts[i]) {
-        params[match[1]] = decodeURIComponent(resolvedParts[i]);
-      }
-    }
-  } catch { /* ignore */ }
-  return params;
-}
-
-function extractQueryParams(resolvedUrl: string): Record<string, string> {
-  const params: Record<string, string> = {};
-  try {
-    const url = new URL(resolvedUrl);
-    url.searchParams.forEach((value, key) => {
-      params[key] = value;
-    });
-  } catch { /* ignore */ }
-  return params;
 }
 
 function safeParseJson(body: string | null | undefined): unknown {
@@ -503,6 +436,89 @@ function computeDiff(left: unknown, right: unknown): { identical: boolean; entri
 
   // Different types or primitives
   return { identical: false, entries: [], summary: `Values differ. Left: ${typeof left}, Right: ${typeof right}` };
+}
+
+function HistoryDetail({ detail, loading, entry }: {
+  detail: { response_body: string | null; response_headers: string | null; request_body: string | null } | null;
+  loading: boolean;
+  entry: HistoryRow;
+}) {
+  const [activeTab, setActiveTab] = useState<'response' | 'headers' | 'request'>('response');
+
+  if (loading) {
+    return (
+      <div className="px-6 py-4 bg-surface/30 text-sm text-text-muted">Loading response...</div>
+    );
+  }
+
+  if (!detail) {
+    return (
+      <div className="px-6 py-4 bg-surface/30 text-sm text-text-muted">No response data available.</div>
+    );
+  }
+
+  const parsedBody = safeParseJson(detail.response_body);
+  const parsedHeaders = safeParseJson(detail.response_headers) as Record<string, string> | null;
+  const parsedRequest = safeParseJson(detail.request_body);
+
+  return (
+    <div className="bg-surface/30">
+      {/* Tabs */}
+      <div className="flex border-b border-border">
+        {(['response', 'headers', 'request'] as const).map(tab => (
+          <button key={tab} onClick={(e) => { e.stopPropagation(); setActiveTab(tab); }}
+            className={`px-4 py-2 text-xs font-medium transition-colors border-b-2 ${
+              activeTab === tab
+                ? 'text-text-primary border-accent'
+                : 'text-text-secondary border-transparent hover:text-text-primary'
+            }`}>
+            {tab === 'response' ? 'Response Body' : tab === 'headers' ? 'Response Headers' : 'Request Body'}
+          </button>
+        ))}
+        <div className="ml-auto flex items-center gap-2 px-3">
+          <span className="text-xs text-text-muted">{entry.resolved_url}</span>
+        </div>
+      </div>
+
+      {/* Content */}
+      <div className="max-h-80 overflow-auto">
+        {activeTab === 'response' && (
+          parsedBody ? (
+            <pre className="p-4 text-xs font-mono text-text-secondary whitespace-pre-wrap break-all">
+              {typeof parsedBody === 'string' ? parsedBody : JSON.stringify(parsedBody, null, 2)}
+            </pre>
+          ) : (
+            <div className="p-4 text-xs text-text-muted">No response body recorded.</div>
+          )
+        )}
+
+        {activeTab === 'headers' && (
+          parsedHeaders ? (
+            <div className="p-4 space-y-0.5">
+              {Object.entries(parsedHeaders).map(([k, v]) => (
+                <div key={k} className="text-xs font-mono">
+                  <span className="text-accent">{k}:</span>{' '}
+                  <span className="text-text-secondary">{v}</span>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div className="p-4 text-xs text-text-muted">No response headers recorded.</div>
+          )
+        )}
+
+        {activeTab === 'request' && (
+          parsedRequest ? (
+            <pre className="p-4 text-xs font-mono text-text-secondary whitespace-pre-wrap break-all">
+              {typeof parsedRequest === 'string' ? parsedRequest : JSON.stringify(parsedRequest, null, 2)}
+            </pre>
+          ) : (
+            <div className="p-4 text-xs text-text-muted">No request body recorded.</div>
+          )
+        )}
+      </div>
+    </div>
+  );
 }
 
 function DiffViewer({ data, onClose }: { data: DiffDataFull; onClose: () => void }) {

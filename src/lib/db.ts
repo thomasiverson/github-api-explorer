@@ -487,6 +487,20 @@ export function deleteCollectionItem(id: string) {
   getDb().prepare('DELETE FROM collection_items WHERE id = ?').run(id);
 }
 
+export function updateCollectionItem(id: string, updates: {
+  pathParams?: string; queryParams?: string; headers?: string; body?: string | null;
+}) {
+  const sets: string[] = [];
+  const vals: unknown[] = [];
+  if (updates.pathParams !== undefined) { sets.push('path_params = ?'); vals.push(updates.pathParams); }
+  if (updates.queryParams !== undefined) { sets.push('query_params = ?'); vals.push(updates.queryParams); }
+  if (updates.headers !== undefined) { sets.push('headers = ?'); vals.push(updates.headers); }
+  if (updates.body !== undefined) { sets.push('body = ?'); vals.push(updates.body); }
+  if (sets.length === 0) return;
+  vals.push(id);
+  getDb().prepare(`UPDATE collection_items SET ${sets.join(', ')} WHERE id = ?`).run(...vals);
+}
+
 export function reorderCollectionItems(collectionId: string, itemIds: string[]) {
   const db = getDb();
   const stmt = db.prepare('UPDATE collection_items SET sort_order = ? WHERE id = ? AND collection_id = ?');

@@ -3,6 +3,7 @@
 import React, { useState, useEffect } from 'react';
 import { TopBar } from '@/components/TopBar';
 import { useApp } from '@/components/AppContext';
+import { ConfirmDialog, isDestructiveMethod, getConfirmMessage } from '@/components/ConfirmDialog';
 
 interface Collection {
   id: string; name: string; description: string; item_count: number;
@@ -29,7 +30,7 @@ export default function CollectionsPage() {
   const [collections, setCollections] = useState<Collection[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [items, setItems] = useState<CollectionItem[]>([]);
-  const [expandedItem, setExpandedItem] = useState<string | null>(null);
+  const [expandedItems, setExpandedItems] = useState<Set<string>>(new Set());
   const [editingName, setEditingName] = useState('');
   const [editingDesc, setEditingDesc] = useState('');
   const [showNewForm, setShowNewForm] = useState(false);
@@ -37,15 +38,19 @@ export default function CollectionsPage() {
   const [newDesc, setNewDesc] = useState('');
   const [runResults, setRunResults] = useState<RunResult[]>([]);
   const [isRunning, setIsRunning] = useState(false);
-  const [missingParams, setMissingParams] = useState<Record<string, string>>({});
-  const [showParamPrompt, setShowParamPrompt] = useState(false);
-  const [expandedResult, setExpandedResult] = useState<string | null>(null);
+  const [runningItemId, setRunningItemId] = useState<string | null>(null);
+  const [confirmState, setConfirmState] = useState<{
+    action: () => void;
+    method: string;
+    path: string;
+    bulk?: boolean;
+  } | null>(null);
 
   useEffect(() => { loadCollections(); }, []);
 
   useEffect(() => {
     setRunResults([]);
-    setExpandedItem(null);
+    setExpandedItems(new Set());
     if (selectedId) loadItems(selectedId);
   }, [selectedId]);
 
@@ -81,6 +86,19 @@ export default function CollectionsPage() {
     });
     if (selectedId === id) { setSelectedId(null); setItems([]); }
     loadCollections();
+  }
+
+  async function duplicateColl(id: string) {
+    const res = await fetch('/api/collections', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'duplicate', id }),
+    });
+    const data = await res.json();
+    const updated = await loadCollections();
+    setSelectedId(data.id);
+    const coll = updated.find((c: Collection) => c.id === data.id);
+    if (coll) { setEditingName(coll.name); setEditingDesc(coll.description); }
   }
 
   async function updateColl() {
@@ -129,179 +147,99 @@ export default function CollectionsPage() {
     });
   }
 
-  // Known auto-fill params
-  const autoFillParams: Record<string, string> = {};
-  if (activeEnv) {
-    autoFillParams['org'] = activeEnv.org_name || activeEnv.enterprise_slug || '';
-    autoFillParams['organization'] = activeEnv.org_name || activeEnv.enterprise_slug || '';
-    autoFillParams['owner'] = activeEnv.org_name || activeEnv.enterprise_slug || '';
-    autoFillParams['enterprise'] = activeEnv.enterprise_slug || '';
-  }
-
-  function detectMissingParams(): Record<string, string> {
-    const missing: Record<string, string> = {};
-    for (const item of items) {
-      const storedParams = JSON.parse(item.path_params || '{}') as Record<string, string>;
-      const placeholders = item.path.match(/\{([\w-]+)\}/g) || [];
-      for (const ph of placeholders) {
-        const name = ph.slice(1, -1);
-        if (storedParams[name]) continue;
-        if (autoFillParams[name]) continue;
-        if (!(name in missing)) missing[name] = '';
+  async function executeItem(item: CollectionItem): Promise<RunResult> {
+    try {
+      // Auto-fill path params from active environment
+      const storedParams = JSON.parse(item.path_params || '{}');
+      const pathParams: Record<string, string> = { ...storedParams };
+      if (activeEnv) {
+        const placeholders = item.path.match(/\{([\w-]+)\}/g) || [];
+        for (const ph of placeholders) {
+          const name = ph.slice(1, -1);
+          if (pathParams[name]) continue;
+          if (name === 'org' || name === 'organization' || name === 'owner') {
+            pathParams[name] = activeEnv.org_name || activeEnv.enterprise_slug || '';
+          } else if (name === 'enterprise') {
+            pathParams[name] = activeEnv.enterprise_slug || '';
+          }
+        }
       }
+
+      const res = await fetch('/api/execute', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          method: item.method,
+          path: item.path,
+          pathParams,
+          queryParams: JSON.parse(item.query_params || '{}'),
+          headers: JSON.parse(item.headers || '{}'),
+          body: item.body ? JSON.parse(item.body) : null,
+        }),
+      });
+      const data = await res.json();
+      let errorMsg = data.error;
+      if (!errorMsg && data.status >= 400 && data.body) {
+        const body = data.body as Record<string, unknown>;
+        errorMsg = (body.message as string) || `HTTP ${data.status}`;
+      }
+      return { itemId: item.id, status: data.status || 0, timing: data.timing || 0, error: errorMsg, responseBody: data.body, path: item.path };
+    } catch (err: unknown) {
+      return { itemId: item.id, status: 0, timing: 0, error: err instanceof Error ? err.message : 'Unknown', path: item.path };
     }
-    return missing;
   }
 
-  function handleRunAll() {
-    const missing = detectMissingParams();
-    if (Object.keys(missing).length > 0) {
-      setMissingParams(missing);
-      setShowParamPrompt(true);
-    } else {
-      runAll({});
+  async function runSingle(item: CollectionItem) {
+    if (isDestructiveMethod(item.method)) {
+      setConfirmState({
+        action: () => doRunSingle(item),
+        method: item.method,
+        path: item.path,
+      });
+      return;
     }
+    doRunSingle(item);
   }
 
-  async function runAll(extraParams: Record<string, string>) {
-    setShowParamPrompt(false);
+  async function doRunSingle(item: CollectionItem) {
+    setRunningItemId(item.id);
+    const result = await executeItem(item);
+    setRunResults(prev => {
+      const filtered = prev.filter(r => r.itemId !== item.id);
+      return [...filtered, result];
+    });
+    setExpandedItems(prev => new Set(prev).add(item.id));
+    setRunningItemId(null);
+  }
+
+  async function runAll() {
+    if (!selectedId || items.length === 0) return;
+    const destructive = items.filter(i => isDestructiveMethod(i.method));
+    if (destructive.length > 0) {
+      const methods = [...new Set(destructive.map(i => i.method))];
+      setConfirmState({
+        action: () => doRunAll(),
+        method: methods.join(', '),
+        path: `${items.length} requests (${destructive.length} ${methods.join('/')}`,
+        bulk: true,
+      });
+      return;
+    }
+    doRunAll();
+  }
+
+  async function doRunAll() {
     if (!selectedId || items.length === 0) return;
     setIsRunning(true);
     setRunResults([]);
     const results: RunResult[] = [];
 
     for (const item of items) {
-      try {
-        // Auto-fill path params from active environment
-        const storedParams = JSON.parse(item.path_params || '{}');
-        const pathParams: Record<string, string> = { ...storedParams };
-        if (activeEnv) {
-          // Extract {param} placeholders from path and fill known ones
-          const placeholders = item.path.match(/\{([\w-]+)\}/g) || [];
-          for (const ph of placeholders) {
-            const name = ph.slice(1, -1);
-            if (pathParams[name]) continue; // already has a value
-            if (extraParams[name]) {
-              pathParams[name] = extraParams[name];
-            } else if (name === 'org' || name === 'organization' || name === 'owner') {
-              pathParams[name] = activeEnv.org_name || activeEnv.enterprise_slug || '';
-            } else if (name === 'enterprise') {
-              pathParams[name] = activeEnv.enterprise_slug || '';
-            }
-          }
-        }
-
-        const res = await fetch('/api/execute', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            method: item.method,
-            path: item.path,
-            pathParams,
-            queryParams: JSON.parse(item.query_params || '{}'),
-            headers: JSON.parse(item.headers || '{}'),
-            body: item.body ? JSON.parse(item.body) : null,
-          }),
-        });
-        const data = await res.json();
-        // Extract error message from response body for failed requests
-        let errorMsg = data.error;
-        if (!errorMsg && data.status >= 400 && data.body) {
-          const body = data.body as Record<string, unknown>;
-          errorMsg = (body.message as string) || `HTTP ${data.status}`;
-        }
-        results.push({ itemId: item.id, status: data.status || 0, timing: data.timing || 0, error: errorMsg, responseBody: data.body, path: item.path });
-      } catch (err: unknown) {
-        results.push({ itemId: item.id, status: 0, timing: 0, error: err instanceof Error ? err.message : 'Unknown', path: item.path });
-      }
+      const result = await executeItem(item);
+      results.push(result);
       setRunResults([...results]);
     }
     setIsRunning(false);
-  }
-
-  function exportResultsHtml() {
-    if (!selected || runResults.length === 0) return;
-    const passed = runResults.filter(r => r.status >= 200 && r.status < 300).length;
-    const failed = runResults.filter(r => r.status === 0 || r.status >= 400).length;
-    const totalTime = Math.round(runResults.reduce((a, r) => a + r.timing, 0));
-    const envName = activeEnv?.name || 'Unknown';
-    const envUrl = activeEnv?.base_url || '';
-
-    const html = `<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>${selected.name} — Results</title>
-<style>
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;max-width:1000px;margin:0 auto;padding:2rem;color:#1f2328;background:#fff}
-h1{font-size:1.5rem;margin-bottom:0.25rem}
-.meta{color:#656d76;font-size:13px;margin-bottom:1.5rem}
-.summary{display:flex;gap:1rem;margin:1rem 0 1.5rem}
-.card{flex:1;text-align:center;padding:1rem;border:1px solid #d0d7de;border-radius:8px}
-.card .num{font-size:1.5rem;font-weight:700}
-.pass{color:#1a7f37}.fail{color:#d1242f}
-.result{border:1px solid #d0d7de;border-radius:8px;margin-bottom:0.75rem;overflow:hidden}
-.result-header{display:flex;align-items:center;gap:8px;padding:10px 14px;background:#f6f8fa;border-bottom:1px solid #d0d7de;font-size:13px}
-.result-header .method{font-weight:700;font-size:11px;padding:2px 6px;border-radius:4px;color:#fff}
-.get{background:#1a7f37}.post{background:#0969da}.put{background:#9a6700}.patch{background:#bc4c00}.delete{background:#d1242f}
-.result-header .path{font-family:monospace;flex:1}
-.result-header .status{font-weight:700}
-.result-header .timing{color:#656d76}
-.result-body{padding:12px 14px}
-.result-body .section-label{font-size:11px;font-weight:600;color:#656d76;text-transform:uppercase;margin:8px 0 4px}
-.result-body .section-label:first-child{margin-top:0}
-.result-body .params{font-family:monospace;font-size:12px;color:#1f2328}
-.result-body .params span{color:#656d76}
-.result-body pre{background:#f6f8fa;border:1px solid #d0d7de;border-radius:6px;padding:10px;font-size:11px;overflow-x:auto;max-height:400px;overflow-y:auto;white-space:pre-wrap;word-break:break-all}
-.error{color:#d1242f;font-size:12px}
-.summary-text{font-size:12px;color:#656d76;margin-top:4px}
-@media print{body{padding:0}.result-body pre{max-height:none}}
-</style></head><body>
-<h1>${escapeHtml(selected.name)}</h1>
-<div class="meta">
-${escapeHtml(selected.description)}<br>
-Environment: ${escapeHtml(envName)} (${escapeHtml(envUrl)})<br>
-Generated: ${new Date().toLocaleString()}
-</div>
-<div class="summary">
-<div class="card"><div class="num pass">${passed}</div>Passed</div>
-<div class="card"><div class="num fail">${failed}</div>Failed</div>
-<div class="card"><div class="num">${runResults.length}</div>Total</div>
-<div class="card"><div class="num">${totalTime}ms</div>Duration</div>
-</div>
-${runResults.map(r => {
-  const item = items.find(i => i.id === r.itemId);
-  const info = describeEndpoint(r.path || '');
-  const isSuccess = r.status >= 200 && r.status < 300;
-  const pathParams = item ? JSON.parse(item.path_params || '{}') : {};
-  const queryParams = item ? JSON.parse(item.query_params || '{}') : {};
-  const hasPathParams = Object.keys(pathParams).length > 0;
-  const hasQueryParams = Object.keys(queryParams).filter(k => queryParams[k]).length > 0;
-  const hasBody = item?.body && ['POST', 'PUT', 'PATCH'].includes(item.method);
-  const resolvedPath = item ? item.path.replace(/\\{([\\w-]+)\\}/g, (_: string, key: string) => pathParams[key] || `{${key}}`) : r.path;
-
-  return `<div class="result">
-<div class="result-header">
-<span class="method ${(item?.method || 'GET').toLowerCase()}">${item?.method || 'GET'}</span>
-<span class="path">${escapeHtml(resolvedPath || '')}</span>
-<span class="status" style="color:${isSuccess ? '#1a7f37' : '#d1242f'}">${r.status || 'ERR'}</span>
-<span class="timing">${r.timing}ms</span>
-</div>
-<div class="result-body">
-<div class="summary-text"><strong>${escapeHtml(info.title)}</strong> — ${isSuccess ? escapeHtml(summarizeResponse(r.path || '', r.responseBody)) : `<span class="error">${escapeHtml(r.error || 'HTTP ' + r.status)}</span>`}</div>
-${hasPathParams ? `<div class="section-label">Path Parameters</div><div class="params">${Object.entries(pathParams).map(([k, v]) => `<span>${k}:</span> ${escapeHtml(String(v))}`).join(' &nbsp; ')}</div>` : ''}
-${hasQueryParams ? `<div class="section-label">Query Parameters</div><div class="params">${Object.entries(queryParams).filter(([, v]) => v).map(([k, v]) => `<span>${k}:</span> ${escapeHtml(String(v))}`).join(' &nbsp; ')}</div>` : ''}
-${hasBody ? `<div class="section-label">Request Body</div><pre>${escapeHtml(formatJson(item!.body!))}</pre>` : ''}
-${r.responseBody ? `<div class="section-label">Response</div><pre>${escapeHtml(JSON.stringify(r.responseBody, null, 2))}</pre>` : ''}
-</div>
-</div>`;
-}).join('')}
-</body></html>`;
-
-    const blob = new Blob([html], { type: 'text/html' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `${selected.name.replace(/[^a-zA-Z0-9]/g, '-').toLowerCase()}-results.html`;
-    a.click();
-    URL.revokeObjectURL(url);
   }
 
   const selected = collections.find(c => c.id === selectedId);
@@ -357,7 +295,7 @@ ${r.responseBody ? `<div class="section-label">Response</div><pre>${escapeHtml(J
               </div>
             </div>
           ) : (
-            <div className="max-w-5xl mx-auto py-6 px-6">
+            <div className="max-w-3xl mx-auto py-6 px-6">
               {/* Collection header */}
               <div className="flex items-start justify-between mb-6">
                 <div className="flex-1 space-y-2">
@@ -369,57 +307,20 @@ ${r.responseBody ? `<div class="section-label">Response</div><pre>${escapeHtml(J
                     className="text-sm bg-transparent text-text-secondary focus:outline-none focus:ring-1 focus:ring-accent rounded px-1 -ml-1 w-full" />
                 </div>
                 <div className="flex gap-2 ml-4">
-                  <button onClick={handleRunAll} disabled={isRunning || items.length === 0}
+                  <button onClick={runAll} disabled={isRunning || items.length === 0}
                     className="px-3 py-1.5 bg-accent-emphasis text-white text-sm rounded-md hover:opacity-90 disabled:opacity-50 transition-opacity">
                     {isRunning ? 'Running...' : `Run All (${items.length})`}
                   </button>
-                  {runResults.length > 0 && (
-                    <button onClick={exportResultsHtml}
-                      className="px-3 py-1.5 text-sm border border-border rounded-md text-text-secondary hover:bg-surface transition-colors">
-                      Export HTML
-                    </button>
-                  )}
+                  <button onClick={() => duplicateColl(selected.id)}
+                    className="px-3 py-1.5 text-text-secondary text-sm border border-border rounded-md hover:bg-surface transition-colors">
+                    Duplicate
+                  </button>
                   <button onClick={() => deleteColl(selected.id)}
                     className="px-3 py-1.5 text-danger text-sm border border-border rounded-md hover:bg-surface transition-colors">
                     Delete
                   </button>
                 </div>
               </div>
-
-              {/* Missing params prompt */}
-              {showParamPrompt && (
-                <div className="mb-4 bg-panel border border-accent/30 rounded-lg p-4">
-                  <h3 className="text-sm font-medium text-text-primary mb-2">Fill in required parameters</h3>
-                  <p className="text-xs text-text-secondary mb-3">These parameters are needed but not yet configured:</p>
-                  <div className="space-y-2">
-                    {Object.entries(missingParams).map(([name, value]) => (
-                      <div key={name} className="flex items-center gap-3">
-                        <label className="text-sm font-mono text-text-secondary w-32 shrink-0">{`{${name}}`}</label>
-                        <input
-                          type="text"
-                          value={value}
-                          onChange={e => setMissingParams(prev => ({ ...prev, [name]: e.target.value }))}
-                          placeholder={`Enter ${name}...`}
-                          className="flex-1 bg-surface border border-border rounded-md px-3 py-1.5 text-sm text-text-primary font-mono focus:outline-none focus:ring-1 focus:ring-accent"
-                        />
-                      </div>
-                    ))}
-                  </div>
-                  <div className="flex gap-2 mt-3">
-                    <button
-                      onClick={() => runAll(missingParams)}
-                      disabled={Object.values(missingParams).some(v => !v.trim())}
-                      className="px-3 py-1.5 bg-accent-emphasis text-white text-sm rounded-md hover:opacity-90 disabled:opacity-50 transition-opacity">
-                      Run All
-                    </button>
-                    <button
-                      onClick={() => setShowParamPrompt(false)}
-                      className="px-3 py-1.5 text-text-secondary text-sm border border-border rounded-md hover:bg-surface transition-colors">
-                      Cancel
-                    </button>
-                  </div>
-                </div>
-              )}
 
               {/* Run results summary */}
               {runResults.length > 0 && (
@@ -430,15 +331,13 @@ ${r.responseBody ? `<div class="section-label">Response</div><pre>${escapeHtml(J
                     <span className="text-text-muted">{Math.round(runResults.reduce((a, r) => a + r.timing, 0))}ms total</span>
                   </div>
                   {/* Key findings */}
-                  <div className="p-3 space-y-1">
+                  <div className="p-3 space-y-3">
                     {runResults.map(r => {
                       const info = describeEndpoint(r.path || '');
                       const isSuccess = r.status >= 200 && r.status < 300;
-                      const isResultExpanded = expandedResult === r.itemId;
                       return (
                         <div key={r.itemId} className="text-xs">
-                          <div className="flex items-start gap-2 cursor-pointer hover:bg-surface/50 rounded p-1 -m-1 transition-colors"
-                            onClick={() => setExpandedResult(isResultExpanded ? null : r.itemId)}>
+                          <div className="flex items-start gap-2">
                             <span className={`shrink-0 mt-0.5 ${isSuccess ? 'text-success' : 'text-danger'}`}>
                               {isSuccess ? '✓' : '✗'}
                             </span>
@@ -458,18 +357,7 @@ ${r.responseBody ? `<div class="section-label">Response</div><pre>${escapeHtml(J
                               )}
                             </div>
                             <span className="text-text-muted shrink-0">{r.timing}ms</span>
-                            <svg width="10" height="10" viewBox="0 0 16 16" fill="currentColor"
-                              className={`text-text-muted transition-transform shrink-0 mt-0.5 ${isResultExpanded ? 'rotate-90' : ''}`}>
-                              <path d="M6.22 3.22a.75.75 0 0 1 1.06 0l4.25 4.25a.75.75 0 0 1 0 1.06l-4.25 4.25a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042L9.94 8 6.22 4.28a.75.75 0 0 1 0-1.06Z" />
-                            </svg>
                           </div>
-                          {isResultExpanded && r.responseBody && (
-                            <div className="mt-2 ml-5">
-                              <pre className="text-[11px] font-mono text-text-secondary whitespace-pre-wrap break-all max-h-96 overflow-auto bg-canvas rounded p-3 border border-border">
-                                {JSON.stringify(r.responseBody, null, 2)}
-                              </pre>
-                            </div>
-                          )}
                         </div>
                       );
                     })}
@@ -481,20 +369,12 @@ ${r.responseBody ? `<div class="section-label">Response</div><pre>${escapeHtml(J
               <div className="space-y-1">
                 {items.map((item, i) => {
                   const result = runResults.find(r => r.itemId === item.id);
-                  const isExpanded = expandedItem === item.id;
-                  const pathParams = JSON.parse(item.path_params || '{}') as Record<string, string>;
-                  const queryParams = JSON.parse(item.query_params || '{}') as Record<string, string>;
-                  const resolvedPath = item.path.replace(/\{([\w-]+)\}/g, (_, key) => pathParams[key] || `{${key}}`);
-                  const queryString = Object.entries(queryParams).filter(([, v]) => v).map(([k, v]) => `${k}=${v}`).join('&');
-                  const displayPath = resolvedPath + (queryString ? `?${queryString}` : '');
-                  const hasBody = item.body && ['POST', 'PUT', 'PATCH'].includes(item.method);
-                  let parsedBody: unknown = null;
-                  if (hasBody) { try { parsedBody = JSON.parse(item.body!); } catch { parsedBody = item.body; } }
+                  const isExpanded = expandedItems.has(item.id);
                   return (
                     <div key={item.id}>
                       <div
-                        className={`flex items-center gap-2 p-2 bg-panel border border-border rounded-md hover:bg-surface/50 transition-colors cursor-pointer`}
-                        onClick={() => setExpandedItem(isExpanded ? null : item.id)}
+                        className="flex items-center gap-2 p-2 bg-panel border border-border rounded-md hover:bg-surface/50 transition-colors cursor-pointer"
+                        onClick={() => setExpandedItems(prev => { const next = new Set(prev); if (next.has(item.id)) next.delete(item.id); else next.add(item.id); return next; })}
                       >
                         <div className="flex flex-col gap-0.5" onClick={e => e.stopPropagation()}>
                           <button onClick={() => moveItem(i, -1)} disabled={i === 0}
@@ -505,75 +385,39 @@ ${r.responseBody ? `<div class="section-label">Response</div><pre>${escapeHtml(J
                         <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded ${METHOD_COLORS[item.method] || 'bg-text-muted'} shrink-0`}>
                           {item.method}
                         </span>
-                        {hasBody && (
-                          <span className="text-[10px] px-1.5 py-0.5 bg-accent/15 border border-accent/30 rounded text-accent font-bold shrink-0">BODY</span>
-                        )}
-                        <span className="text-sm font-mono text-text-primary flex-1 truncate" title={displayPath}>
-                          {displayPath}
-                        </span>
+                        <span className="text-sm font-mono text-text-primary flex-1 truncate">{item.path}</span>
                         {result && (
-                          <>
-                            <span className={`text-xs font-mono font-bold ${
-                              result.status >= 200 && result.status < 300 ? 'text-success' : 'text-danger'
-                            }`}>
-                              {result.status || 'ERR'} {result.timing}ms
-                            </span>
-                          </>
+                          <span className={`text-xs font-mono font-bold ${
+                            result.status >= 200 && result.status < 300 ? 'text-success' : 'text-danger'
+                          }`}>
+                            {result.status || 'ERR'} {result.timing}ms
+                          </span>
                         )}
+                        <svg width="10" height="10" viewBox="0 0 16 16" fill="currentColor"
+                          className={`text-text-muted transition-transform ${isExpanded ? 'rotate-90' : ''}`}>
+                          <path d="M6.22 3.22a.75.75 0 0 1 1.06 0l4.25 4.25a.75.75 0 0 1 0 1.06l-4.25 4.25a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042L9.94 8 6.22 4.28a.75.75 0 0 1 0-1.06Z" />
+                        </svg>
+                        <button onClick={e => { e.stopPropagation(); runSingle(item); }}
+                          disabled={isRunning || runningItemId === item.id}
+                          className="text-text-muted hover:text-accent p-1 transition-colors disabled:opacity-50" title="Run">
+                          {runningItemId === item.id ? (
+                            <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor" className="animate-spin">
+                              <path d="M8 0a8 8 0 1 0 0 16A8 8 0 0 0 8 0Zm0 14.5a6.5 6.5 0 1 1 0-13 6.5 6.5 0 0 1 0 13Z" opacity=".3"/>
+                              <path d="M8 0a8 8 0 0 1 8 8h-1.5A6.5 6.5 0 0 0 8 1.5V0Z"/>
+                            </svg>
+                          ) : (
+                            <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
+                              <path d="M8 0a8 8 0 1 1 0 16A8 8 0 0 1 8 0ZM1.5 8a6.5 6.5 0 1 0 13 0 6.5 6.5 0 0 0-13 0Zm4.879-2.773 4.264 2.559a.25.25 0 0 1 0 .428l-4.264 2.559A.25.25 0 0 1 6 10.559V5.442a.25.25 0 0 1 .379-.215Z" />
+                            </svg>
+                          )}
+                        </button>
                         <button onClick={e => { e.stopPropagation(); deleteItem(item.id); }}
                           className="text-text-muted hover:text-danger p-1 text-xs">✕</button>
                       </div>
-                      {/* Expanded detail */}
                       {isExpanded && (
-                        <div className="ml-8 mt-1 mb-2 p-3 bg-surface/50 border border-border rounded-md space-y-3">
-                          {/* Path params */}
-                          {Object.keys(pathParams).length > 0 && (
-                            <div>
-                              <div className="text-[10px] font-semibold text-text-muted uppercase mb-1">Path Parameters</div>
-                              <div className="flex flex-wrap gap-2">
-                                {Object.entries(pathParams).map(([k, v]) => (
-                                  <span key={k} className="text-xs font-mono">
-                                    <span className="text-text-muted">{k}:</span> <span className="text-text-primary">{v || <span className="text-warning italic">not set</span>}</span>
-                                  </span>
-                                ))}
-                              </div>
-                            </div>
-                          )}
-                          {/* Query params */}
-                          {Object.keys(queryParams).filter(k => queryParams[k]).length > 0 && (
-                            <div>
-                              <div className="text-[10px] font-semibold text-text-muted uppercase mb-1">Query Parameters</div>
-                              <div className="flex flex-wrap gap-2">
-                                {Object.entries(queryParams).filter(([, v]) => v).map(([k, v]) => (
-                                  <span key={k} className="text-xs font-mono">
-                                    <span className="text-text-muted">{k}:</span> <span className="text-text-primary">{v}</span>
-                                  </span>
-                                ))}
-                              </div>
-                            </div>
-                          )}
-                          {/* Request body */}
-                          {hasBody && parsedBody && (
-                            <div>
-                              <div className="text-[10px] font-semibold text-text-muted uppercase mb-1">Request Body</div>
-                              <pre className="text-[11px] font-mono text-text-secondary whitespace-pre-wrap break-all max-h-40 overflow-auto bg-canvas rounded p-2 border border-border">
-                                {typeof parsedBody === 'string' ? parsedBody : JSON.stringify(parsedBody, null, 2)}
-                              </pre>
-                            </div>
-                          )}
-                          {/* Run result */}
-                          {result && (
-                            <div>
-                              <div className="text-[10px] font-semibold text-text-muted uppercase mb-1">Response</div>
-                              {result.error && (
-                                <div className="text-xs text-danger mb-2">Error: {result.error}</div>
-                              )}
-                              <pre className="text-[11px] font-mono text-text-secondary whitespace-pre-wrap break-all max-h-64 overflow-auto bg-canvas rounded p-2 border border-border">
-                                {JSON.stringify(result.responseBody, null, 2)}
-                              </pre>
-                            </div>
-                          )}
-                        </div>
+                        <ItemEditor item={item} result={result} onUpdate={(updated) => {
+                          setItems(prev => prev.map(it => it.id === updated.id ? updated : it));
+                        }} />
                       )}
                     </div>
                   );
@@ -589,16 +433,204 @@ ${r.responseBody ? `<div class="section-label">Response</div><pre>${escapeHtml(J
           )}
         </div>
       </div>
+      {confirmState && (() => {
+        const info = getConfirmMessage(confirmState.method, confirmState.path);
+        return (
+          <ConfirmDialog
+            open={true}
+            title={confirmState.bulk ? 'Confirm Run All' : info.title}
+            message={confirmState.bulk
+              ? `This batch contains requests that will modify data on the server.`
+              : info.message}
+            detail={`${confirmState.method} ${confirmState.path}`}
+            confirmLabel={confirmState.bulk ? 'Run All' : `Send ${confirmState.method}`}
+            variant={info.variant}
+            onConfirm={() => { const action = confirmState.action; setConfirmState(null); action(); }}
+            onCancel={() => setConfirmState(null)}
+          />
+        );
+      })()}
     </div>
   );
 }
 
-function escapeHtml(str: string): string {
-  return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-}
+function ItemEditor({ item, result, onUpdate }: {
+  item: CollectionItem;
+  result: RunResult | undefined;
+  onUpdate: (updated: CollectionItem) => void;
+}) {
+  const pathParams = JSON.parse(item.path_params || '{}') as Record<string, string>;
+  const queryParams = JSON.parse(item.query_params || '{}') as Record<string, string>;
+  const bodyStr = item.body ? JSON.stringify(JSON.parse(item.body), null, 2) : '';
 
-function formatJson(str: string): string {
-  try { return JSON.stringify(JSON.parse(str), null, 2); } catch { return str; }
+  // Extract all {param} placeholders from path
+  const placeholders = (item.path.match(/\{([\w-]+)\}/g) || []).map(p => p.slice(1, -1));
+  // Ensure all placeholders have entries
+  const allPathParams: Record<string, string> = {};
+  for (const p of placeholders) allPathParams[p] = pathParams[p] || '';
+  // Also include any stored params not in template (custom ones)
+  for (const [k, v] of Object.entries(pathParams)) allPathParams[k] = v;
+
+  const [editPathParams, setEditPathParams] = useState<Record<string, string>>(allPathParams);
+  const [editQueryParams, setEditQueryParams] = useState<Record<string, string>>(queryParams);
+  const [editBody, setEditBody] = useState(bodyStr);
+  const [newQueryKey, setNewQueryKey] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [bodyError, setBodyError] = useState<string | null>(null);
+
+  const hasChanges = JSON.stringify(editPathParams) !== JSON.stringify(allPathParams) ||
+    JSON.stringify(editQueryParams) !== JSON.stringify(queryParams) ||
+    editBody !== bodyStr;
+
+  async function save() {
+    // Validate body JSON if present
+    let parsedBody: unknown = null;
+    if (editBody.trim()) {
+      try {
+        parsedBody = JSON.parse(editBody);
+        setBodyError(null);
+      } catch {
+        setBodyError('Invalid JSON');
+        return;
+      }
+    }
+
+    setSaving(true);
+    await fetch('/api/collections', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        action: 'update-item',
+        id: item.id,
+        pathParams: editPathParams,
+        queryParams: editQueryParams,
+        body: parsedBody,
+      }),
+    });
+    onUpdate({
+      ...item,
+      path_params: JSON.stringify(editPathParams),
+      query_params: JSON.stringify(editQueryParams),
+      body: parsedBody ? JSON.stringify(parsedBody) : null,
+    });
+    setSaving(false);
+  }
+
+  function addQueryParam() {
+    if (!newQueryKey.trim()) return;
+    setEditQueryParams(prev => ({ ...prev, [newQueryKey.trim()]: '' }));
+    setNewQueryKey('');
+  }
+
+  function removeQueryParam(key: string) {
+    setEditQueryParams(prev => {
+      const next = { ...prev };
+      delete next[key];
+      return next;
+    });
+  }
+
+  return (
+    <div className="ml-8 mt-1 mb-2 p-3 bg-surface/50 border border-border rounded-md space-y-3" onClick={e => e.stopPropagation()}>
+      {/* Path Parameters */}
+      {Object.keys(editPathParams).length > 0 && (
+        <div>
+          <div className="text-[10px] font-semibold text-text-muted uppercase tracking-wider mb-1.5">Path Parameters</div>
+          <div className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-1.5 items-center">
+            {Object.entries(editPathParams).map(([k, v]) => (
+              <React.Fragment key={k}>
+                <label className="text-xs font-mono text-accent whitespace-nowrap">{k}</label>
+                <input
+                  type="text"
+                  value={v}
+                  onChange={e => setEditPathParams(prev => ({ ...prev, [k]: e.target.value }))}
+                  className="bg-panel border border-border rounded px-2 py-1 text-xs font-mono text-text-primary focus:outline-none focus:ring-1 focus:ring-accent w-full"
+                  placeholder={`value for {${k}}`}
+                />
+              </React.Fragment>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Query Parameters */}
+      <div>
+        <div className="text-[10px] font-semibold text-text-muted uppercase tracking-wider mb-1.5 flex items-center gap-2">
+          Query Parameters
+          <span className="text-text-muted font-normal normal-case tracking-normal">({Object.keys(editQueryParams).length})</span>
+        </div>
+        {Object.keys(editQueryParams).length > 0 && (
+          <div className="grid grid-cols-[auto_1fr_auto] gap-x-2 gap-y-1.5 items-center mb-2">
+            {Object.entries(editQueryParams).map(([k, v]) => (
+              <React.Fragment key={k}>
+                <label className="text-xs font-mono text-accent whitespace-nowrap">{k}</label>
+                <input
+                  type="text"
+                  value={v}
+                  onChange={e => setEditQueryParams(prev => ({ ...prev, [k]: e.target.value }))}
+                  className="bg-panel border border-border rounded px-2 py-1 text-xs font-mono text-text-primary focus:outline-none focus:ring-1 focus:ring-accent"
+                />
+                <button onClick={() => removeQueryParam(k)}
+                  className="text-text-muted hover:text-danger text-xs p-0.5">✕</button>
+              </React.Fragment>
+            ))}
+          </div>
+        )}
+        <div className="flex gap-2 items-center">
+          <input
+            type="text"
+            value={newQueryKey}
+            onChange={e => setNewQueryKey(e.target.value)}
+            onKeyDown={e => e.key === 'Enter' && addQueryParam()}
+            placeholder="Add query param..."
+            className="bg-panel border border-border rounded px-2 py-1 text-xs font-mono text-text-primary focus:outline-none focus:ring-1 focus:ring-accent w-40"
+          />
+          <button onClick={addQueryParam} disabled={!newQueryKey.trim()}
+            className="text-xs text-accent hover:text-accent-emphasis disabled:opacity-30">+ Add</button>
+        </div>
+      </div>
+
+      {/* Request Body */}
+      <div>
+        <div className="text-[10px] font-semibold text-text-muted uppercase tracking-wider mb-1.5">Request Body</div>
+        <textarea
+          value={editBody}
+          onChange={e => { setEditBody(e.target.value); setBodyError(null); }}
+          rows={Math.min(10, Math.max(3, editBody.split('\n').length + 1))}
+          spellCheck={false}
+          className={`w-full bg-panel border rounded px-3 py-2 text-[11px] font-mono text-text-primary focus:outline-none focus:ring-1 focus:ring-accent resize-y ${
+            bodyError ? 'border-danger' : 'border-border'
+          }`}
+          placeholder="{ }"
+        />
+        {bodyError && <div className="text-xs text-danger mt-0.5">{bodyError}</div>}
+      </div>
+
+      {/* Save button */}
+      {hasChanges && (
+        <div className="flex items-center gap-2 pt-1">
+          <button onClick={save} disabled={saving}
+            className="px-3 py-1 bg-accent-emphasis text-white text-xs rounded-md hover:opacity-90 disabled:opacity-50 transition-opacity">
+            {saving ? 'Saving...' : 'Save Changes'}
+          </button>
+          <span className="text-[10px] text-text-muted">Changes not yet saved</span>
+        </div>
+      )}
+
+      {/* Response (after run) */}
+      {result && (
+        <div className="border-t border-border pt-3">
+          <div className="text-[10px] font-semibold text-text-muted uppercase tracking-wider mb-1">Response</div>
+          {result.error && (
+            <div className="text-xs text-danger mb-1">Error: {result.error}</div>
+          )}
+          <pre className="text-[11px] font-mono text-text-secondary whitespace-pre-wrap break-all max-h-64 overflow-auto">
+            {JSON.stringify(result.responseBody, null, 2)}
+          </pre>
+        </div>
+      )}
+    </div>
+  );
 }
 
 function describeEndpoint(path: string): { title: string; errorHint: string } {

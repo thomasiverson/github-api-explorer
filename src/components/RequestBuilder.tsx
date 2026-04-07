@@ -2,6 +2,7 @@
 
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { useApp } from './AppContext';
+import { ConfirmDialog, isDestructiveMethod, getConfirmMessage } from './ConfirmDialog';
 
 const METHOD_BG: Record<string, string> = {
   GET: 'bg-method-get', POST: 'bg-method-post',
@@ -19,6 +20,7 @@ export function RequestBuilder() {
   const [showBatch, setShowBatch] = useState(false);
   const [batchParam, setBatchParam] = useState('');
   const [batchValues, setBatchValues] = useState('');
+  const [confirmState, setConfirmState] = useState<{ action: () => void } | null>(null);
 
   // Keep a ref to activeEnv so the effect always reads the latest value
   const activeEnvRef = useRef(activeEnv);
@@ -281,7 +283,17 @@ export function RequestBuilder() {
   }, [selectedEndpoint, activeEnv, pathValues, queryValues, batchParam, batchValues, setResponse, setIsLoading]);
 
   // Keep ref in sync for keyboard shortcut
-  executeRequestRef.current = () => showBatch ? executeBatch() : executeRequest();
+  executeRequestRef.current = () => maybeConfirmExecute();
+
+  function maybeConfirmExecute() {
+    if (!selectedEndpoint) return;
+    const action = () => showBatch ? executeBatch() : executeRequest();
+    if (isDestructiveMethod(selectedEndpoint.method)) {
+      setConfirmState({ action });
+    } else {
+      action();
+    }
+  }
 
   if (!selectedEndpoint) {
     return (
@@ -309,7 +321,7 @@ export function RequestBuilder() {
             {resolvedPath}
           </div>
           <button
-            onClick={() => showBatch ? executeBatch() : executeRequest()}
+            onClick={() => maybeConfirmExecute()}
             disabled={isLoading || !activeEnv}
             className="px-4 py-1.5 bg-accent-emphasis text-white text-sm font-medium rounded-md
                        hover:opacity-90 disabled:opacity-50 disabled:cursor-not-allowed transition-opacity flex items-center gap-2"
@@ -616,6 +628,21 @@ export function RequestBuilder() {
         )}
       </div>
       </div>{/* end scrollable content area */}
+      {confirmState && selectedEndpoint && (() => {
+        const info = getConfirmMessage(selectedEndpoint.method, resolvedPath);
+        return (
+          <ConfirmDialog
+            open={true}
+            title={info.title}
+            message={info.message}
+            detail={`${selectedEndpoint.method} ${resolvedPath}`}
+            confirmLabel={`Send ${selectedEndpoint.method}`}
+            variant={info.variant}
+            onConfirm={() => { const action = confirmState.action; setConfirmState(null); action(); }}
+            onCancel={() => setConfirmState(null)}
+          />
+        );
+      })()}
     </div>
   );
 }
