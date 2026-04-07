@@ -4,6 +4,7 @@ import React, { useState, useEffect } from 'react';
 import { TopBar } from '@/components/TopBar';
 import { useApp } from '@/components/AppContext';
 import { ConfirmDialog, isDestructiveMethod, getConfirmMessage } from '@/components/ConfirmDialog';
+import { ParamCombobox } from '@/components/ParamCombobox';
 
 interface Collection {
   id: string; name: string; description: string; item_count: number;
@@ -540,12 +541,13 @@ function ItemEditor({ item, result, onUpdate }: {
             {Object.entries(editPathParams).map(([k, v]) => (
               <React.Fragment key={k}>
                 <label className="text-xs font-mono text-accent whitespace-nowrap">{k}</label>
-                <input
-                  type="text"
+                <ParamCombobox
+                  paramName={k}
                   value={v}
-                  onChange={e => setEditPathParams(prev => ({ ...prev, [k]: e.target.value }))}
-                  className="bg-panel border border-border rounded px-2 py-1 text-xs font-mono text-text-primary focus:outline-none focus:ring-1 focus:ring-accent w-full"
+                  onChange={val => setEditPathParams(prev => ({ ...prev, [k]: val }))}
+                  allParamValues={editPathParams}
                   placeholder={`value for {${k}}`}
+                  className="bg-panel border border-border rounded px-2 py-1 text-xs font-mono text-text-primary focus:outline-none focus:ring-1 focus:ring-accent w-full"
                 />
               </React.Fragment>
             ))}

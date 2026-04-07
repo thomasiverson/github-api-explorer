@@ -3,6 +3,7 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { useApp } from './AppContext';
 import { ConfirmDialog, isDestructiveMethod, getConfirmMessage } from './ConfirmDialog';
+import { ParamCombobox, isDiscoverableParam } from './ParamCombobox';
 
 const METHOD_BG: Record<string, string> = {
   GET: 'bg-method-get', POST: 'bg-method-post',
@@ -429,10 +430,11 @@ export function RequestBuilder() {
                           {p.enum.map(v => <option key={v} value={v}>{v}</option>)}
                         </select>
                       ) : (
-                        <input
-                          type="text"
+                        <ParamCombobox
+                          paramName={p.name}
                           value={pathValues[p.name] || ''}
-                          onChange={e => setPathValues(prev => ({ ...prev, [p.name]: e.target.value }))}
+                          onChange={v => setPathValues(prev => ({ ...prev, [p.name]: v }))}
+                          allParamValues={pathValues}
                           placeholder={p.description || p.type}
                           className="flex-1 bg-surface border border-border rounded-md px-3 py-1.5 text-sm text-text-primary
                                      placeholder-text-muted focus:outline-none focus:ring-1 focus:ring-accent font-mono"
