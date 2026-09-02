@@ -5,7 +5,7 @@
  * and imports all endpoint definitions into the SQLite database.
  * 
  * Supports:
- * - api.github.com (cloud, including EMU)
+ * - GitHub Enterprise Cloud, including EMU
  * - ghes-X.Y (GitHub Enterprise Server versions)
  */
 
@@ -223,22 +223,40 @@ export function parseOpenApiSpec(spec: OpenApiSpec, specVersion: string): Import
  * @param version - "api.github.com" for cloud, or "ghes-3.12" etc.
  */
 export async function fetchOpenApiSpec(version = 'api.github.com'): Promise<OpenApiSpec> {
-  // GitHub publishes bundled specs at:
-  // https://raw.githubusercontent.com/github/rest-api-description/main/descriptions/{version}/api.github.com.json
-  // For GHES: descriptions/ghes-3.12/ghes-3.12.json
-  let url: string;
   if (version === 'api.github.com') {
-    url = 'https://raw.githubusercontent.com/github/rest-api-description/main/descriptions/api.github.com/api.github.com.json';
-  } else {
-    url = `https://raw.githubusercontent.com/github/rest-api-description/main/descriptions/${version}/${version}.json`;
+    const [publicCloud, enterpriseCloud] = await Promise.all([
+      fetchSpec('https://raw.githubusercontent.com/github/rest-api-description/main/descriptions/api.github.com/api.github.com.json'),
+      fetchSpec('https://raw.githubusercontent.com/github/rest-api-description/main/descriptions/ghec/ghec.json'),
+    ]);
+    return mergeOpenApiSpecs(publicCloud, enterpriseCloud);
   }
 
+  return fetchSpec(
+    `https://raw.githubusercontent.com/github/rest-api-description/main/descriptions/${version}/${version}.json`
+  );
+}
+
+async function fetchSpec(url: string): Promise<OpenApiSpec> {
   const response = await fetch(url);
   if (!response.ok) {
     throw new Error(`Failed to fetch OpenAPI spec from ${url}: ${response.status} ${response.statusText}`);
   }
 
   return response.json() as Promise<OpenApiSpec>;
+}
+
+function mergeOpenApiSpecs(...specs: OpenApiSpec[]): OpenApiSpec {
+  const paths: Record<string, OpenApiPathItem> = {};
+  const parameters: Record<string, OpenApiParameter> = {};
+
+  for (const spec of specs) {
+    Object.assign(parameters, spec.components?.parameters);
+    for (const [path, pathItem] of Object.entries(spec.paths)) {
+      paths[path] = { ...paths[path], ...pathItem };
+    }
+  }
+
+  return { paths, components: { parameters } };
 }
 
 /**

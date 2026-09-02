@@ -10,6 +10,22 @@ const METHOD_BG: Record<string, string> = {
   PUT: 'bg-method-put', PATCH: 'bg-method-patch', DELETE: 'bg-method-delete',
 };
 
+const REQUEST_BODY_EXAMPLES: Record<string, Record<string, unknown>> = {
+  'billing/create-budget': {
+    budget_amount: 30,
+    prevent_further_usage: true,
+    budget_scope: 'user',
+    budget_entity_name: '',
+    budget_type: 'BundlePricing',
+    budget_product_sku: 'ai_credits',
+    budget_alerting: {
+      will_alert: false,
+      alert_recipients: [],
+    },
+    user: 'GITHUB_LOGIN',
+  },
+};
+
 export function RequestBuilder() {
   const { selectedEndpoint, activeEnv, setResponse, setIsLoading, isLoading } = useApp();
   const [pathValues, setPathValues] = useState<Record<string, string>>({});
@@ -76,6 +92,8 @@ export function RequestBuilder() {
 
     if (selectedEndpoint.initialBody) {
       setBodyText(selectedEndpoint.initialBody);
+    } else if (REQUEST_BODY_EXAMPLES[selectedEndpoint.operationId]) {
+      setBodyText(JSON.stringify(REQUEST_BODY_EXAMPLES[selectedEndpoint.operationId], null, 2));
     } else if (selectedEndpoint.bodySchema) {
       setBodyText(generateExampleBody(selectedEndpoint.bodySchema));
     } else {
