@@ -329,6 +329,8 @@ export function Sidebar() {
                 isActive={selectedEndpoint?.operationId === ep.operation_id}
                 isBulkSelected={bulkSelected.has(ep.id)}
                 bulkResult={bulkResults[ep.id]}
+                isFavorite={favorites.has(ep.operation_id)}
+                onToggleFavorite={() => toggleFavorite(ep.operation_id)}
                 onClick={(e) => {
                   if (toggleBulkSelect(ep.id, e)) return;
                   handleSelectEndpoint(ep);

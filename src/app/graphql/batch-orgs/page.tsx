@@ -272,9 +272,12 @@ export default function BatchCreateOrgsPage() {
       setMembers(admins);
 
       // Auto-populate empty billing_email and admin_logins in existing rows
-      if (rows.length > 0 && (billingEmail || admins.length > 0)) {
-        const adminLoginsStr = admins.map(m => m.login).join(';');
-        const defaultEmail = billingEmail || admins[0]?.email || '';
+      // Filter out the enterprise setup user (e.g., tpitest_admin) — it cannot own orgs
+      const setupUserPattern = `${enterpriseSlug.trim()}_admin`.toLowerCase();
+      const assignableAdmins = admins.filter(m => m.login.toLowerCase() !== setupUserPattern);
+      if (rows.length > 0 && (billingEmail || assignableAdmins.length > 0)) {
+        const adminLoginsStr = assignableAdmins.map(m => m.login).join(';');
+        const defaultEmail = billingEmail || assignableAdmins[0]?.email || admins[0]?.email || '';
         const updated = rows.map(r => ({
           ...r,
           billing_email: r.billing_email || defaultEmail,
@@ -619,6 +622,31 @@ export default function BatchCreateOrgsPage() {
           {/* Configuration */}
           <section className="bg-panel border border-border rounded-lg p-4 space-y-4">
             <h2 className="text-sm font-semibold text-text-primary uppercase tracking-wider">Configuration</h2>
+            <details open className="bg-surface/50 border border-border rounded-md text-xs text-text-secondary">
+              <summary className="px-3 py-2 font-semibold text-text-primary cursor-pointer select-none hover:bg-surface rounded-md">
+                How batch organization creation works
+              </summary>
+              <ol className="px-3 pb-3 grid gap-3 md:grid-cols-3">
+                <li>
+                  <span className="font-semibold text-text-primary">1. Load enterprise context</span>
+                  <p className="mt-0.5">
+                    Fetch enterprise info to load the billing email, eligible administrator defaults, and member pickers. This is read-only and does not create anything.
+                  </p>
+                </li>
+                <li>
+                  <span className="font-semibold text-text-primary">2. Add organizations</span>
+                  <p className="mt-0.5">
+                    Paste or upload CSV rows, then review and edit the parsed values in the preview table.
+                  </p>
+                </li>
+                <li>
+                  <span className="font-semibold text-text-primary">3. Validate and create</span>
+                  <p className="mt-0.5">
+                    Use Dry Run to check organization names and administrators, then create valid organizations one at a time.
+                  </p>
+                </li>
+              </ol>
+            </details>
             <div>
               <label className="text-sm text-text-secondary block mb-1">Enterprise Slug</label>
               <div className="flex items-center gap-2 flex-wrap">
@@ -680,6 +708,9 @@ export default function BatchCreateOrgsPage() {
                   </span>
                 )}
               </div>
+              <p className="mt-1.5 text-xs text-text-muted">
+                Recommended when CSV fields are incomplete. You can skip this step when every row already includes a billing email and administrator login.
+              </p>
             </div>
 
             {/* Permissions note */}
@@ -717,7 +748,7 @@ export default function BatchCreateOrgsPage() {
                 <button
                   onClick={() => {
                     const email = enterpriseBillingEmail || members.find(m => m.isAdmin)?.email || 'billing@example.com';
-                    const admins = members.filter(m => m.isAdmin).map(m => m.login).join(';') || 'admin1;admin2';
+                    const admins = members.filter(m => m.isAdmin && m.login.toLowerCase() !== `${(enterpriseSlug || 'enterprise').toLowerCase()}_admin`).map(m => m.login).join(';') || 'admin1;admin2';
                     const slug = enterpriseSlug || 'enterprise';
                     const displaySlug = slug.charAt(0).toUpperCase() + slug.slice(1);
                     const sample = `name,display_name,billing_email,admin_logins\n${slug}-my-new-org,${displaySlug} My New Org,${email},${admins}\n${slug}-another-org,${displaySlug} Another Org,${email},${admins}\n${slug}-simple-org,${displaySlug} Simple Org,${email},${admins}`;
