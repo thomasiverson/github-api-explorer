@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server';
-import { clearEndpoints, insertEndpoint, getEndpointCount } from '@/lib/db';
+import { replaceEndpoints, getEndpointCount } from '@/lib/db';
 import { importOpenApiSpec } from '@/lib/openapi-import';
 
 export async function POST(request: Request) {
@@ -8,7 +8,7 @@ export async function POST(request: Request) {
 
   try {
     const result = await importOpenApiSpec(
-      { clearEndpoints, insertEndpoint },
+      { replaceEndpoints },
       specVersion
     );
     const total = getEndpointCount();

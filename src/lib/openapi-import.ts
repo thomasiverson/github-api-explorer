@@ -11,11 +11,16 @@
 
 import { v4 as uuidv4 } from 'uuid';
 
-interface OpenApiSpec {
+export interface OpenApiSpec {
   paths: Record<string, OpenApiPathItem>;
-  components?: {
-    parameters?: Record<string, OpenApiParameter>;
-  };
+  components?: OpenApiComponents;
+}
+
+interface OpenApiComponents {
+  parameters?: Record<string, OpenApiParameter>;
+  schemas?: Record<string, unknown>;
+  requestBodies?: Record<string, OpenApiRequestBody>;
+  responses?: Record<string, OpenApiResponse>;
 }
 
 interface OpenApiPathItem {
@@ -30,12 +35,8 @@ interface OpenApiOperation {
   tags?: string[];
   deprecated?: boolean;
   parameters?: OpenApiParameter[];
-  requestBody?: {
-    content?: Record<string, { schema?: unknown }>;
-  };
-  responses?: Record<string, {
-    content?: Record<string, { schema?: unknown }>;
-  }>;
+  requestBody?: OpenApiRequestBody;
+  responses?: Record<string, OpenApiResponse>;
   'x-github'?: {
     category?: string;
     subcategory?: string;
@@ -51,8 +52,28 @@ interface OpenApiParameter {
     type?: string;
     default?: unknown;
     enum?: string[];
+    items?: unknown;
   };
+  style?: string;
+  explode?: boolean;
   '$ref'?: string;
+}
+
+interface OpenApiRequestBody {
+  required?: boolean;
+  content?: Record<string, OpenApiMediaType>;
+  '$ref'?: string;
+}
+
+interface OpenApiResponse {
+  content?: Record<string, OpenApiMediaType>;
+  '$ref'?: string;
+}
+
+interface OpenApiMediaType {
+  schema?: unknown;
+  example?: unknown;
+  examples?: Record<string, { value?: unknown }>;
 }
 
 /**
@@ -76,7 +97,7 @@ function resolveParams(
   }).filter(p => p.name && p.in); // filter out any unresolved refs
 }
 
-interface ImportedEndpoint {
+export interface ImportedEndpoint {
   id: string;
   category: string;
   subcategory: string;
@@ -104,50 +125,145 @@ function extractParams(parameters: OpenApiParameter[] | undefined, location: str
       type: p.schema?.type || 'string',
       default: p.schema?.default !== undefined ? String(p.schema.default) : undefined,
       enum: p.schema?.enum,
+      style: p.style,
+      explode: p.explode,
     }));
 }
 
-function extractBodySchema(op: OpenApiOperation): string | null {
-  const content = op.requestBody?.content;
+function extractBodySchema(op: OpenApiOperation, spec: OpenApiSpec): string | null {
+  const requestBody = resolveReferencedObject<OpenApiRequestBody>(op.requestBody, spec);
+  const content = requestBody?.content;
   if (!content) return null;
-  const jsonContent = content['application/json'];
+  const jsonContent = findJsonContent(content);
   if (!jsonContent?.schema) return null;
-  // Simplify deeply nested schemas to keep storage reasonable
-  return JSON.stringify(simplifySchema(jsonContent.schema));
+  const simplified = simplifySchema(jsonContent.schema, spec);
+  if (!simplified || typeof simplified !== 'object' || Array.isArray(simplified)) {
+    return JSON.stringify(simplified);
+  }
+
+  const result = { ...simplified as Record<string, unknown> };
+  const example = jsonContent.example ?? firstExampleValue(jsonContent.examples);
+  if (example !== undefined && result.example === undefined) {
+    result.example = example;
+  }
+  if (requestBody.required) {
+    result['x-request-body-required'] = true;
+  }
+  return JSON.stringify(result);
 }
 
-function extractResponseSchema(op: OpenApiOperation): string | null {
-  const resp = op.responses?.['200'] || op.responses?.['201'] || op.responses?.['202'];
+function extractResponseSchema(op: OpenApiOperation, spec: OpenApiSpec): string | null {
+  const rawResponse = op.responses?.['200'] || op.responses?.['201'] || op.responses?.['202'];
+  const resp = resolveReferencedObject<OpenApiResponse>(rawResponse, spec);
   if (!resp?.content) return null;
-  const jsonContent = resp.content['application/json'];
+  const jsonContent = findJsonContent(resp.content);
   if (!jsonContent?.schema) return null;
-  return JSON.stringify(simplifySchema(jsonContent.schema));
+  return JSON.stringify(simplifySchema(jsonContent.schema, spec));
 }
 
-function simplifySchema(schema: unknown, depth = 0): unknown {
-  if (depth > 4 || !schema || typeof schema !== 'object') return schema;
+function simplifySchema(
+  schema: unknown,
+  spec: OpenApiSpec,
+  depth = 0,
+  resolvingRefs = new Set<string>()
+): unknown {
+  if (!schema || typeof schema !== 'object') return schema;
   const s = schema as Record<string, unknown>;
+
+  if (typeof s['$ref'] === 'string') {
+    const ref = s['$ref'];
+    if (resolvingRefs.has(ref) || depth > 6) {
+      return { '$ref': ref };
+    }
+    const resolved = resolveJsonPointer(spec, ref);
+    if (resolved !== undefined) {
+      const nextRefs = new Set(resolvingRefs);
+      nextRefs.add(ref);
+      return simplifySchema(resolved, spec, depth, nextRefs);
+    }
+  }
+
+  if (depth > 6) {
+    const summary: Record<string, unknown> = {};
+    if (s.type) summary.type = s.type;
+    if (s.description) summary.description = s.description;
+    if (s['$ref']) summary['$ref'] = s['$ref'];
+    return summary;
+  }
+
   const result: Record<string, unknown> = {};
 
-  if (s.type) result.type = s.type;
-  if (s.description) result.description = s.description;
-  if (s.enum) result.enum = s.enum;
-  if (s.required) result.required = s.required;
-  if (s.default !== undefined) result.default = s.default;
+  for (const key of [
+    'type', 'description', 'format', 'enum', 'required', 'default', 'example',
+    'nullable', 'minimum', 'maximum', 'minLength', 'maxLength', 'pattern',
+    'minItems', 'maxItems', 'uniqueItems', 'readOnly', 'writeOnly', 'deprecated',
+  ]) {
+    if (s[key] !== undefined) result[key] = s[key];
+  }
 
   if (s.properties && typeof s.properties === 'object') {
     const props: Record<string, unknown> = {};
     for (const [key, value] of Object.entries(s.properties as Record<string, unknown>)) {
-      props[key] = simplifySchema(value, depth + 1);
+      props[key] = simplifySchema(value, spec, depth + 1, resolvingRefs);
     }
     result.properties = props;
   }
 
   if (s.items) {
-    result.items = simplifySchema(s.items, depth + 1);
+    result.items = simplifySchema(s.items, spec, depth + 1, resolvingRefs);
+  }
+
+  for (const compositionKey of ['allOf', 'oneOf', 'anyOf'] as const) {
+    const branches = s[compositionKey];
+    if (Array.isArray(branches)) {
+      result[compositionKey] = branches.map(branch => (
+        simplifySchema(branch, spec, depth + 1, resolvingRefs)
+      ));
+    }
+  }
+
+  if (typeof s.additionalProperties === 'boolean') {
+    result.additionalProperties = s.additionalProperties;
+  } else if (s.additionalProperties) {
+    result.additionalProperties = simplifySchema(
+      s.additionalProperties,
+      spec,
+      depth + 1,
+      resolvingRefs
+    );
   }
 
   return result;
+}
+
+function findJsonContent(content: Record<string, OpenApiMediaType>): OpenApiMediaType | undefined {
+  return content['application/json']
+    || Object.entries(content).find(([contentType]) => contentType.includes('json'))?.[1];
+}
+
+function firstExampleValue(examples: OpenApiMediaType['examples']): unknown {
+  if (!examples) return undefined;
+  return Object.values(examples).find(example => example.value !== undefined)?.value;
+}
+
+function resolveReferencedObject<T extends object>(
+  value: (T & { '$ref'?: string }) | undefined,
+  spec: OpenApiSpec
+): T | undefined {
+  if (!value?.['$ref']) return value;
+  const resolved = resolveJsonPointer(spec, value['$ref']);
+  return resolved && typeof resolved === 'object' ? resolved as T : undefined;
+}
+
+function resolveJsonPointer(root: unknown, ref: string): unknown {
+  if (!ref.startsWith('#/')) return undefined;
+  let current = root;
+  for (const encodedSegment of ref.slice(2).split('/')) {
+    if (!current || typeof current !== 'object') return undefined;
+    const segment = encodedSegment.replace(/~1/g, '/').replace(/~0/g, '~');
+    current = (current as Record<string, unknown>)[segment];
+  }
+  return current;
 }
 
 export function parseOpenApiSpec(spec: OpenApiSpec, specVersion: string): ImportedEndpoint[] {
@@ -207,8 +323,8 @@ export function parseOpenApiSpec(spec: OpenApiSpec, specVersion: string): Import
         description: (op.description || '').substring(0, 2000), // cap at 2000 chars
         pathParams: JSON.stringify(pathParams),
         queryParams: JSON.stringify(queryParams),
-        bodySchema: extractBodySchema(op),
-        responseSchema: extractResponseSchema(op),
+        bodySchema: extractBodySchema(op, spec),
+        responseSchema: extractResponseSchema(op, spec),
         isDeprecated: op.deprecated || false,
         specVersion,
       });
@@ -245,18 +361,24 @@ async function fetchSpec(url: string): Promise<OpenApiSpec> {
   return response.json() as Promise<OpenApiSpec>;
 }
 
-function mergeOpenApiSpecs(...specs: OpenApiSpec[]): OpenApiSpec {
+export function mergeOpenApiSpecs(...specs: OpenApiSpec[]): OpenApiSpec {
   const paths: Record<string, OpenApiPathItem> = {};
   const parameters: Record<string, OpenApiParameter> = {};
+  const schemas: Record<string, unknown> = {};
+  const requestBodies: Record<string, OpenApiRequestBody> = {};
+  const responses: Record<string, OpenApiResponse> = {};
 
   for (const spec of specs) {
     Object.assign(parameters, spec.components?.parameters);
+    Object.assign(schemas, spec.components?.schemas);
+    Object.assign(requestBodies, spec.components?.requestBodies);
+    Object.assign(responses, spec.components?.responses);
     for (const [path, pathItem] of Object.entries(spec.paths)) {
       paths[path] = { ...paths[path], ...pathItem };
     }
   }
 
-  return { paths, components: { parameters } };
+  return { paths, components: { parameters, schemas, requestBodies, responses } };
 }
 
 /**
@@ -265,8 +387,7 @@ function mergeOpenApiSpecs(...specs: OpenApiSpec[]): OpenApiSpec {
  */
 export async function importOpenApiSpec(
   db: {
-    clearEndpoints: (specVersion: string) => void;
-    insertEndpoint: (endpoint: ImportedEndpoint) => void;
+    replaceEndpoints: (specVersion: string, endpoints: ImportedEndpoint[]) => void;
   },
   specVersion = 'api.github.com'
 ): Promise<{ count: number; categories: number }> {
@@ -275,17 +396,46 @@ export async function importOpenApiSpec(
 
   console.log('Parsing spec...');
   const endpoints = parseOpenApiSpec(spec, specVersion);
+  validateImportedEndpoints(endpoints, specVersion);
 
-  console.log(`Clearing existing endpoints for ${specVersion}...`);
-  db.clearEndpoints(specVersion);
-
-  console.log(`Importing ${endpoints.length} endpoints...`);
-  for (const endpoint of endpoints) {
-    db.insertEndpoint(endpoint);
-  }
+  console.log(`Replacing ${specVersion} catalog with ${endpoints.length} endpoints...`);
+  db.replaceEndpoints(specVersion, endpoints);
 
   const categories = new Set(endpoints.map(e => e.category)).size;
   console.log(`Done! Imported ${endpoints.length} endpoints across ${categories} categories.`);
 
   return { count: endpoints.length, categories };
+}
+
+const CLOUD_SENTINEL_ROUTES = [
+  'GET /meta',
+  'GET /user',
+  'GET /enterprises/{enterprise}/settings/billing/budgets',
+];
+
+export function validateImportedEndpoints(endpoints: ImportedEndpoint[], specVersion: string): void {
+  const minimumCount = specVersion === 'api.github.com' ? 1000 : 100;
+  if (endpoints.length < minimumCount) {
+    throw new Error(
+      `Catalog integrity check failed for ${specVersion}: expected at least ${minimumCount} endpoints, received ${endpoints.length}`
+    );
+  }
+
+  const routeKeys = new Set<string>();
+  for (const endpoint of endpoints) {
+    const key = `${endpoint.method} ${endpoint.path}`;
+    if (routeKeys.has(key)) {
+      throw new Error(`Catalog integrity check failed for ${specVersion}: duplicate route ${key}`);
+    }
+    routeKeys.add(key);
+  }
+
+  if (specVersion === 'api.github.com') {
+    const missing = CLOUD_SENTINEL_ROUTES.filter(route => !routeKeys.has(route));
+    if (missing.length > 0) {
+      throw new Error(
+        `Catalog integrity check failed for ${specVersion}: missing required routes ${missing.join(', ')}`
+      );
+    }
+  }
 }

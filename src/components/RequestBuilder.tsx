@@ -10,6 +10,7 @@ import {
   collectEnabledQueryParams,
   resolvePath,
 } from '@/lib/rest-request';
+import { generateExampleBody } from '@/lib/openapi-example';
 import type { QueryParamValue } from '@/lib/rest-request';
 import type { ExecuteResponse } from '@/lib/types';
 
@@ -756,34 +757,6 @@ function createClientErrorResponse(message: string): ExecuteResponse {
     nextPageUrl: null,
     nextPageRequest: null,
   };
-}
-
-function generateExampleBody(schema: unknown): string {
-  if (!schema || typeof schema !== 'object') return '{}';
-  const s = schema as Record<string, unknown>;
-  if (s.type === 'object' && s.properties) {
-    const example: Record<string, unknown> = {};
-    const required = (s.required as string[]) || [];
-    for (const [key, val] of Object.entries(s.properties as Record<string, Record<string, unknown>>)) {
-      if (!required.includes(key) && Object.keys(s.properties as object).length > 6) continue;
-      example[key] = getDefaultForType(val);
-    }
-    return JSON.stringify(example, null, 2);
-  }
-  return '{}';
-}
-
-function getDefaultForType(schema: Record<string, unknown>): unknown {
-  if (schema.default !== undefined) return schema.default;
-  if (schema.enum && Array.isArray(schema.enum)) return schema.enum[0];
-  switch (schema.type) {
-    case 'string': return '';
-    case 'number': case 'integer': return 0;
-    case 'boolean': return false;
-    case 'array': return [];
-    case 'object': return {};
-    default: return null;
-  }
 }
 
 function isValidJson(text: string): boolean {

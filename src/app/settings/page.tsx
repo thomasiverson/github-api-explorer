@@ -39,13 +39,17 @@ export default function SettingsPage() {
   async function importVersion(version: string) {
     setImportingVersion(version);
     try {
-      await fetch('/api/import', {
+      const res = await fetch('/api/import', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ specVersion: version }),
       });
+      const data = await res.json();
+      if (!res.ok || data.error) {
+        throw new Error(data.error || `Import failed with HTTP ${res.status}`);
+      }
       await loadVersions();
-      setImportStatus(`Imported ${version} successfully`);
+      setImportStatus(`Imported ${version} successfully (${data.count} endpoints)`);
     } catch (err) {
       setImportStatus(`Import failed: ${err instanceof Error ? err.message : 'Unknown error'}`);
     }

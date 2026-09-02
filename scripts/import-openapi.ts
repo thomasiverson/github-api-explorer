@@ -9,7 +9,7 @@
  *   npx tsx scripts/import-openapi.ts ghes-3.12        # imports GHES 3.12
  */
 
-import { clearEndpoints, insertEndpoint, getEndpointCount } from '../src/lib/db';
+import { replaceEndpoints, getEndpointCount } from '../src/lib/db';
 import { importOpenApiSpec } from '../src/lib/openapi-import';
 
 async function main() {
@@ -21,7 +21,7 @@ async function main() {
 
   try {
     const result = await importOpenApiSpec(
-      { clearEndpoints, insertEndpoint },
+      { replaceEndpoints },
       specVersion
     );
 

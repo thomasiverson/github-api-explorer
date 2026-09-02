@@ -1,6 +1,7 @@
 import Database from 'better-sqlite3';
 import path from 'path';
 import crypto from 'crypto';
+import type { ImportedEndpoint } from './openapi-import';
 
 const DB_PATH = path.join(process.cwd(), 'data', 'harness.db');
 
@@ -67,6 +68,8 @@ function initSchema(db: Database.Database) {
     CREATE INDEX IF NOT EXISTS idx_endpoints_category ON endpoints(category);
     CREATE INDEX IF NOT EXISTS idx_endpoints_method ON endpoints(method);
     CREATE INDEX IF NOT EXISTS idx_endpoints_operation_id ON endpoints(operation_id);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_endpoints_spec_method_path
+      ON endpoints(spec_version, method, path);
 
     CREATE TABLE IF NOT EXISTS history (
       id TEXT PRIMARY KEY,
@@ -311,18 +314,35 @@ export function clearEndpoints(specVersion?: string) {
   }
 }
 
-export function insertEndpoint(endpoint: {
-  id: string; category: string; subcategory: string; operationId: string;
-  method: string; path: string; summary: string; description: string;
-  pathParams: string; queryParams: string; bodySchema: string | null;
-  responseSchema: string | null; isDeprecated: boolean; specVersion: string;
-}) {
-  getDb().prepare(`
-    INSERT OR REPLACE INTO endpoints
-    (id, category, subcategory, operation_id, method, path, summary, description,
-     path_params, query_params, body_schema, response_schema, is_deprecated, spec_version)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(
+export function insertEndpoint(endpoint: ImportedEndpoint) {
+  insertEndpointRow(getDb().prepare(INSERT_ENDPOINT_SQL), endpoint);
+}
+
+export function replaceEndpoints(specVersion: string, endpoints: ImportedEndpoint[]) {
+  const db = getDb();
+  const clear = db.prepare('DELETE FROM endpoints WHERE spec_version = ?');
+  const insert = db.prepare(INSERT_ENDPOINT_SQL);
+  const replace = db.transaction(() => {
+    clear.run(specVersion);
+    for (const endpoint of endpoints) {
+      insertEndpointRow(insert, endpoint);
+    }
+  });
+  replace();
+}
+
+const INSERT_ENDPOINT_SQL = `
+  INSERT INTO endpoints
+  (id, category, subcategory, operation_id, method, path, summary, description,
+   path_params, query_params, body_schema, response_schema, is_deprecated, spec_version)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+`;
+
+function insertEndpointRow(
+  statement: Database.Statement,
+  endpoint: ImportedEndpoint
+) {
+  statement.run(
     endpoint.id, endpoint.category, endpoint.subcategory, endpoint.operationId,
     endpoint.method, endpoint.path, endpoint.summary, endpoint.description,
     endpoint.pathParams, endpoint.queryParams, endpoint.bodySchema,
