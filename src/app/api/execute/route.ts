@@ -1,63 +1,54 @@
 import { NextResponse } from 'next/server';
 import { createOctokit } from '@/lib/auth';
 import { addHistory, getActiveEnvironment, lookupCategory } from '@/lib/db';
+import { buildRestUrl, validatePaginationUrl } from '@/lib/rest-request';
+import type { HttpMethod, ExecuteResponse } from '@/lib/types';
 import { v4 as uuidv4 } from 'uuid';
 
 export async function POST(request: Request) {
-  const body = await request.json();
-  const {
-    environmentId,
-    method,
-    path: pathTemplate,
-    pathParams = {},
-    queryParams = {},
-    headers: customHeaders = {},
-    body: requestBody,
-    operationId,
-    category,
-    nextPageUrl,
-  } = body;
-
-  // Determine target environment
-  const envId = environmentId || getActiveEnvironment()?.id;
-  if (!envId) {
-    return NextResponse.json({ error: 'No active environment' }, { status: 400 });
-  }
-
+  const startTime = performance.now();
   try {
+    const body = await request.json() as Record<string, unknown>;
+    const environmentId = typeof body.environmentId === 'string' ? body.environmentId : undefined;
+    const pathTemplate = typeof body.path === 'string' ? body.path : undefined;
+    const nextPageUrl = typeof body.nextPageUrl === 'string' ? body.nextPageUrl : undefined;
+    const methodValue = typeof body.method === 'string' ? body.method.toUpperCase() : nextPageUrl ? 'GET' : '';
+    const operationId = typeof body.operationId === 'string' ? body.operationId : undefined;
+    const category = typeof body.category === 'string' ? body.category : undefined;
+
+    if (!isHttpMethod(methodValue)) {
+      return executeError(`Unsupported or missing HTTP method: ${methodValue || '(missing)'}`, 400, startTime);
+    }
+    if (!pathTemplate) {
+      return executeError('Request path is required', 400, startTime);
+    }
+    if (nextPageUrl && methodValue !== 'GET') {
+      return executeError('Paginated requests must use GET', 400, startTime);
+    }
+
+    const pathParams = readStringRecord(body.pathParams, 'pathParams');
+    const queryParams = readQueryRecord(body.queryParams);
+    const customHeaders = readStringRecord(body.headers, 'headers');
+    const requestBody = body.body;
+
+    const envId = environmentId || getActiveEnvironment()?.id;
+    if (!envId) {
+      return executeError('No active environment', 400, startTime);
+    }
+
     const { octokit, baseUrl } = createOctokit(envId);
 
-    // Resolve path parameters
-    let resolvedPath = pathTemplate;
-    for (const [key, value] of Object.entries(pathParams)) {
-      resolvedPath = resolvedPath.replace(`{${key}}`, encodeURIComponent(value as string));
-    }
-
     // Build full URL (or use nextPageUrl for pagination)
-    let fullUrl: string;
-    if (nextPageUrl) {
-      fullUrl = nextPageUrl;
-    } else {
-      const queryString = Object.entries(queryParams)
-        .filter(([, v]) => v !== '' && v !== undefined)
-        .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v as string)}`)
-        .join('&');
-      fullUrl = `${baseUrl}${resolvedPath}${queryString ? '?' + queryString : ''}`;
-    }
+    const fullUrl = nextPageUrl || buildRestUrl(baseUrl, pathTemplate, pathParams, queryParams);
 
-    // SSRF protection: validate URL against configured base
-    const parsed = new URL(fullUrl);
-    const baseParsed = new URL(baseUrl);
-    if (parsed.hostname !== baseParsed.hostname) {
-      return NextResponse.json(
-        { error: `SSRF blocked: ${parsed.hostname} does not match configured base ${baseParsed.hostname}` },
-        { status: 403 }
-      );
+    try {
+      validatePaginationUrl(fullUrl, baseUrl);
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : 'Invalid target URL';
+      return executeError(`SSRF blocked: ${message}`, 403, startTime);
     }
 
     // Execute request
-    const startTime = performance.now();
-
     const fetchHeaders: Record<string, string> = {
       'Accept': 'application/vnd.github+json',
       'X-GitHub-Api-Version': '2022-11-28',
@@ -65,11 +56,11 @@ export async function POST(request: Request) {
     };
 
     const fetchOptions: RequestInit = {
-      method: method.toUpperCase(),
+      method: methodValue,
       headers: fetchHeaders,
     };
 
-    if (requestBody && ['POST', 'PUT', 'PATCH'].includes(method.toUpperCase())) {
+    if (requestBody !== null && requestBody !== undefined && ['POST', 'PUT', 'PATCH'].includes(methodValue)) {
       fetchOptions.body = typeof requestBody === 'string' ? requestBody : JSON.stringify(requestBody);
       fetchHeaders['Content-Type'] = 'application/json';
     }
@@ -126,12 +117,14 @@ export async function POST(request: Request) {
     addHistory({
       id: uuidv4(),
       environmentId: envId,
-      method: method.toUpperCase(),
+      method: methodValue,
       path: pathTemplate,
       resolvedUrl: fullUrl,
       status: response.status,
       timing,
-      requestBody: requestBody ? (typeof requestBody === 'string' ? requestBody : JSON.stringify(requestBody)) : null,
+      requestBody: requestBody !== null && requestBody !== undefined
+        ? (typeof requestBody === 'string' ? requestBody : JSON.stringify(requestBody))
+        : null,
       responseBody: truncatedBody,
       responseHeaders: JSON.stringify(responseHeaders),
       operationId: operationId || null,
@@ -146,9 +139,67 @@ export async function POST(request: Request) {
       timing,
       rateLimit,
       nextPageUrl: nextPage,
+      nextPageRequest: nextPage ? {
+        environmentId: envId,
+        method: 'GET',
+        path: pathTemplate,
+        headers: customHeaders,
+        operationId,
+        category,
+      } : null,
     });
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : 'Unknown error';
-    return NextResponse.json({ error: message }, { status: 500 });
+    return executeError(message, 500, startTime);
   }
+}
+
+const HTTP_METHODS = new Set<string>(['GET', 'POST', 'PUT', 'PATCH', 'DELETE']);
+
+function isHttpMethod(value: string): value is HttpMethod {
+  return HTTP_METHODS.has(value);
+}
+
+function readStringRecord(value: unknown, fieldName: string): Record<string, string> {
+  if (value === undefined || value === null) return {};
+  if (typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error(`${fieldName} must be an object`);
+  }
+
+  const entries = Object.entries(value);
+  if (entries.some(([, entryValue]) => typeof entryValue !== 'string')) {
+    throw new Error(`${fieldName} values must be strings`);
+  }
+  return Object.fromEntries(entries) as Record<string, string>;
+}
+
+function readQueryRecord(value: unknown): Record<string, string | string[]> {
+  if (value === undefined || value === null) return {};
+  if (typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('queryParams must be an object');
+  }
+
+  const entries = Object.entries(value);
+  if (entries.some(([, entryValue]) => (
+    typeof entryValue !== 'string'
+    && (!Array.isArray(entryValue) || entryValue.some(item => typeof item !== 'string'))
+  ))) {
+    throw new Error('queryParams values must be strings or arrays of strings');
+  }
+  return Object.fromEntries(entries) as Record<string, string | string[]>;
+}
+
+function executeError(message: string, httpStatus: number, startedAt: number) {
+  const response: ExecuteResponse & { error: string } = {
+    error: message,
+    status: httpStatus,
+    statusText: 'Proxy Error',
+    headers: {},
+    body: { error: message },
+    timing: Math.round(performance.now() - startedAt),
+    rateLimit: null,
+    nextPageUrl: null,
+    nextPageRequest: null,
+  };
+  return NextResponse.json(response, { status: httpStatus });
 }

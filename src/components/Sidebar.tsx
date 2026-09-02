@@ -44,7 +44,7 @@ export function Sidebar() {
   const [searchResults, setSearchResults] = useState<EndpointRow[]>([]);
   const [isSearching, setIsSearching] = useState(false);
   const [bulkSelected, setBulkSelected] = useState<Set<string>>(new Set());
-  const [bulkResults, setBulkResults] = useState<Record<string, { status: number; timing: number }>>({});
+  const [bulkResults, setBulkResults] = useState<Record<string, { status: number; timing: number; error?: string }>>({});
   const [isBulkRunning, setIsBulkRunning] = useState(false);
   const [favorites, setFavorites] = useState<Set<string>>(new Set());
   const [favoriteEndpoints, setFavoriteEndpoints] = useState<EndpointRow[]>([]);
@@ -170,12 +170,13 @@ export function Sidebar() {
     });
   }
 
-  function toggleBulkSelect(epId: string, e: React.MouseEvent) {
+  function toggleBulkSelect(endpoint: EndpointRow, e: React.MouseEvent) {
     if (!e.ctrlKey && !e.metaKey) return false; // not a bulk-select click
+    if (endpoint.method !== 'GET') return false;
     e.preventDefault();
     setBulkSelected(prev => {
       const next = new Set(prev);
-      if (next.has(epId)) next.delete(epId); else next.add(epId);
+      if (next.has(endpoint.id)) next.delete(endpoint.id); else next.add(endpoint.id);
       return next;
     });
     return true;
@@ -196,25 +197,68 @@ export function Sidebar() {
     for (const epId of bulkSelected) {
       const ep = allEndpoints.find(e => e.id === epId);
       if (!ep) continue;
+      if (ep.method !== 'GET') {
+        setBulkResults(prev => ({
+          ...prev,
+          [epId]: { status: 0, timing: 0, error: 'Bulk execution supports GET endpoints only' },
+        }));
+        continue;
+      }
       try {
         const pathParams: Record<string, string> = {};
-        const parsed = JSON.parse(ep.path_params || '[]');
+        const parsed = JSON.parse(ep.path_params || '[]') as Array<{ name: string; required: boolean }>;
         for (const p of parsed) {
           if (p.name === 'org' || p.name === 'owner') pathParams[p.name] = activeEnv.org_name || '';
           else if (p.name === 'enterprise') pathParams[p.name] = activeEnv.enterprise_slug || '';
         }
+        const missingPath = parsed.filter(p => p.required && !pathParams[p.name]).map(p => p.name);
+        const queryDefinitions = JSON.parse(ep.query_params || '[]') as Array<{
+          name: string;
+          required: boolean;
+          default?: string;
+        }>;
+        const missingQuery = queryDefinitions
+          .filter(p => p.required && !p.default)
+          .map(p => p.name);
+        if (missingPath.length > 0 || missingQuery.length > 0) {
+          const missing = [...missingPath, ...missingQuery];
+          setBulkResults(prev => ({
+            ...prev,
+            [epId]: { status: 0, timing: 0, error: `Missing required parameters: ${missing.join(', ')}` },
+          }));
+          continue;
+        }
+        const queryParams = Object.fromEntries(
+          queryDefinitions
+            .filter((p): p is typeof p & { default: string } => p.required && p.default !== undefined)
+            .map(p => [p.name, p.default])
+        );
         const res = await fetch('/api/execute', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            method: ep.method, path: ep.path, pathParams, queryParams: {},
+            environmentId: activeEnv.id,
+            method: ep.method,
+            path: ep.path,
+            pathParams,
+            queryParams,
             operationId: ep.operation_id, category: ep.category,
           }),
         });
         const data = await res.json();
-        setBulkResults(prev => ({ ...prev, [epId]: { status: data.status || 0, timing: data.timing || 0 } }));
-      } catch {
-        setBulkResults(prev => ({ ...prev, [epId]: { status: 0, timing: 0 } }));
+        setBulkResults(prev => ({
+          ...prev,
+          [epId]: { status: data.status || 0, timing: data.timing || 0, error: data.error },
+        }));
+      } catch (error: unknown) {
+        setBulkResults(prev => ({
+          ...prev,
+          [epId]: {
+            status: 0,
+            timing: 0,
+            error: error instanceof Error ? error.message : 'Unknown bulk execution error',
+          },
+        }));
       }
     }
     setIsBulkRunning(false);
@@ -267,7 +311,7 @@ export function Sidebar() {
               className="text-[11px] text-text-muted hover:text-text-primary">Clear</button>
           </div>
         )}
-        <p className="text-xs text-text-muted mt-1">Ctrl+click to multi-select</p>
+        <p className="text-xs text-text-muted mt-1">Ctrl+click GET endpoints to multi-select</p>
         {/* Version filter */}
         {specVersions.length > 1 && (
           <select
@@ -332,7 +376,7 @@ export function Sidebar() {
                 isFavorite={favorites.has(ep.operation_id)}
                 onToggleFavorite={() => toggleFavorite(ep.operation_id)}
                 onClick={(e) => {
-                  if (toggleBulkSelect(ep.id, e)) return;
+                  if (toggleBulkSelect(ep, e)) return;
                   handleSelectEndpoint(ep);
                 }}
               />
@@ -364,7 +408,7 @@ export function Sidebar() {
                     isFavorite={true}
                     onToggleFavorite={() => toggleFavorite(ep.operation_id)}
                     onClick={(e) => {
-                      if (toggleBulkSelect(ep.id, e)) return;
+                      if (toggleBulkSelect(ep, e)) return;
                       handleSelectEndpoint(ep);
                     }}
                   />
@@ -409,7 +453,7 @@ export function Sidebar() {
                             isFavorite={favorites.has(ep.operation_id)}
                             onToggleFavorite={() => toggleFavorite(ep.operation_id)}
                             onClick={(e) => {
-                              if (toggleBulkSelect(ep.id, e)) return;
+                              if (toggleBulkSelect(ep, e)) return;
                               handleSelectEndpoint(ep);
                             }}
                           />
@@ -433,7 +477,7 @@ export function Sidebar() {
                               isFavorite={favorites.has(ep.operation_id)}
                               onToggleFavorite={() => toggleFavorite(ep.operation_id)}
                               onClick={(e) => {
-                                if (toggleBulkSelect(ep.id, e)) return;
+                                if (toggleBulkSelect(ep, e)) return;
                                 handleSelectEndpoint(ep);
                               }}
                             />
@@ -456,7 +500,7 @@ function EndpointItem({
   endpoint, isActive, isBulkSelected, bulkResult, isFavorite, onToggleFavorite, onClick,
 }: {
   endpoint: EndpointRow; isActive: boolean; isBulkSelected: boolean;
-  bulkResult?: { status: number; timing: number };
+  bulkResult?: { status: number; timing: number; error?: string };
   isFavorite?: boolean; onToggleFavorite?: () => void;
   onClick: (e: React.MouseEvent) => void;
 }) {
@@ -477,9 +521,12 @@ function EndpointItem({
         {endpoint.path}
       </span>
       {bulkResult && (
-        <span className={`text-[10px] font-mono font-bold shrink-0 ${
+        <span
+          className={`text-[10px] font-mono font-bold shrink-0 ${
           bulkResult.status >= 200 && bulkResult.status < 300 ? 'text-success' : 'text-danger'
-        }`}>
+          }`}
+          title={bulkResult.error}
+        >
           {bulkResult.status}
         </span>
       )}

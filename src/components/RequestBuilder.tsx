@@ -4,6 +4,14 @@ import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { useApp } from './AppContext';
 import { ConfirmDialog, isDestructiveMethod, getConfirmMessage } from './ConfirmDialog';
 import { ParamCombobox, isDiscoverableParam, getDiscoveryConfig } from './ParamCombobox';
+import {
+  buildRestUrl,
+  collectEnabledHeaders,
+  collectEnabledQueryParams,
+  resolvePath,
+} from '@/lib/rest-request';
+import type { QueryParamValue } from '@/lib/rest-request';
+import type { ExecuteResponse } from '@/lib/types';
 
 const METHOD_BG: Record<string, string> = {
   GET: 'bg-method-get', POST: 'bg-method-post',
@@ -39,34 +47,42 @@ export function RequestBuilder() {
   const [batchValues, setBatchValues] = useState('');
   const [confirmState, setConfirmState] = useState<{ action: () => void } | null>(null);
 
-  // Keep a ref to activeEnv so the effect always reads the latest value
-  const activeEnvRef = useRef(activeEnv);
   // Ref for keyboard shortcut to call latest executeRequest
   const executeRequestRef = useRef<(() => void) | null>(null);
-  activeEnvRef.current = activeEnv;
 
   // Load environment variables
-  const [envVars, setEnvVars] = useState<Record<string, string>>({});
+  const [envVars, setEnvVars] = useState<{ environmentId: string; values: Record<string, string> }>({
+    environmentId: '',
+    values: {},
+  });
   useEffect(() => {
-    if (!activeEnv) return;
+    if (!activeEnv) {
+      setEnvVars({ environmentId: '', values: {} });
+      return;
+    }
+    const environmentId = activeEnv.id;
     fetch(`/api/variables?environmentId=${activeEnv.id}`)
       .then(r => r.json())
       .then((vars: Array<{ name: string; value: string }>) => {
         const map: Record<string, string> = {};
         for (const v of vars) map[v.name] = v.value;
-        setEnvVars(map);
+        setEnvVars({ environmentId, values: map });
+      })
+      .catch((error: unknown) => {
+        console.error('Failed to load environment variables:', error);
       });
   }, [activeEnv]);
 
-  // Reset form when endpoint changes
+  // Rebase parameters when either the endpoint or active environment changes.
   useEffect(() => {
     if (!selectedEndpoint) return;
-    const env = activeEnvRef.current;
-    const allVars: Record<string, string> = { ...envVars };
+    const allVars: Record<string, string> = envVars.environmentId === activeEnv?.id
+      ? { ...envVars.values }
+      : {};
     // Built-in variables from environment
-    if (env) {
-      if (env.org_name) { allVars['org'] = env.org_name; allVars['owner'] = env.org_name; }
-      if (env.enterprise_slug) { allVars['enterprise'] = env.enterprise_slug; }
+    if (activeEnv) {
+      if (activeEnv.org_name) { allVars['org'] = activeEnv.org_name; allVars['owner'] = activeEnv.org_name; }
+      if (activeEnv.enterprise_slug) { allVars['enterprise'] = activeEnv.enterprise_slug; }
     }
 
     const pv: Record<string, string> = {};
@@ -89,7 +105,11 @@ export function RequestBuilder() {
       qv[p.name] = { value: val, enabled: p.required || !!initVal };
     }
     setQueryValues(qv);
+  }, [selectedEndpoint, activeEnv, envVars]);
 
+  // Reset endpoint-specific content independently so environment changes do not erase body edits.
+  useEffect(() => {
+    if (!selectedEndpoint) return;
     if (selectedEndpoint.initialBody) {
       setBodyText(selectedEndpoint.initialBody);
     } else if (REQUEST_BODY_EXAMPLES[selectedEndpoint.operationId]) {
@@ -114,21 +134,13 @@ export function RequestBuilder() {
     return () => window.removeEventListener('keydown', handler);
   }, []);
 
-  const resolvedPath = selectedEndpoint
-    ? selectedEndpoint.path.replace(/\{([\w-]+)\}/g, (_, key) => pathValues[key] || `{${key}}`)
-    : '';
+  const resolvedPath = selectedEndpoint ? resolvePath(selectedEndpoint.path, pathValues) : '';
 
   const buildResolvedUrl = useCallback(() => {
     if (!selectedEndpoint || !activeEnv) return '';
-    const enabledQueries: Record<string, string> = {};
-    for (const [k, v] of Object.entries(queryValues)) {
-      if (v.enabled && v.value) enabledQueries[k] = v.value;
-    }
-    const queryString = Object.entries(enabledQueries)
-      .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
-      .join('&');
-    return `${activeEnv.base_url}${resolvedPath}${queryString ? '?' + queryString : ''}`;
-  }, [selectedEndpoint, activeEnv, queryValues, resolvedPath]);
+    const enabledQueries = collectEnabledQueryParams(queryValues, selectedEndpoint.queryParams);
+    return buildRestUrl(activeEnv.base_url, selectedEndpoint.path, pathValues, enabledQueries);
+  }, [selectedEndpoint, activeEnv, queryValues, pathValues]);
 
   const copyAsCurl = useCallback(() => {
     if (!selectedEndpoint || !activeEnv) return;
@@ -138,11 +150,14 @@ export function RequestBuilder() {
       parts.push(`-X ${selectedEndpoint.method}`);
     }
     parts.push(`"${url}"`);
-    parts.push('-H "Accept: application/vnd.github+json"');
-    parts.push('-H "Authorization: token YOUR_TOKEN"');
-    parts.push('-H "X-GitHub-Api-Version: 2022-11-28"');
-    for (const h of customHeaders) {
-      if (h.enabled && h.key) parts.push(`-H "${h.key}: ${h.value}"`);
+    const headers = {
+      Accept: 'application/vnd.github+json',
+      'X-GitHub-Api-Version': '2022-11-28',
+      ...collectEnabledHeaders(customHeaders),
+      Authorization: 'token YOUR_TOKEN',
+    };
+    for (const [key, value] of Object.entries(headers)) {
+      parts.push(`-H "${key}: ${value}"`);
     }
     if (bodyText && ['POST', 'PUT', 'PATCH'].includes(selectedEndpoint.method)) {
       parts.push(`-d '${bodyText.replace(/\n/g, '')}'`);
@@ -165,19 +180,7 @@ export function RequestBuilder() {
 
       const missing = [...missingPath, ...missingQuery];
       if (missing.length > 0) {
-        setResponse({
-          status: 0,
-          statusText: 'Validation Error',
-          headers: {},
-          body: {
-            error: `Missing required parameters: ${missing.join(', ')}`,
-            missing,
-            hint: 'Fill in the required fields marked with * before sending.',
-          },
-          timing: 0,
-          rateLimit: null,
-          nextPageUrl: null,
-        });
+        setResponse(createValidationResponse(missing));
         return;
       }
     }
@@ -185,14 +188,16 @@ export function RequestBuilder() {
     setIsLoading(true);
 
     try {
-      const enabledQueries: Record<string, string> = {};
-      for (const [k, v] of Object.entries(queryValues)) {
-        if (v.enabled && v.value) enabledQueries[k] = v.value;
-      }
-
-      const enabledHeaders: Record<string, string> = {};
-      for (const h of customHeaders) {
-        if (h.enabled && h.key) enabledHeaders[h.key] = h.value;
+      const enabledQueries = collectEnabledQueryParams(queryValues, selectedEndpoint.queryParams);
+      const enabledHeaders = collectEnabledHeaders(customHeaders);
+      let requestBody: unknown = null;
+      if (bodyText && ['POST', 'PUT', 'PATCH'].includes(selectedEndpoint.method)) {
+        try {
+          requestBody = JSON.parse(bodyText);
+        } catch {
+          setResponse(createClientErrorResponse('Invalid JSON request body'));
+          return;
+        }
       }
 
       const res = await fetch('/api/execute', {
@@ -205,8 +210,7 @@ export function RequestBuilder() {
           pathParams: pathValues,
           queryParams: enabledQueries,
           headers: enabledHeaders,
-          body: bodyText && ['POST', 'PUT', 'PATCH'].includes(selectedEndpoint.method)
-            ? JSON.parse(bodyText) : null,
+          body: requestBody,
           operationId: selectedEndpoint.operationId,
           category: selectedEndpoint.category,
           nextPageUrl,
@@ -242,16 +246,36 @@ export function RequestBuilder() {
     const param = batchParam || selectedEndpoint.pathParams[0]?.name;
     if (lines.length === 0 || !param) return;
 
+    const missingPath = selectedEndpoint.pathParams
+      .filter(p => p.required && p.name !== param && !pathValues[p.name]?.trim())
+      .map(p => p.name);
+    const missingQuery = selectedEndpoint.queryParams
+      .filter(p => p.required && (!queryValues[p.name]?.enabled || !queryValues[p.name]?.value?.trim()))
+      .map(p => p.name);
+    const missing = [...missingPath, ...missingQuery];
+    if (missing.length > 0) {
+      setResponse(createValidationResponse(missing));
+      return;
+    }
+
+    let requestBody: unknown = null;
+    if (bodyText && ['POST', 'PUT', 'PATCH'].includes(selectedEndpoint.method)) {
+      try {
+        requestBody = JSON.parse(bodyText);
+      } catch {
+        setResponse(createClientErrorResponse('Invalid JSON request body'));
+        return;
+      }
+    }
+
+    const enabledQueries = collectEnabledQueryParams(queryValues, selectedEndpoint.queryParams);
+    const enabledHeaders = collectEnabledHeaders(customHeaders);
     setIsLoading(true);
     const results: Array<{ value: string; status: number; timing: number; body: unknown; error?: string }> = [];
 
     for (const value of lines) {
       const params = { ...pathValues, [param]: value };
       try {
-        const enabledQueries: Record<string, string> = {};
-        for (const [k, v] of Object.entries(queryValues)) {
-          if (v.enabled && v.value) enabledQueries[k] = v.value;
-        }
         const res = await fetch('/api/execute', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -261,6 +285,10 @@ export function RequestBuilder() {
             path: selectedEndpoint.path,
             pathParams: params,
             queryParams: enabledQueries,
+            headers: enabledHeaders,
+            body: requestBody,
+            operationId: selectedEndpoint.operationId,
+            category: selectedEndpoint.category,
           }),
         });
         const data = await res.json();
@@ -299,7 +327,7 @@ export function RequestBuilder() {
       });
     }
     setIsLoading(false);
-  }, [selectedEndpoint, activeEnv, pathValues, queryValues, batchParam, batchValues, setResponse, setIsLoading]);
+  }, [selectedEndpoint, activeEnv, pathValues, queryValues, bodyText, customHeaders, batchParam, batchValues, setResponse, setIsLoading]);
 
   // Keep ref in sync for keyboard shortcut
   executeRequestRef.current = () => maybeConfirmExecute();
@@ -366,10 +394,8 @@ export function RequestBuilder() {
             method={selectedEndpoint.method}
             path={selectedEndpoint.path}
             pathParams={pathValues}
-            queryParams={Object.fromEntries(
-              Object.entries(queryValues).filter(([, v]) => v.enabled && v.value).map(([k, v]) => [k, v.value])
-            )}
-            headers={Object.fromEntries(customHeaders.filter(h => h.enabled && h.key).map(h => [h.key, h.value]))}
+            queryParams={collectEnabledQueryParams(queryValues, selectedEndpoint.queryParams)}
+            headers={collectEnabledHeaders(customHeaders)}
             body={bodyText && ['POST', 'PUT', 'PATCH'].includes(selectedEndpoint.method) ? bodyText : null}
             operationId={selectedEndpoint.operationId}
           />
@@ -488,7 +514,7 @@ export function RequestBuilder() {
                           value={queryValues[p.name]?.value || ''}
                           onChange={e => setQueryValues(prev => ({
                             ...prev,
-                            [p.name]: { ...prev[p.name], value: e.target.value, enabled: true }
+                             [p.name]: { ...prev[p.name], value: e.target.value, enabled: e.target.value.length > 0 }
                           }))}
                           className="flex-1 bg-surface border border-border rounded-md px-3 py-1.5 text-sm text-text-primary
                                      focus:outline-none focus:ring-1 focus:ring-accent"
@@ -508,7 +534,7 @@ export function RequestBuilder() {
                               enabled: e.target.value.length > 0,
                             }
                           }))}
-                          placeholder={p.description || p.type}
+                          placeholder={p.type === 'array' ? 'Comma-separated values' : p.description || p.type}
                           className="flex-1 bg-surface border border-border rounded-md px-3 py-1.5 text-sm text-text-primary
                                      placeholder-text-muted focus:outline-none focus:ring-1 focus:ring-accent font-mono"
                         />
@@ -700,6 +726,36 @@ export function RequestBuilder() {
       })()}
     </div>
   );
+}
+
+function createValidationResponse(missing: string[]): ExecuteResponse {
+  return {
+    status: 400,
+    statusText: 'Validation Error',
+    headers: {},
+    body: {
+      error: `Missing required parameters: ${missing.join(', ')}`,
+      missing,
+      hint: 'Fill in the required fields marked with * before sending.',
+    },
+    timing: 0,
+    rateLimit: null,
+    nextPageUrl: null,
+    nextPageRequest: null,
+  };
+}
+
+function createClientErrorResponse(message: string): ExecuteResponse {
+  return {
+    status: 400,
+    statusText: 'Validation Error',
+    headers: {},
+    body: { error: message },
+    timing: 0,
+    rateLimit: null,
+    nextPageUrl: null,
+    nextPageRequest: null,
+  };
 }
 
 function generateExampleBody(schema: unknown): string {
@@ -907,7 +963,7 @@ function SaveToCollectionButton({
   method, path, pathParams, queryParams, headers, body, operationId,
 }: {
   method: string; path: string; pathParams: Record<string, string>;
-  queryParams: Record<string, string>; headers: Record<string, string>;
+  queryParams: Record<string, QueryParamValue>; headers: Record<string, string>;
   body: string | null; operationId: string;
 }) {
   const [open, setOpen] = useState(false);

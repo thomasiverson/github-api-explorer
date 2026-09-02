@@ -1,7 +1,7 @@
 'use client';
 
 import React, { createContext, useContext, useState, useCallback, useEffect, ReactNode } from 'react';
-import type { HttpMethod } from '@/lib/types';
+import type { ApiParameter, ExecuteResponse, HttpMethod } from '@/lib/types';
 
 interface EndpointSelection {
   operationId: string;
@@ -11,8 +11,8 @@ interface EndpointSelection {
   summary: string;
   description: string;
   specVersion: string;
-  pathParams: Array<{ name: string; description: string; required: boolean; type: string; default?: string; enum?: string[] }>;
-  queryParams: Array<{ name: string; description: string; required: boolean; type: string; default?: string; enum?: string[] }>;
+  pathParams: ApiParameter[];
+  queryParams: ApiParameter[];
   bodySchema: unknown | null;
   // Optional: pre-filled values for replay from history
   initialPathValues?: Record<string, string>;
@@ -20,15 +20,7 @@ interface EndpointSelection {
   initialBody?: string;
 }
 
-interface ResponseData {
-  status: number;
-  statusText: string;
-  headers: Record<string, string>;
-  body: unknown;
-  timing: number;
-  rateLimit: { limit: number; remaining: number; reset: number; used: number; resource: string } | null;
-  nextPageUrl: string | null;
-}
+type ResponseData = ExecuteResponse;
 
 interface ActiveEnv {
   id: string;

@@ -50,6 +50,8 @@ export interface ApiParameter {
   type: string;
   default?: string;
   enum?: string[];
+  style?: string;
+  explode?: boolean;
 }
 
 export type HttpMethod = 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE';
@@ -61,7 +63,7 @@ export interface ExecuteRequest {
   method: HttpMethod;
   path: string;
   pathParams: Record<string, string>;
-  queryParams: Record<string, string>;
+  queryParams: Record<string, string | string[]>;
   headers: Record<string, string>;
   body: string | null;
 }
@@ -74,6 +76,14 @@ export interface ExecuteResponse {
   timing: number;         // ms
   rateLimit: RateLimitInfo | null;
   nextPageUrl: string | null;
+  nextPageRequest?: {
+    environmentId: string;
+    method: HttpMethod;
+    path: string;
+    headers: Record<string, string>;
+    operationId?: string;
+    category?: string;
+  } | null;
 }
 
 export interface RateLimitInfo {

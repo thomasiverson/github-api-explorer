@@ -2,40 +2,45 @@
 
 import React, { useState, useCallback } from 'react';
 import { useApp } from './AppContext';
+import { mergePaginatedBody } from '@/lib/rest-request';
 
 export function ResponseViewer() {
   const { response, responseCollapsed, toggleResponse, isLoading, setResponse } = useApp();
   const [activeTab, setActiveTab] = useState<'body' | 'headers' | 'raw' | 'preview'>('body');
-  const [pages, setPages] = useState<unknown[]>([]);
   const [loadingMore, setLoadingMore] = useState(false);
   const [bodyFilter, setBodyFilter] = useState('');
 
-  // Track paginated data
-  const displayBody = pages.length > 0
-    ? (Array.isArray(response?.body) ? [...pages.flat(), ...response.body] : response?.body)
-    : response?.body;
+  const displayBody = response?.body;
 
   const loadNextPage = useCallback(async () => {
-    if (!response?.nextPageUrl) return;
+    if (!response?.nextPageUrl || !response.nextPageRequest) return;
     setLoadingMore(true);
     try {
       const res = await fetch('/api/execute', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ nextPageUrl: response.nextPageUrl }),
+        body: JSON.stringify({
+          ...response.nextPageRequest,
+          nextPageUrl: response.nextPageUrl,
+        }),
       });
       const data = await res.json();
-      if (Array.isArray(data.body) && Array.isArray(response.body)) {
-        setPages(prev => [...prev, response.body]);
-        setResponse({
-          ...data,
-          body: [...(response.body as unknown[]), ...data.body],
-        });
-      } else {
-        setResponse(data);
-      }
+      setResponse({
+        ...data,
+        body: res.ok ? mergePaginatedBody(response.body, data.body) : data.body,
+      });
     } catch (err: unknown) {
-      console.error('Failed to load next page:', err);
+      const message = err instanceof Error ? err.message : 'Unknown pagination error';
+      setResponse({
+        status: 0,
+        statusText: 'Pagination Error',
+        headers: {},
+        body: { error: message },
+        timing: 0,
+        rateLimit: null,
+        nextPageUrl: null,
+        nextPageRequest: null,
+      });
     } finally {
       setLoadingMore(false);
     }
@@ -84,11 +89,7 @@ export function ResponseViewer() {
 
   if (!response) return null;
 
-  const statusClass = response.status >= 500 ? 'status-5xx' :
-                      response.status >= 400 ? 'status-4xx' :
-                      response.status >= 300 ? 'status-3xx' : 'status-2xx';
-
-  const statusBgClass = response.status >= 500 ? 'bg-danger/20 text-danger' :
+  const statusBgClass = response.status === 0 || response.status >= 500 ? 'bg-danger/20 text-danger' :
                         response.status >= 400 ? 'bg-warning/20 text-warning' :
                         response.status >= 300 ? 'bg-info/20 text-info' : 'bg-success/20 text-success';
 

@@ -5,6 +5,7 @@ import { TopBar } from '@/components/TopBar';
 import { useApp } from '@/components/AppContext';
 import { ConfirmDialog, isDestructiveMethod, getConfirmMessage } from '@/components/ConfirmDialog';
 import { ParamCombobox } from '@/components/ParamCombobox';
+import type { QueryParamValue } from '@/lib/rest-request';
 
 interface Collection {
   id: string; name: string; description: string; item_count: number;
@@ -461,7 +462,7 @@ function ItemEditor({ item, result, onUpdate }: {
   onUpdate: (updated: CollectionItem) => void;
 }) {
   const pathParams = JSON.parse(item.path_params || '{}') as Record<string, string>;
-  const queryParams = JSON.parse(item.query_params || '{}') as Record<string, string>;
+  const queryParams = JSON.parse(item.query_params || '{}') as Record<string, QueryParamValue>;
   const bodyStr = item.body ? JSON.stringify(JSON.parse(item.body), null, 2) : '';
 
   // Extract all {param} placeholders from path
@@ -473,7 +474,7 @@ function ItemEditor({ item, result, onUpdate }: {
   for (const [k, v] of Object.entries(pathParams)) allPathParams[k] = v;
 
   const [editPathParams, setEditPathParams] = useState<Record<string, string>>(allPathParams);
-  const [editQueryParams, setEditQueryParams] = useState<Record<string, string>>(queryParams);
+  const [editQueryParams, setEditQueryParams] = useState<Record<string, QueryParamValue>>(queryParams);
   const [editBody, setEditBody] = useState(bodyStr);
   const [newQueryKey, setNewQueryKey] = useState('');
   const [saving, setSaving] = useState(false);
@@ -568,8 +569,13 @@ function ItemEditor({ item, result, onUpdate }: {
                 <label className="text-xs font-mono text-accent whitespace-nowrap">{k}</label>
                 <input
                   type="text"
-                  value={v}
-                  onChange={e => setEditQueryParams(prev => ({ ...prev, [k]: e.target.value }))}
+                  value={Array.isArray(v) ? v.join(', ') : v}
+                  onChange={e => setEditQueryParams(prev => ({
+                    ...prev,
+                    [k]: Array.isArray(v)
+                      ? e.target.value.split(',').map(value => value.trim()).filter(Boolean)
+                      : e.target.value,
+                  }))}
                   className="bg-panel border border-border rounded px-2 py-1 text-xs font-mono text-text-primary focus:outline-none focus:ring-1 focus:ring-accent"
                 />
                 <button onClick={() => removeQueryParam(k)}
