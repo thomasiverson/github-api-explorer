@@ -502,7 +502,11 @@ export function RequestBuilder() {
                           value={queryValues[p.name]?.value || ''}
                           onChange={e => setQueryValues(prev => ({
                             ...prev,
-                            [p.name]: { ...prev[p.name], value: e.target.value }
+                            [p.name]: {
+                              ...prev[p.name],
+                              value: e.target.value,
+                              enabled: e.target.value.length > 0,
+                            }
                           }))}
                           placeholder={p.description || p.type}
                           className="flex-1 bg-surface border border-border rounded-md px-3 py-1.5 text-sm text-text-primary
