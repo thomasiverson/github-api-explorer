@@ -5,13 +5,16 @@ import { useApp } from './AppContext';
 import { ConfirmDialog, isDestructiveMethod, getConfirmMessage } from './ConfirmDialog';
 import { ParamCombobox, isDiscoverableParam, getDiscoveryConfig } from './ParamCombobox';
 import {
+  applyBatchJsonLine,
+  applyBatchValue,
   buildRestUrl,
   collectEnabledHeaders,
   collectEnabledQueryParams,
+  parseBatchJsonLines,
   resolvePath,
 } from '@/lib/rest-request';
 import { generateExampleBody } from '@/lib/openapi-example';
-import type { QueryParamValue } from '@/lib/rest-request';
+import type { BatchTarget, QueryParamValue } from '@/lib/rest-request';
 import type { ExecuteResponse } from '@/lib/types';
 
 const METHOD_BG: Record<string, string> = {
@@ -33,7 +36,63 @@ const REQUEST_BODY_EXAMPLES: Record<string, Record<string, unknown>> = {
     },
     user: 'GITHUB_LOGIN',
   },
+  'billing/update-budget': {
+    prevent_further_usage: true,
+    budget_amount: 10,
+    budget_alerting: {
+      will_alert: false,
+      alert_recipients: [],
+    },
+  },
+  'billing/update-budget-org': {
+    prevent_further_usage: true,
+    budget_amount: 10,
+    budget_alerting: {
+      will_alert: false,
+      alert_recipients: [],
+    },
+  },
 };
+
+function getBatchBodyPropertyNames(bodyText: string): string[] {
+  if (!bodyText.trim()) return [];
+  try {
+    const body = JSON.parse(bodyText) as unknown;
+    if (typeof body !== 'object' || body === null || Array.isArray(body)) return [];
+    return Object.entries(body)
+      .filter(([, value]) => typeof value !== 'object' || value === null)
+      .map(([name]) => name);
+  } catch {
+    return [];
+  }
+}
+
+function getBatchJsonlExample(bodyText: string): string {
+  if (!bodyText.trim()) return '';
+  try {
+    const body = JSON.parse(bodyText) as unknown;
+    if (typeof body !== 'object' || body === null || Array.isArray(body)) return '';
+    return JSON.stringify(body);
+  } catch {
+    return '';
+  }
+}
+
+function getDefaultBatchTargetValue(pathNames: string[], queryNames: string[], bodyNames: string[]): string {
+  if (pathNames[0]) return `path:${pathNames[0]}`;
+  if (queryNames[0]) return `query:${queryNames[0]}`;
+  if (bodyNames[0]) return `body:${bodyNames[0]}`;
+  return '';
+}
+
+function parseBatchTarget(value: string): BatchTarget | null {
+  const separator = value.indexOf(':');
+  if (separator < 1) return null;
+  const location = value.slice(0, separator);
+  const name = value.slice(separator + 1);
+  if (!name || !['path', 'query', 'body'].includes(location)) return null;
+  return { location: location as BatchTarget['location'], name };
+}
 
 export function RequestBuilder() {
   const { selectedEndpoint, activeEnv, setResponse, setIsLoading, isLoading } = useApp();
@@ -44,7 +103,8 @@ export function RequestBuilder() {
   const [customHeaders, setCustomHeaders] = useState<Array<{ key: string; value: string; enabled: boolean }>>([]);
   const [curlCopied, setCurlCopied] = useState(false);
   const [showBatch, setShowBatch] = useState(false);
-  const [batchParam, setBatchParam] = useState('');
+  const [batchMode, setBatchMode] = useState<'single' | 'jsonl'>('single');
+  const [batchTargetValue, setBatchTargetValue] = useState('');
   const [batchValues, setBatchValues] = useState('');
   const [confirmState, setConfirmState] = useState<{ action: () => void } | null>(null);
 
@@ -120,6 +180,9 @@ export function RequestBuilder() {
     } else {
       setBodyText('');
     }
+    setBatchMode('single');
+    setBatchTargetValue('');
+    setBatchValues('');
     setActiveTab(selectedEndpoint.pathParams.length > 0 || selectedEndpoint.queryParams.length > 0 ? 'params' : 'body');
   }, [selectedEndpoint]);
 
@@ -244,20 +307,14 @@ export function RequestBuilder() {
   const executeBatch = useCallback(async () => {
     if (!selectedEndpoint || !activeEnv) return;
     const lines = batchValues.split('\n').map(l => l.trim()).filter(Boolean);
-    const param = batchParam || selectedEndpoint.pathParams[0]?.name;
-    if (lines.length === 0 || !param) return;
-
-    const missingPath = selectedEndpoint.pathParams
-      .filter(p => p.required && p.name !== param && !pathValues[p.name]?.trim())
-      .map(p => p.name);
-    const missingQuery = selectedEndpoint.queryParams
-      .filter(p => p.required && (!queryValues[p.name]?.enabled || !queryValues[p.name]?.value?.trim()))
-      .map(p => p.name);
-    const missing = [...missingPath, ...missingQuery];
-    if (missing.length > 0) {
-      setResponse(createValidationResponse(missing));
-      return;
-    }
+    const bodyPropertyNames = getBatchBodyPropertyNames(bodyText);
+    const defaultTargetValue = getDefaultBatchTargetValue(
+      selectedEndpoint.pathParams.map(param => param.name),
+      selectedEndpoint.queryParams.map(param => param.name),
+      bodyPropertyNames
+    );
+    const target = parseBatchTarget(batchTargetValue || defaultTargetValue);
+    if (lines.length === 0 || (batchMode === 'single' && !target)) return;
 
     let requestBody: unknown = null;
     if (bodyText && ['POST', 'PUT', 'PATCH'].includes(selectedEndpoint.method)) {
@@ -271,11 +328,63 @@ export function RequestBuilder() {
 
     const enabledQueries = collectEnabledQueryParams(queryValues, selectedEndpoint.queryParams);
     const enabledHeaders = collectEnabledHeaders(customHeaders);
-    setIsLoading(true);
-    const results: Array<{ value: string; status: number; timing: number; body: unknown; error?: string }> = [];
+    const baseRequestValues = { pathParams: pathValues, queryParams: enabledQueries, body: requestBody };
+    let batchRequests: Array<{
+      label: string;
+      input: unknown;
+      requestValues: ReturnType<typeof applyBatchJsonLine>;
+    }>;
 
-    for (const value of lines) {
-      const params = { ...pathValues, [param]: value };
+    if (batchMode === 'jsonl') {
+      const parsed = parseBatchJsonLines(batchValues);
+      if (parsed.errors.length > 0) {
+        setResponse(createClientErrorResponse(parsed.errors
+          .map(error => error.lineNumber > 0 ? `Line ${error.lineNumber}: ${error.message}` : error.message)
+          .join('\n')));
+        return;
+      }
+      batchRequests = [];
+      for (const row of parsed.rows) {
+        try {
+          batchRequests.push({
+            label: `Line ${row.lineNumber}`,
+            input: row.input,
+            requestValues: applyBatchJsonLine(baseRequestValues, row.input),
+          });
+        } catch (error) {
+          const message = error instanceof Error ? error.message : 'Invalid JSONL batch input';
+          setResponse(createClientErrorResponse(`Line ${row.lineNumber}: ${message}`));
+          return;
+        }
+      }
+    } else {
+      batchRequests = lines.map(value => ({
+        label: value,
+        input: value,
+        requestValues: applyBatchValue(baseRequestValues, target!, value),
+      }));
+    }
+
+    const invalidRequest = batchRequests.find(item => {
+      const missingPath = selectedEndpoint.pathParams.some(param => (
+        param.required && !item.requestValues.pathParams[param.name]?.trim()
+      ));
+      const missingQuery = selectedEndpoint.queryParams.some(param => {
+        const value = item.requestValues.queryParams[param.name];
+        return param.required && (!value || (Array.isArray(value) ? value.length === 0 : !value.trim()));
+      });
+      return missingPath || missingQuery;
+    });
+    if (invalidRequest) {
+      setResponse(createClientErrorResponse(`${invalidRequest.label} is missing a required path or query parameter`));
+      return;
+    }
+
+    setIsLoading(true);
+    const results: Array<{ label: string; input: unknown; status: number; timing: number; body: unknown; error?: string }> = [];
+    const targetLabel = batchMode === 'jsonl' ? 'jsonl' : `${target!.location}.${target!.name}`;
+
+    for (const batchRequest of batchRequests) {
       try {
         const res = await fetch('/api/execute', {
           method: 'POST',
@@ -284,18 +393,18 @@ export function RequestBuilder() {
             environmentId: activeEnv.id,
             method: selectedEndpoint.method,
             path: selectedEndpoint.path,
-            pathParams: params,
-            queryParams: enabledQueries,
+            pathParams: batchRequest.requestValues.pathParams,
+            queryParams: batchRequest.requestValues.queryParams,
             headers: enabledHeaders,
-            body: requestBody,
+            body: batchRequest.requestValues.body,
             operationId: selectedEndpoint.operationId,
             category: selectedEndpoint.category,
           }),
         });
         const data = await res.json();
-        results.push({ value, status: data.status || 0, timing: data.timing || 0, body: data.body, error: data.error });
+        results.push({ label: batchRequest.label, input: batchRequest.input, status: data.status || 0, timing: data.timing || 0, body: data.body, error: data.error });
       } catch (err) {
-        results.push({ value, status: 0, timing: 0, body: null, error: err instanceof Error ? err.message : 'Unknown' });
+        results.push({ label: batchRequest.label, input: batchRequest.input, status: 0, timing: 0, body: null, error: err instanceof Error ? err.message : 'Unknown' });
       }
 
       // Update response pane progressively
@@ -304,18 +413,19 @@ export function RequestBuilder() {
       const totalTime = results.reduce((a, r) => a + r.timing, 0);
       setResponse({
         status: failed > 0 ? 207 : 200,
-        statusText: `Batch: ${passed} passed, ${failed} failed (${results.length}/${lines.length})`,
+        statusText: `Batch: ${passed} passed, ${failed} failed (${results.length}/${batchRequests.length})`,
         headers: {},
         body: {
           _batch: true,
-          param,
-          total: lines.length,
+          target: targetLabel,
+          total: batchRequests.length,
           completed: results.length,
           passed,
           failed,
           totalTime,
           results: results.map(r => ({
-            [param]: r.value,
+            item: r.label,
+            input: r.input,
             status: r.status,
             timing: `${r.timing}ms`,
             ...(r.error ? { error: r.error } : {}),
@@ -328,7 +438,7 @@ export function RequestBuilder() {
       });
     }
     setIsLoading(false);
-  }, [selectedEndpoint, activeEnv, pathValues, queryValues, bodyText, customHeaders, batchParam, batchValues, setResponse, setIsLoading]);
+  }, [selectedEndpoint, activeEnv, pathValues, queryValues, bodyText, customHeaders, batchMode, batchTargetValue, batchValues, setResponse, setIsLoading]);
 
   // Keep ref in sync for keyboard shortcut
   executeRequestRef.current = () => maybeConfirmExecute();
@@ -357,6 +467,21 @@ export function RequestBuilder() {
     );
   }
 
+  const batchBodyPropertyNames = getBatchBodyPropertyNames(bodyText);
+  const defaultBatchTargetValue = getDefaultBatchTargetValue(
+    selectedEndpoint.pathParams.map(param => param.name),
+    selectedEndpoint.queryParams.map(param => param.name),
+    batchBodyPropertyNames
+  );
+  const effectiveBatchTargetValue = batchTargetValue || defaultBatchTargetValue;
+  const effectiveBatchTarget = parseBatchTarget(effectiveBatchTargetValue);
+  const hasBatchTargets = defaultBatchTargetValue.length > 0;
+  const parsedJsonLines = batchMode === 'jsonl' ? parseBatchJsonLines(batchValues) : null;
+  const batchRequestCount = batchMode === 'jsonl'
+    ? parsedJsonLines?.rows.length || 0
+    : batchValues.split('\n').filter(line => line.trim()).length;
+  const batchHasErrors = (parsedJsonLines?.errors.length || 0) > 0;
+
   return (
     <div className="flex-1 flex flex-col bg-canvas min-w-0 overflow-x-hidden">
       {/* URL Bar */}
@@ -370,7 +495,7 @@ export function RequestBuilder() {
           </div>
           <button
             onClick={() => maybeConfirmExecute()}
-            disabled={isLoading || !activeEnv}
+            disabled={isLoading || !activeEnv || (showBatch && (batchRequestCount === 0 || batchHasErrors))}
             className="px-4 py-1.5 bg-accent-emphasis text-white text-sm font-medium rounded-md
                        hover:opacity-90 disabled:opacity-50 disabled:cursor-not-allowed transition-opacity flex items-center gap-2"
           >
@@ -380,7 +505,7 @@ export function RequestBuilder() {
                 <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
               </svg>
             ) : null}
-            {showBatch ? `Run Batch (${batchValues.split('\n').filter(l => l.trim()).length})` : 'Send'}
+            {showBatch ? `Run Batch (${batchRequestCount})` : 'Send'}
           </button>
           <button
             onClick={() => { copyAsCurl(); setCurlCopied(true); setTimeout(() => setCurlCopied(false), 2000); }}
@@ -401,11 +526,15 @@ export function RequestBuilder() {
             operationId={selectedEndpoint.operationId}
           />
           <button
-            onClick={() => setShowBatch(!showBatch)}
-            disabled={!activeEnv}
+            onClick={() => {
+              const nextShowBatch = !showBatch;
+              setShowBatch(nextShowBatch);
+              if (nextShowBatch) setActiveTab('params');
+            }}
+            disabled={!activeEnv || !hasBatchTargets}
             className={`px-2.5 py-1.5 border text-sm rounded-md transition-colors shrink-0
               ${showBatch ? 'border-accent text-accent bg-accent/10' : 'border-border text-text-secondary hover:bg-surface disabled:opacity-50'}`}
-            title="Batch execute with multiple parameter values"
+            title={hasBatchTargets ? 'Batch execute with multiple request values' : 'This request has no batchable values'}
           >
             Batch
           </button>
@@ -551,40 +680,97 @@ export function RequestBuilder() {
             )}
 
             {/* Batch values input */}
-            {showBatch && selectedEndpoint.pathParams.length > 0 && (
+            {showBatch && hasBatchTargets && (
               <div className="border-t border-border pt-4">
                 <h3 className="text-xs font-semibold text-text-secondary uppercase tracking-wider mb-2">
                   Batch Values
                   <span className="font-normal text-text-muted ml-1">— run this endpoint once per value</span>
                 </h3>
                 <div className="space-y-2">
-                  <div className="flex items-center gap-2">
-                    <label className="text-sm text-text-secondary">Vary parameter:</label>
-                    <select value={batchParam || selectedEndpoint.pathParams[0]?.name || ''}
-                      onChange={e => setBatchParam(e.target.value)}
-                      className="bg-surface border border-border rounded-md px-2 py-1 text-sm text-text-primary font-mono focus:outline-none focus:ring-1 focus:ring-accent">
-                      {selectedEndpoint.pathParams.map(p => (
-                        <option key={p.name} value={p.name}>{p.name}</option>
-                      ))}
-                    </select>
+                  <div className="flex items-center gap-1" role="group" aria-label="Batch input mode">
+                    <button type="button" onClick={() => setBatchMode('single')}
+                      aria-pressed={batchMode === 'single'}
+                      className={`px-3 py-1 text-xs border rounded-l-md ${batchMode === 'single' ? 'bg-accent-emphasis text-white border-accent' : 'border-border text-text-secondary hover:bg-surface'}`}>
+                      Single field
+                    </button>
+                    <button type="button" onClick={() => {
+                      setBatchMode('jsonl');
+                      if (!batchValues.trim()) setBatchValues(getBatchJsonlExample(bodyText));
+                    }}
+                      aria-pressed={batchMode === 'jsonl'}
+                      className={`px-3 py-1 text-xs border rounded-r-md ${batchMode === 'jsonl' ? 'bg-accent-emphasis text-white border-accent' : 'border-border text-text-secondary hover:bg-surface'}`}>
+                      JSONL
+                    </button>
                   </div>
+                  {batchMode === 'single' && (
+                    <div className="flex items-center gap-2">
+                      <label className="text-sm text-text-secondary">Vary by:</label>
+                      <select value={effectiveBatchTargetValue}
+                        onChange={e => setBatchTargetValue(e.target.value)}
+                        className="bg-surface border border-border rounded-md px-2 py-1 text-sm text-text-primary font-mono focus:outline-none focus:ring-1 focus:ring-accent">
+                      {selectedEndpoint.pathParams.length > 0 && (
+                        <optgroup label="Path">
+                          {selectedEndpoint.pathParams.map(param => (
+                            <option key={param.name} value={`path:${param.name}`}>{param.name}</option>
+                          ))}
+                        </optgroup>
+                      )}
+                      {selectedEndpoint.queryParams.length > 0 && (
+                        <optgroup label="Query">
+                          {selectedEndpoint.queryParams.map(param => (
+                            <option key={param.name} value={`query:${param.name}`}>{param.name}</option>
+                          ))}
+                        </optgroup>
+                      )}
+                      {batchBodyPropertyNames.length > 0 && (
+                        <optgroup label="Body">
+                          {batchBodyPropertyNames.map(name => (
+                            <option key={name} value={`body:${name}`}>{name}</option>
+                          ))}
+                        </optgroup>
+                      )}
+                      </select>
+                    </div>
+                  )}
+                  {batchMode === 'jsonl' && (
+                    <div className="text-xs text-text-secondary space-y-1">
+                      <p><span className="font-semibold text-text-primary">Body patch:</span> fields are merged directly into the current JSON body.</p>
+                      <p><span className="font-semibold text-text-primary">Request envelope:</span> use <code className="font-mono">body</code>, <code className="font-mono">query</code>, or <code className="font-mono">path</code> to vary multiple request sections.</p>
+                      <p className="text-text-muted">Each non-empty line is one request. Existing values remain unchanged unless that row overrides them.</p>
+                    </div>
+                  )}
                   <textarea
                     value={batchValues}
                     onChange={e => setBatchValues(e.target.value)}
-                    placeholder={`Enter one value per line, e.g.:\ntpi-test-org\ntpi-innersource\ntpitest-research`}
-                    rows={4}
+                    spellCheck={false}
+                    placeholder={batchMode === 'jsonl'
+                      ? 'Enter one JSON object per line'
+                      : 'Enter one value per line, e.g.:\ntpi-test-org\ntpi-innersource\ntpitest-research'}
+                    rows={batchMode === 'jsonl' ? 6 : 4}
                     className="w-full bg-surface border border-border rounded-md px-3 py-2 text-sm text-text-primary font-mono
                                resize-y focus:outline-none focus:ring-1 focus:ring-accent placeholder-text-muted"
                   />
                   <div className="flex items-center gap-2">
-                    <p className="text-[10px] text-text-muted flex-1">
-                      The Send button above will run {batchValues.split('\n').filter(l => l.trim()).length} requests. Results appear in the response panel →
-                    </p>
-                    {isDiscoverableParam(batchParam || selectedEndpoint.pathParams[0]?.name || '') && (
+                    {batchMode === 'jsonl' ? (
+                      <p className={`text-xs flex-1 ${parsedJsonLines && parsedJsonLines.errors.length > 0
+                        ? 'text-danger'
+                        : batchRequestCount > 0 ? 'text-success font-medium' : 'text-text-muted'}`}>
+                        {batchRequestCount === 0 && (!parsedJsonLines || parsedJsonLines.errors.length === 0)
+                          ? 'Pending: enter one JSON object per line'
+                          : parsedJsonLines && parsedJsonLines.errors.length > 0
+                          ? `✘ ${parsedJsonLines.errors[0].lineNumber > 0 ? `Line ${parsedJsonLines.errors[0].lineNumber}: ` : ''}${parsedJsonLines.errors[0].message}`
+                          : `✔ ${batchRequestCount} valid JSONL row${batchRequestCount === 1 ? '' : 's'}`}
+                      </p>
+                    ) : (
+                      <p className="text-[10px] text-text-muted flex-1">
+                        The Send button above will run {batchRequestCount} requests. Results appear in the response panel →
+                      </p>
+                    )}
+                    {batchMode === 'single' && effectiveBatchTarget && isDiscoverableParam(effectiveBatchTarget.name) && (
                       <button
                         type="button"
                         onClick={async () => {
-                          const paramName = batchParam || selectedEndpoint.pathParams[0]?.name || '';
+                          const paramName = effectiveBatchTarget.name;
                           const config = getDiscoveryConfig(paramName);
                           if (!config) return;
                           const params = new URLSearchParams({ type: config.type });
