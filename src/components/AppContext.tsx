@@ -65,7 +65,8 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [responseCollapsed, setResponseCollapsed] = useState(false);
   const [theme, setTheme] = useState<'dark' | 'light'>('dark');
 
-  // Detect theme on mount (client-side only to avoid hydration mismatch)
+  // Theme preference is client-only, so apply it after hydration.
+  /* eslint-disable react-hooks/set-state-in-effect */
   useEffect(() => {
     const saved = localStorage.getItem('theme');
     if (saved === 'dark' || saved === 'light') {
@@ -74,6 +75,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
       setTheme('light');
     }
   }, []);
+  /* eslint-enable react-hooks/set-state-in-effect */
 
   // Apply theme on mount and listen for system changes
   useEffect(() => {

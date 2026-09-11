@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useEffect, useState, useMemo, useRef } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { useApp } from './AppContext';
 import type { HttpMethod } from '@/lib/types';
 
@@ -54,23 +54,8 @@ export function Sidebar() {
   const [favoritesExpanded, setFavoritesExpanded] = useState(true);
   const searchTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  useEffect(() => {
-    loadCategories('api.github.com');
-    loadFavorites();
-    // Keyboard shortcut: Cmd/Ctrl+K
-    const handler = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
-        e.preventDefault();
-        searchInputRef.current?.focus();
-      }
-    };
-    window.addEventListener('keydown', handler);
-    return () => window.removeEventListener('keydown', handler);
-  }, []);
-
-  async function loadCategories(version?: string) {
-    const vParam = version || selectedVersion;
-    const vQuery = vParam ? `&version=${encodeURIComponent(vParam)}` : '';
+  const loadCategories = useCallback(async (version: string) => {
+    const vQuery = `&version=${encodeURIComponent(version)}`;
     const res = await fetch(`/api/endpoints?action=categories${vQuery}`);
     const data = await res.json();
     setCategories(data.categories);
@@ -79,9 +64,9 @@ export function Sidebar() {
     // Reset expanded categories when version changes
     setExpandedCategories(new Set());
     setCategoryEndpoints({});
-  }
+  }, []);
 
-  async function loadFavorites() {
+  const loadFavorites = useCallback(async () => {
     const res = await fetch('/api/favorites');
     const ids: string[] = await res.json();
     setFavorites(new Set(ids));
@@ -107,7 +92,21 @@ export function Sidebar() {
       }
       setFavoriteEndpoints(favEndpoints);
     }
-  }
+  }, []);
+
+  useEffect(() => {
+    void loadCategories('api.github.com');
+    void loadFavorites();
+    // Keyboard shortcut: Cmd/Ctrl+K
+    const handler = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
+        e.preventDefault();
+        searchInputRef.current?.focus();
+      }
+    };
+    window.addEventListener('keydown', handler);
+    return () => window.removeEventListener('keydown', handler);
+  }, [loadCategories, loadFavorites]);
 
   async function toggleFavorite(operationId: string) {
     const isFav = favorites.has(operationId);

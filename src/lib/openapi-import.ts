@@ -308,6 +308,8 @@ export function parseOpenApiSpec(spec: OpenApiSpec, specVersion: string): Import
             type: 'string',
             default: undefined,
             enum: undefined,
+            style: undefined,
+            explode: undefined,
           }));
         }
       }

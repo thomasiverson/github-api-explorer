@@ -549,7 +549,6 @@ export function RequestBuilder() {
             <EndpointInfo
               summary={selectedEndpoint.summary}
               description={selectedEndpoint.description}
-              operationId={selectedEndpoint.operationId}
               category={selectedEndpoint.category}
               specVersion={selectedEndpoint.specVersion}
             />
@@ -897,7 +896,7 @@ export function RequestBuilder() {
       </div>
       </div>{/* end scrollable content area */}
       {confirmState && selectedEndpoint && (() => {
-        const info = getConfirmMessage(selectedEndpoint.method, resolvedPath);
+        const info = getConfirmMessage(selectedEndpoint.method);
         return (
           <ConfirmDialog
             open={true}
@@ -950,8 +949,8 @@ function isValidJson(text: string): boolean {
   try { JSON.parse(text); return true; } catch { return false; }
 }
 
-function EndpointInfo({ summary, description, operationId, category, specVersion }: {
-  summary: string; description: string; operationId: string; category: string; specVersion: string;
+function EndpointInfo({ summary, description, category, specVersion }: {
+  summary: string; description: string; category: string; specVersion: string;
 }) {
   const [collapsed, setCollapsed] = useState(false);
   const hasDescription = description && description.trim().length > 0;

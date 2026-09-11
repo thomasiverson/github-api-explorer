@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useEffect } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import { TopBar } from '@/components/TopBar';
 
 interface EnvironmentRow {
@@ -25,16 +25,14 @@ export default function SettingsPage() {
   const [importedVersions, setImportedVersions] = useState<Array<{ spec_version: string; count: number }>>([]);
   const [importingVersion, setImportingVersion] = useState<string | null>(null);
 
-  useEffect(() => { loadEnvironments(); loadVersions(); }, []);
-
-  async function loadVersions() {
+  const loadVersions = useCallback(async () => {
     try {
       const res = await fetch('/api/compare?action=versions');
       const data = await res.json();
       setImportedVersions(data.imported || []);
       setAvailableVersions(data.available || []);
     } catch { /* ignore */ }
-  }
+  }, []);
 
   async function importVersion(version: string) {
     setImportingVersion(version);
@@ -56,22 +54,27 @@ export default function SettingsPage() {
     setImportingVersion(null);
   }
 
-  useEffect(() => {
-    if (selectedEnvForVars) loadVariables(selectedEnvForVars);
-  }, [selectedEnvForVars]);
-
-  async function loadEnvironments() {
+  const loadEnvironments = useCallback(async () => {
     const res = await fetch('/api/environments');
     const envs = await res.json();
     setEnvironments(envs);
     const active = envs.find((e: EnvironmentRow) => e.is_active === 1);
-    if (active && !selectedEnvForVars) setSelectedEnvForVars(active.id);
-  }
+    setSelectedEnvForVars(current => current || active?.id || '');
+  }, []);
 
-  async function loadVariables(envId: string) {
+  const loadVariables = useCallback(async (envId: string) => {
     const res = await fetch(`/api/variables?environmentId=${envId}`);
     setVariables(await res.json());
-  }
+  }, []);
+
+  useEffect(() => {
+    void loadEnvironments();
+    void loadVersions();
+  }, [loadEnvironments, loadVersions]);
+
+  useEffect(() => {
+    if (selectedEnvForVars) void loadVariables(selectedEnvForVars);
+  }, [loadVariables, selectedEnvForVars]);
 
   async function saveVariable(name: string, value: string, id?: string) {
     await fetch('/api/variables', {

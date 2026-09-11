@@ -85,7 +85,7 @@ export function isDestructiveMethod(method: string): boolean {
   return DESTRUCTIVE_METHODS.has(method.toUpperCase());
 }
 
-export function getConfirmMessage(method: string, path: string): { title: string; message: string; variant: 'danger' | 'warning' } {
+export function getConfirmMessage(method: string): { title: string; message: string; variant: 'danger' | 'warning' } {
   const upper = method.toUpperCase();
   if (upper === 'DELETE') {
     return {

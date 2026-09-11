@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useEffect } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import { TopBar } from '@/components/TopBar';
 
 interface VersionInfo {
@@ -59,9 +59,7 @@ export default function ComparePage() {
   const [filterQuery, setFilterQuery] = useState('');
   const [expandedEntry, setExpandedEntry] = useState<string | null>(null);
 
-  useEffect(() => { loadVersions(); }, []);
-
-  async function loadVersions() {
+  const loadVersions = useCallback(async () => {
     const res = await fetch('/api/compare?action=versions');
     const data = await res.json();
     setImportedVersions(data.imported);
@@ -73,7 +71,11 @@ export default function ComparePage() {
     } else if (data.imported.length === 1) {
       setFromVersion(data.imported[0].spec_version);
     }
-  }
+  }, []);
+
+  /* eslint-disable react-hooks/set-state-in-effect */
+  useEffect(() => { void loadVersions(); }, [loadVersions]);
+  /* eslint-enable react-hooks/set-state-in-effect */
 
   async function importVersion(version: string) {
     setIsImporting(version);
@@ -469,30 +471,37 @@ function EndpointDiffDetail({ entry, fromVersion, toVersion }: {
 
 function ParamsList({ params, label }: { params: string | undefined; label: string }) {
   if (!params) return <p className="text-xs text-text-muted italic">No {label.toLowerCase()} params</p>;
+  let parsed: Array<{ name: string; required: boolean; type: string; description: string }>;
   try {
-    const parsed = JSON.parse(params) as Array<{ name: string; required: boolean; type: string; description: string }>;
-    if (parsed.length === 0) return <p className="text-xs text-text-muted italic">No {label.toLowerCase()} params</p>;
-    return (
-      <div className="space-y-0.5 mb-2">
-        <div className="text-[10px] text-text-muted font-semibold">{label}</div>
-        {parsed.map(p => (
-          <div key={p.name} className="text-xs font-mono text-text-secondary px-1">
-            {p.name}{p.required ? '*' : ''} <span className="text-text-muted">({p.type})</span>
-          </div>
-        ))}
-      </div>
-    );
-  } catch { return <p className="text-xs text-text-muted italic">Parse error</p>; }
+    parsed = JSON.parse(params) as typeof parsed;
+  } catch {
+    return <p className="text-xs text-text-muted italic">Parse error</p>;
+  }
+  if (!Array.isArray(parsed)) return <p className="text-xs text-text-muted italic">Parse error</p>;
+  if (parsed.length === 0) return <p className="text-xs text-text-muted italic">No {label.toLowerCase()} params</p>;
+  return (
+    <div className="space-y-0.5 mb-2">
+      <div className="text-[10px] text-text-muted font-semibold">{label}</div>
+      {parsed.map(p => (
+        <div key={p.name} className="text-xs font-mono text-text-secondary px-1">
+          {p.name}{p.required ? '*' : ''} <span className="text-text-muted">({p.type})</span>
+        </div>
+      ))}
+    </div>
+  );
 }
 
 function SchemaView({ schema }: { schema: string | null | undefined }) {
   if (!schema) return <p className="text-xs text-text-muted italic">No schema</p>;
+  let parsed: unknown;
   try {
-    const parsed = JSON.parse(schema);
-    return (
-      <pre className="text-[11px] font-mono text-text-secondary bg-surface rounded-md p-2 max-h-48 overflow-auto whitespace-pre-wrap">
-        {JSON.stringify(parsed, null, 2)}
-      </pre>
-    );
-  } catch { return <pre className="text-[11px] font-mono text-text-muted">{schema}</pre>; }
+    parsed = JSON.parse(schema);
+  } catch {
+    return <pre className="text-[11px] font-mono text-text-muted">{schema}</pre>;
+  }
+  return (
+    <pre className="text-[11px] font-mono text-text-secondary bg-surface rounded-md p-2 max-h-48 overflow-auto whitespace-pre-wrap">
+      {JSON.stringify(parsed, null, 2)}
+    </pre>
+  );
 }
