@@ -17,6 +17,7 @@ import {
   collectRepositorySecurity,
   collectRulesetDetails,
   evaluateAssessmentBaseline,
+  formatScimRoleLabel,
 } from '../src/lib/assessment';
 
 test('collects and normalizes paginated enterprise organizations', async () => {
@@ -249,6 +250,16 @@ test('collects paginated enterprise SCIM users', async () => {
     active: false,
     roles: [],
   });
+});
+
+test('formats GitHub SCIM role aliases as readable role names', () => {
+  assert.equal(formatScimRoleLabel('27d9891d-2c17-4f45-a262-781a0e55c80a'), 'User');
+  assert.equal(
+    formatScimRoleLabel('981df190-8801-4618-a08a-d91f6206c954'),
+    'Enterprise owner'
+  );
+  assert.equal(formatScimRoleLabel('billing_manager'), 'Billing manager');
+  assert.equal(formatScimRoleLabel('custom-role'), 'custom-role');
 });
 
 test('collects repositories across organizations with pagination', async () => {

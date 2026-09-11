@@ -5,6 +5,10 @@ export interface AssessmentOrganization {
   description: string | null;
 }
 
+export function formatScimRoleLabel(role: string): string {
+  return SCIM_ROLE_LABELS[role.toLowerCase()] ?? role;
+}
+
 export interface AssessmentMember {
   login: string;
   name: string | null;
@@ -459,6 +463,19 @@ const SEVERITY_IMPACT: Record<AssessmentSeverity, number> = {
   high: 20,
   medium: 10,
   low: 5,
+};
+
+const SCIM_ROLE_LABELS: Readonly<Record<string, string>> = {
+  user: 'User',
+  '27d9891d-2c17-4f45-a262-781a0e55c80a': 'User',
+  guest_collaborator: 'Guest collaborator',
+  '1ebc4a02-e56c-43a6-92a5-02ee09b90824': 'Guest collaborator',
+  enterprise_owner: 'Enterprise owner',
+  '981df190-8801-4618-a08a-d91f6206c954': 'Enterprise owner',
+  'ba4987ab-a1c3-412a-b58c-360fc407cb10': 'Enterprise owner',
+  billing_manager: 'Billing manager',
+  '0e338b8c-cc7f-498a-928d-ea3470d7e7e3': 'Billing manager',
+  'e6be2762-e4ad-4108-b72d-1bbe884a0f91': 'Billing manager',
 };
 
 const ENTERPRISE_ORGANIZATIONS_QUERY = `query EnterpriseOrganizations($slug: String!, $cursor: String) {

@@ -3,13 +3,14 @@
 import { useCallback, useEffect, useState } from 'react';
 import { TopBar } from '@/components/TopBar';
 import { useApp } from '@/components/AppContext';
-import type {
-  AssessmentActionsEvidence,
-  AssessmentOrganizationAccess,
-  AssessmentRepositoryAccess,
-  AssessmentRepositoryRules,
-  AssessmentRulesetDetail,
-  AssessmentScimInventory,
+import {
+  formatScimRoleLabel,
+  type AssessmentActionsEvidence,
+  type AssessmentOrganizationAccess,
+  type AssessmentRepositoryAccess,
+  type AssessmentRepositoryRules,
+  type AssessmentRulesetDetail,
+  type AssessmentScimInventory,
 } from '@/lib/assessment';
 
 const INVENTORY_METRICS = [
@@ -604,7 +605,7 @@ export default function AssessmentPage() {
                               : <span className="font-medium text-text-secondary">Inactive</span>}
                           </td>
                           <td className="px-3 py-2.5 text-text-secondary">
-                            {identity.roles.join(', ') || '— None reported'}
+                            <ScimRoleList roles={identity.roles} />
                           </td>
                         </tr>
                       ))}
@@ -1288,6 +1289,20 @@ function RepositoryTeamGrants({
         </span>
       ))}
     </span>
+  );
+}
+
+function ScimRoleList({ roles }: { roles: string[] }) {
+  if (roles.length === 0) return <span>— None reported</span>;
+  return (
+    <>
+      {roles.map((role, index) => (
+        <span key={role} title={`GitHub SCIM role value: ${role}`}>
+          {index > 0 && ', '}
+          {formatScimRoleLabel(role)}
+        </span>
+      ))}
+    </>
   );
 }
 
