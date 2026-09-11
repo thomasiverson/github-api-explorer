@@ -16,6 +16,82 @@ export interface AssessmentIdentity {
   ownerLogins: string[];
 }
 
+export interface AssessmentOrganizationAccess {
+  organizationLogin: string;
+  defaultRepositoryPermission: string | null;
+  membersCanCreateRepositories: boolean | null;
+  membersCanCreatePublicRepositories: boolean | null;
+  membersCanCreatePrivateRepositories: boolean | null;
+  membersCanCreateInternalRepositories: boolean | null;
+  membersCanForkPrivateRepositories: boolean | null;
+  twoFactorRequirementEnabled: boolean | null;
+  adminLogins: string[] | null;
+  outsideCollaboratorLogins: string[] | null;
+}
+
+export type AssessmentOrganizationAccessCheck =
+  | 'settings'
+  | 'administrators'
+  | 'outside-collaborators';
+
+export interface AssessmentOrganizationAccessFailure {
+  organizationLogin: string;
+  check: AssessmentOrganizationAccessCheck;
+  error: string;
+}
+
+export interface AssessmentOrganizationAccessCollection {
+  items: AssessmentOrganizationAccess[];
+  failures: AssessmentOrganizationAccessFailure[];
+}
+
+export interface AssessmentDirectCollaborator {
+  login: string;
+  roleName: string;
+  permission: 'admin' | 'maintain' | 'write' | 'triage' | 'read' | 'unknown';
+}
+
+export interface AssessmentRepositoryTeamGrant {
+  slug: string;
+  name: string;
+  permission: string;
+}
+
+export interface AssessmentRepositoryAccess {
+  nameWithOwner: string;
+  visibility: string;
+  isArchived: boolean;
+  isFork: boolean;
+  directCollaborators: AssessmentDirectCollaborator[] | null;
+  teamGrants: AssessmentRepositoryTeamGrant[] | null;
+}
+
+export type AssessmentRepositoryAccessCheck = 'direct-collaborators' | 'team-grants';
+
+export interface AssessmentRepositoryAccessFailure {
+  nameWithOwner: string;
+  check: AssessmentRepositoryAccessCheck;
+  error: string;
+}
+
+export interface AssessmentRepositoryAccessCollection {
+  items: AssessmentRepositoryAccess[];
+  failures: AssessmentRepositoryAccessFailure[];
+}
+
+export interface AssessmentScimIdentity {
+  scimId: string;
+  userName: string;
+  displayName: string | null;
+  active: boolean;
+  roles: string[];
+}
+
+export interface AssessmentScimInventory {
+  totalResults: number;
+  identities: AssessmentScimIdentity[];
+}
+
 export interface AssessmentRepository {
   githubId: number;
   nodeId: string;
@@ -325,6 +401,40 @@ export interface AssessmentRestResponse {
   data: unknown;
 }
 
+export interface AssessmentOrganizationAccessRequests {
+  getOrganization: (organizationLogin: string) => Promise<AssessmentRestResponse>;
+  getAdministrators: (
+    organizationLogin: string,
+    page: number,
+    perPage: number
+  ) => Promise<AssessmentRestResponse>;
+  getOutsideCollaborators: (
+    organizationLogin: string,
+    page: number,
+    perPage: number
+  ) => Promise<AssessmentRestResponse>;
+}
+
+export interface AssessmentRepositoryAccessRequests {
+  getDirectCollaborators: (
+    owner: string,
+    repo: string,
+    page: number,
+    perPage: number
+  ) => Promise<AssessmentRestResponse>;
+  getTeamGrants: (
+    owner: string,
+    repo: string,
+    page: number,
+    perPage: number
+  ) => Promise<AssessmentRestResponse>;
+}
+
+export type AssessmentScimRequest = (
+  startIndex: number,
+  count: number
+) => Promise<AssessmentRestResponse>;
+
 export interface AssessmentRepositorySecurityRequests {
   getRepository: (owner: string, repo: string) => Promise<AssessmentRestResponse>;
   getCodeScanningDefaultSetup: (owner: string, repo: string) => Promise<AssessmentRestResponse>;
@@ -499,6 +609,339 @@ export async function collectEnterpriseIdentity(
   });
 
   return { members, ownerLogins };
+}
+
+export async function collectOrganizationAccess(
+  requests: AssessmentOrganizationAccessRequests,
+  organizationLogins: string[]
+): Promise<AssessmentOrganizationAccessCollection> {
+  const items: AssessmentOrganizationAccess[] = [];
+  const failures: AssessmentOrganizationAccessFailure[] = [];
+
+  for (const organizationLogin of organizationLogins) {
+    const item: AssessmentOrganizationAccess = {
+      organizationLogin,
+      defaultRepositoryPermission: null,
+      membersCanCreateRepositories: null,
+      membersCanCreatePublicRepositories: null,
+      membersCanCreatePrivateRepositories: null,
+      membersCanCreateInternalRepositories: null,
+      membersCanForkPrivateRepositories: null,
+      twoFactorRequirementEnabled: null,
+      adminLogins: null,
+      outsideCollaboratorLogins: null,
+    };
+
+    try {
+      const response = await requests.getOrganization(organizationLogin);
+      if (response.status !== 200) {
+        throw new Error(describeRestFailure('organization settings', response));
+      }
+      Object.assign(item, normalizeOrganizationAccessSettings(response.data));
+    } catch (error) {
+      failures.push({
+        organizationLogin,
+        check: 'settings',
+        error: normalizeAssessmentError(error),
+      });
+    }
+
+    try {
+      const administrators = await collectPagedRestArray(
+        (page, perPage) => requests.getAdministrators(organizationLogin, page, perPage),
+        'organization administrators'
+      );
+      item.adminLogins = normalizeLoginRecords(administrators);
+    } catch (error) {
+      failures.push({
+        organizationLogin,
+        check: 'administrators',
+        error: normalizeAssessmentError(error),
+      });
+    }
+
+    try {
+      const outsideCollaborators = await collectPagedRestArray(
+        (page, perPage) => requests.getOutsideCollaborators(
+          organizationLogin,
+          page,
+          perPage
+        ),
+        'outside collaborators'
+      );
+      item.outsideCollaboratorLogins = normalizeLoginRecords(outsideCollaborators);
+    } catch (error) {
+      failures.push({
+        organizationLogin,
+        check: 'outside-collaborators',
+        error: normalizeAssessmentError(error),
+      });
+    }
+
+    items.push(item);
+  }
+
+  return { items, failures };
+}
+
+export async function collectRepositoryAccess(
+  requests: AssessmentRepositoryAccessRequests,
+  repositories: AssessmentRepository[]
+): Promise<AssessmentRepositoryAccessCollection> {
+  const items: AssessmentRepositoryAccess[] = [];
+  const failures: AssessmentRepositoryAccessFailure[] = [];
+
+  for (const repository of repositories) {
+    const [owner, repo] = repository.nameWithOwner.split('/');
+    if (!owner || !repo) {
+      throw new Error(`Invalid repository name: ${repository.nameWithOwner}`);
+    }
+    const item: AssessmentRepositoryAccess = {
+      nameWithOwner: repository.nameWithOwner,
+      visibility: repository.visibility,
+      isArchived: repository.isArchived,
+      isFork: repository.isFork,
+      directCollaborators: null,
+      teamGrants: null,
+    };
+
+    try {
+      const collaborators = await collectPagedRestArray(
+        (page, perPage) => requests.getDirectCollaborators(owner, repo, page, perPage),
+        'direct repository collaborators'
+      );
+      item.directCollaborators = collaborators.map(normalizeDirectCollaborator);
+    } catch (error) {
+      failures.push({
+        nameWithOwner: repository.nameWithOwner,
+        check: 'direct-collaborators',
+        error: normalizeAssessmentError(error),
+      });
+    }
+
+    try {
+      const teams = await collectPagedRestArray(
+        (page, perPage) => requests.getTeamGrants(owner, repo, page, perPage),
+        'repository team grants'
+      );
+      item.teamGrants = teams.map(normalizeRepositoryTeamGrant);
+    } catch (error) {
+      failures.push({
+        nameWithOwner: repository.nameWithOwner,
+        check: 'team-grants',
+        error: normalizeAssessmentError(error),
+      });
+    }
+
+    items.push(item);
+  }
+
+  return { items, failures };
+}
+
+export async function collectEnterpriseScim(
+  request: AssessmentScimRequest
+): Promise<AssessmentScimInventory> {
+  const identities = new Map<string, AssessmentScimIdentity>();
+  let startIndex = 1;
+  let totalResults: number | null = null;
+
+  while (true) {
+    const response = await request(startIndex, REST_PAGE_SIZE);
+    if (response.status !== 200) {
+      throw new Error(describeRestFailure('enterprise SCIM users', response));
+    }
+    const page = readAssessmentObject(response.data);
+    if (
+      !page
+      || !Number.isInteger(page.totalResults)
+      || !Array.isArray(page.Resources)
+    ) {
+      throw new Error('GitHub returned an invalid enterprise SCIM response');
+    }
+    if (totalResults !== null && totalResults !== page.totalResults) {
+      throw new Error('GitHub returned inconsistent enterprise SCIM totals');
+    }
+    totalResults = page.totalResults as number;
+
+    for (const value of page.Resources) {
+      const identity = normalizeScimIdentity(value);
+      if (identities.has(identity.scimId)) {
+        throw new Error(`GitHub returned duplicate SCIM identity ${identity.scimId}`);
+      }
+      identities.set(identity.scimId, identity);
+    }
+    if (identities.size >= totalResults) break;
+    if (page.Resources.length === 0) {
+      throw new Error('GitHub returned an incomplete enterprise SCIM page');
+    }
+    startIndex += page.Resources.length;
+  }
+
+  return {
+    totalResults: totalResults ?? 0,
+    identities: [...identities.values()].sort(
+      (left, right) => left.userName.localeCompare(right.userName)
+    ),
+  };
+}
+
+async function collectPagedRestArray(
+  request: (page: number, perPage: number) => Promise<AssessmentRestResponse>,
+  label: string
+): Promise<unknown[]> {
+  const items: unknown[] = [];
+  let page = 1;
+  while (true) {
+    const response = await request(page, REST_PAGE_SIZE);
+    if (response.status !== 200) {
+      throw new Error(describeRestFailure(label, response));
+    }
+    if (!Array.isArray(response.data)) {
+      throw new Error(`GitHub returned an invalid ${label} response`);
+    }
+    items.push(...response.data);
+    if (response.data.length < REST_PAGE_SIZE) break;
+    page += 1;
+  }
+  return items;
+}
+
+function normalizeOrganizationAccessSettings(value: unknown): Partial<AssessmentOrganizationAccess> {
+  const settings = readAssessmentObject(value);
+  if (!settings || typeof settings.default_repository_permission !== 'string') {
+    throw new Error('GitHub returned invalid organization access settings');
+  }
+  return {
+    defaultRepositoryPermission: settings.default_repository_permission,
+    membersCanCreateRepositories: readOptionalBoolean(
+      settings.members_can_create_repositories,
+      'members_can_create_repositories'
+    ),
+    membersCanCreatePublicRepositories: readOptionalBoolean(
+      settings.members_can_create_public_repositories,
+      'members_can_create_public_repositories'
+    ),
+    membersCanCreatePrivateRepositories: readOptionalBoolean(
+      settings.members_can_create_private_repositories,
+      'members_can_create_private_repositories'
+    ),
+    membersCanCreateInternalRepositories: readOptionalBoolean(
+      settings.members_can_create_internal_repositories,
+      'members_can_create_internal_repositories'
+    ),
+    membersCanForkPrivateRepositories: readOptionalBoolean(
+      settings.members_can_fork_private_repositories,
+      'members_can_fork_private_repositories'
+    ),
+    twoFactorRequirementEnabled: readOptionalBoolean(
+      settings.two_factor_requirement_enabled,
+      'two_factor_requirement_enabled'
+    ),
+  };
+}
+
+function readOptionalBoolean(value: unknown, field: string): boolean | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== 'boolean') {
+    throw new Error(`GitHub returned an invalid ${field} setting`);
+  }
+  return value;
+}
+
+function normalizeLoginRecords(values: unknown[]): string[] {
+  const logins = values.map(value => {
+    const record = readAssessmentObject(value);
+    if (!record || typeof record.login !== 'string') {
+      throw new Error('GitHub returned an invalid user record');
+    }
+    return record.login;
+  });
+  return [...new Set(logins)].sort((left, right) => left.localeCompare(right));
+}
+
+function normalizeDirectCollaborator(value: unknown): AssessmentDirectCollaborator {
+  const collaborator = readAssessmentObject(value);
+  if (
+    !collaborator
+    || typeof collaborator.login !== 'string'
+    || typeof collaborator.role_name !== 'string'
+  ) {
+    throw new Error('GitHub returned an invalid direct collaborator');
+  }
+  return {
+    login: collaborator.login,
+    roleName: collaborator.role_name,
+    permission: normalizeCollaboratorPermission(collaborator),
+  };
+}
+
+function normalizeCollaboratorPermission(
+  collaborator: Record<string, unknown>
+): AssessmentDirectCollaborator['permission'] {
+  const permissions = readAssessmentObject(collaborator.permissions);
+  if (permissions) {
+    if (permissions.admin === true) return 'admin';
+    if (permissions.maintain === true) return 'maintain';
+    if (permissions.push === true) return 'write';
+    if (permissions.triage === true) return 'triage';
+    if (permissions.pull === true) return 'read';
+  }
+  const roleName = collaborator.role_name;
+  if (
+    roleName === 'admin'
+    || roleName === 'maintain'
+    || roleName === 'write'
+    || roleName === 'triage'
+    || roleName === 'read'
+  ) {
+    return roleName;
+  }
+  return 'unknown';
+}
+
+function normalizeRepositoryTeamGrant(value: unknown): AssessmentRepositoryTeamGrant {
+  const team = readAssessmentObject(value);
+  if (
+    !team
+    || typeof team.slug !== 'string'
+    || typeof team.name !== 'string'
+    || typeof team.permission !== 'string'
+  ) {
+    throw new Error('GitHub returned an invalid repository team grant');
+  }
+  return {
+    slug: team.slug,
+    name: team.name,
+    permission: team.permission,
+  };
+}
+
+function normalizeScimIdentity(value: unknown): AssessmentScimIdentity {
+  const identity = readAssessmentObject(value);
+  if (
+    !identity
+    || typeof identity.id !== 'string'
+    || typeof identity.userName !== 'string'
+    || typeof identity.active !== 'boolean'
+    || !Array.isArray(identity.roles)
+  ) {
+    throw new Error('GitHub returned an invalid enterprise SCIM identity');
+  }
+  const roles = identity.roles.map(roleValue => {
+    const role = readAssessmentObject(roleValue);
+    if (!role || typeof role.value !== 'string') {
+      throw new Error('GitHub returned an invalid enterprise SCIM role');
+    }
+    return role.value;
+  });
+  return {
+    scimId: identity.id,
+    userName: identity.userName,
+    displayName: typeof identity.displayName === 'string' ? identity.displayName : null,
+    active: identity.active,
+    roles,
+  };
 }
 
 export async function collectOrganizationRepositories(
@@ -1623,6 +2066,10 @@ export function evaluateAssessmentBaseline(input: {
   ownerCount: number;
   repositories: AssessmentRepository[];
   teams: AssessmentTeam[];
+  organizationAccess?: AssessmentOrganizationAccess[] | null;
+  repositoryAccess?: AssessmentRepositoryAccess[] | null;
+  scim?: AssessmentScimInventory | null;
+  setupAccountLogin?: string;
   securityDefaults?: AssessmentSecurityDefault[] | null;
   repositorySecurity?: AssessmentRepositorySecurity[] | null;
   repositoryRules?: AssessmentRepositoryRules[] | null;
@@ -1642,6 +2089,16 @@ export function evaluateAssessmentBaseline(input: {
     return Number.isFinite(updatedAt) && updatedAt < staleThreshold;
   });
   const publicRepositories = input.repositories.filter(repository => repository.visibility === 'PUBLIC');
+  let organizationsWithAccessSettings = 0;
+  let organizationsWithPublicRepositoryCreation = 0;
+  let outsideCollaboratorCount = 0;
+  let directRepositoryGrantCount = 0;
+  let teamRepositoryGrantCount = 0;
+  let activeScimIdentities = 0;
+  let inactiveScimIdentities = 0;
+  const humanEnterpriseMembers = input.members.filter(
+    member => member.login.toLowerCase() !== input.setupAccountLogin?.toLowerCase()
+  ).length;
 
   if (input.ownerCount === 0) {
     findings.push({
@@ -1663,6 +2120,187 @@ export function evaluateAssessmentBaseline(input: {
       recommendation: 'Assign and validate at least one additional enterprise owner using a separately managed account.',
       affectedResources: input.members.filter(member => member.isOwner).map(member => member.login),
     });
+  }
+
+  if (input.organizationAccess) {
+    const broadAdminAccess = input.organizationAccess.filter(
+      organization => organization.defaultRepositoryPermission === 'admin'
+    );
+    const broadWriteAccess = input.organizationAccess.filter(
+      organization => organization.defaultRepositoryPermission === 'write'
+    );
+    const publicCreationEnabled = input.organizationAccess.filter(
+      organization => organization.membersCanCreatePublicRepositories === true
+    );
+    const outsideCollaborators = input.organizationAccess.flatMap(organization => (
+      (organization.outsideCollaboratorLogins ?? []).map(login => ({
+        organizationLogin: organization.organizationLogin,
+        login,
+      }))
+    ));
+
+    organizationsWithAccessSettings = input.organizationAccess.filter(
+      organization => organization.defaultRepositoryPermission !== null
+    ).length;
+    organizationsWithPublicRepositoryCreation = publicCreationEnabled.length;
+    outsideCollaboratorCount = outsideCollaborators.length;
+
+    if (broadAdminAccess.length > 0) {
+      findings.push({
+        ruleKey: 'organization-default-repository-admin',
+        domain: 'identity',
+        severity: 'high',
+        title: 'Organization members receive repository administration by default',
+        summary: `${broadAdminAccess.length} ${broadAdminAccess.length === 1 ? 'organization grants' : 'organizations grant'} all members administrator access to repositories by default.`,
+        recommendation: 'Set the organization base permission to read or none, then grant elevated access through governed teams.',
+        affectedResources: broadAdminAccess.map(organization => organization.organizationLogin),
+      });
+    }
+    if (broadWriteAccess.length > 0) {
+      findings.push({
+        ruleKey: 'organization-default-repository-write',
+        domain: 'identity',
+        severity: 'medium',
+        title: 'Organization members receive repository write access by default',
+        summary: `${broadWriteAccess.length} ${broadWriteAccess.length === 1 ? 'organization grants' : 'organizations grant'} all members write access to repositories by default.`,
+        recommendation: 'Reduce the organization base permission to read or none, then grant write access through governed teams.',
+        affectedResources: broadWriteAccess.map(organization => organization.organizationLogin),
+      });
+    }
+    if (publicCreationEnabled.length > 0) {
+      findings.push({
+        ruleKey: 'organization-public-repository-creation-enabled',
+        domain: 'identity',
+        severity: 'medium',
+        title: 'Members can create public repositories',
+        summary: `${publicCreationEnabled.length} ${publicCreationEnabled.length === 1 ? 'organization allows' : 'organizations allow'} members to create public repositories.`,
+        recommendation: 'Restrict public repository creation to approved administrators or document the review process that governs public disclosure.',
+        affectedResources: publicCreationEnabled.map(organization => organization.organizationLogin),
+      });
+    }
+    if (outsideCollaborators.length > 0) {
+      findings.push({
+        ruleKey: 'outside-collaborator-review',
+        domain: 'identity',
+        severity: 'low',
+        title: 'Outside collaborator access requires periodic review',
+        summary: `${outsideCollaborators.length} outside collaborator ${outsideCollaborators.length === 1 ? 'grant was' : 'grants were'} discovered across the enterprise organizations.`,
+        recommendation: 'Confirm that each outside collaborator has a current sponsor, an expiration or review date, and only the repository access required.',
+        affectedResources: outsideCollaborators.map(
+          collaborator => `${collaborator.organizationLogin}/${collaborator.login}`
+        ),
+      });
+    }
+  }
+
+  if (input.repositoryAccess) {
+    const enterpriseMemberLogins = new Set(
+      input.members.map(member => member.login.toLowerCase())
+    );
+    const outsideCollaboratorsByOrganization = new Map(
+      (input.organizationAccess ?? []).map(organization => [
+        organization.organizationLogin.toLowerCase(),
+        new Set(
+          (organization.outsideCollaboratorLogins ?? []).map(login => login.toLowerCase())
+        ),
+      ])
+    );
+    const activeAccess = input.repositoryAccess.filter(
+      repository => !repository.isArchived && !repository.isFork
+    );
+    const directGrants = activeAccess.flatMap(repository => (
+      (repository.directCollaborators ?? []).map(collaborator => ({
+        repository,
+        collaborator,
+      }))
+    ));
+    const teamGrants = activeAccess.flatMap(repository => (
+      (repository.teamGrants ?? []).map(team => ({ repository, team }))
+    ));
+    const privilegedOutsideGrants = directGrants.filter(({ repository, collaborator }) => {
+      const organization = repository.nameWithOwner.split('/')[0].toLowerCase();
+      return (
+        (collaborator.permission === 'admin' || collaborator.permission === 'maintain')
+        && outsideCollaboratorsByOrganization.get(organization)?.has(
+          collaborator.login.toLowerCase()
+        )
+      );
+    });
+    const outsideGrantKeys = new Set(
+      privilegedOutsideGrants.map(
+        ({ repository, collaborator }) => (
+          `${repository.nameWithOwner.toLowerCase()}:${collaborator.login.toLowerCase()}`
+        )
+      )
+    );
+    const privilegedDirectGrants = directGrants.filter(({ repository, collaborator }) => (
+      (collaborator.permission === 'admin' || collaborator.permission === 'maintain')
+      && enterpriseMemberLogins.has(collaborator.login.toLowerCase())
+      && !outsideGrantKeys.has(
+        `${repository.nameWithOwner.toLowerCase()}:${collaborator.login.toLowerCase()}`
+      )
+    ));
+    const writeDirectGrants = directGrants.filter(({ repository, collaborator }) => (
+      collaborator.permission === 'write'
+      && enterpriseMemberLogins.has(collaborator.login.toLowerCase())
+      && !outsideCollaboratorsByOrganization
+        .get(repository.nameWithOwner.split('/')[0].toLowerCase())
+        ?.has(collaborator.login.toLowerCase())
+    ));
+
+    directRepositoryGrantCount = directGrants.length;
+    teamRepositoryGrantCount = teamGrants.length;
+
+    if (privilegedOutsideGrants.length > 0) {
+      findings.push({
+        ruleKey: 'outside-collaborator-privileged-repository-access',
+        domain: 'identity',
+        severity: 'high',
+        title: 'Outside collaborators hold privileged repository access',
+        summary: `${privilegedOutsideGrants.length} direct outside-collaborator ${privilegedOutsideGrants.length === 1 ? 'grant provides' : 'grants provide'} administrator or maintain access.`,
+        recommendation: 'Remove privileged outside access where possible and use a narrowly scoped team or lower repository role for approved external contributors.',
+        affectedResources: privilegedOutsideGrants.map(
+          ({ repository, collaborator }) => (
+            `${repository.nameWithOwner}:${collaborator.login} (${collaborator.permission})`
+          )
+        ),
+      });
+    }
+    if (privilegedDirectGrants.length > 0) {
+      findings.push({
+        ruleKey: 'direct-privileged-repository-access',
+        domain: 'identity',
+        severity: 'medium',
+        title: 'Repositories have direct privileged grants',
+        summary: `${privilegedDirectGrants.length} direct ${privilegedDirectGrants.length === 1 ? 'grant provides' : 'grants provide'} administrator or maintain access outside team governance.`,
+        recommendation: 'Move durable privileged access into governed teams and retain direct grants only for documented exceptions.',
+        affectedResources: privilegedDirectGrants.map(
+          ({ repository, collaborator }) => (
+            `${repository.nameWithOwner}:${collaborator.login} (${collaborator.permission})`
+          )
+        ),
+      });
+    }
+    if (writeDirectGrants.length > 0) {
+      findings.push({
+        ruleKey: 'direct-write-repository-access-review',
+        domain: 'identity',
+        severity: 'low',
+        title: 'Repositories have direct write grants',
+        summary: `${writeDirectGrants.length} direct ${writeDirectGrants.length === 1 ? 'grant provides' : 'grants provide'} write access outside team governance.`,
+        recommendation: 'Review direct write grants and move durable access into governed teams.',
+        affectedResources: writeDirectGrants.map(
+          ({ repository, collaborator }) => (
+            `${repository.nameWithOwner}:${collaborator.login} (${collaborator.permission})`
+          )
+        ),
+      });
+    }
+  }
+
+  if (input.scim) {
+    activeScimIdentities = input.scim.identities.filter(identity => identity.active).length;
+    inactiveScimIdentities = input.scim.identities.length - activeScimIdentities;
   }
 
   if (staleRepositories.length > 0) {
@@ -2278,6 +2916,21 @@ export function evaluateAssessmentBaseline(input: {
       privateRepositories: input.repositories.filter(repository => repository.visibility === 'PRIVATE').length,
       publicRepositories: publicRepositories.length,
       staleActiveRepositories: staleRepositories.length,
+      ...(input.organizationAccess ? {
+        organizationsWithAccessSettings,
+        organizationsWithPublicRepositoryCreation,
+        outsideCollaboratorCount,
+      } : {}),
+      ...(input.repositoryAccess ? {
+        directRepositoryGrantCount,
+        teamRepositoryGrantCount,
+      } : {}),
+      ...(input.scim ? {
+        activeScimIdentities,
+        humanEnterpriseMembers,
+        inactiveScimIdentities,
+        scimIdentities: input.scim.totalResults,
+      } : {}),
       ...(input.repositoryRules ? {
         classicProtectedDefaultBranches,
         defaultBranchProtectionUnknownRepositories,

@@ -7,9 +7,12 @@ import {
   collectEnterpriseCopilotSeats,
   collectEnterpriseIdentity,
   collectEnterpriseOrganizations,
+  collectEnterpriseScim,
   collectEnterpriseSecurityDefaults,
+  collectOrganizationAccess,
   collectOrganizationRepositories,
   collectOrganizationTeams,
+  collectRepositoryAccess,
   collectRepositoryRules,
   collectRepositorySecurity,
   collectRulesetDetails,
@@ -110,6 +113,142 @@ test('rejects malformed enterprise identity responses', async () => {
     () => collectEnterpriseIdentity(async () => ({ enterprise: { members: null } }), 'acme'),
     /invalid member inventory response/
   );
+});
+
+test('collects paginated organization access evidence and preserves partial failures', async () => {
+  const adminPages: number[] = [];
+  const result = await collectOrganizationAccess({
+    getOrganization: async organizationLogin => ({
+      status: 200,
+      data: {
+        default_repository_permission: organizationLogin === 'org-one' ? 'read' : 'none',
+        members_can_create_repositories: true,
+        members_can_create_public_repositories: organizationLogin === 'org-one',
+        members_can_create_private_repositories: true,
+        members_can_create_internal_repositories: true,
+        members_can_fork_private_repositories: false,
+        two_factor_requirement_enabled: false,
+      },
+    }),
+    getAdministrators: async (organizationLogin, page) => {
+      if (organizationLogin === 'org-one') {
+        adminPages.push(page);
+        return {
+          status: 200,
+          data: page === 1
+            ? Array.from({ length: 100 }, (_, index) => ({ login: `admin-${index}` }))
+            : [{ login: 'admin-100' }],
+        };
+      }
+      return { status: 200, data: [] };
+    },
+    getOutsideCollaborators: async organizationLogin => (
+      organizationLogin === 'org-two'
+        ? { status: 403, data: { message: 'Resource protected by SAML' } }
+        : { status: 200, data: [{ login: 'external-one' }] }
+    ),
+  }, ['org-one', 'org-two']);
+
+  assert.deepEqual(adminPages, [1, 2]);
+  assert.equal(result.items[0].adminLogins?.length, 101);
+  assert.deepEqual(result.items[0].outsideCollaboratorLogins, ['external-one']);
+  assert.equal(result.items[1].outsideCollaboratorLogins, null);
+  assert.deepEqual(result.failures, [{
+    organizationLogin: 'org-two',
+    check: 'outside-collaborators',
+    error: 'GitHub returned 403 for outside collaborators: Resource protected by SAML',
+  }]);
+});
+
+test('collects direct collaborators and team grants with normalized permissions', async () => {
+  const directPages: number[] = [];
+  const repository = {
+    githubId: 1,
+    nodeId: 'REPO_1',
+    organizationLogin: 'acme',
+    nameWithOwner: 'acme/repository',
+    visibility: 'PRIVATE',
+    isArchived: false,
+    isFork: false,
+    updatedAt: '2026-09-01T00:00:00Z',
+  };
+  const result = await collectRepositoryAccess({
+    getDirectCollaborators: async (_owner, _repo, page) => {
+      directPages.push(page);
+      return {
+        status: 200,
+        data: page === 1
+          ? Array.from({ length: 100 }, (_, index) => ({
+              login: `reader-${index}`,
+              role_name: 'read',
+              permissions: { pull: true },
+            }))
+          : [{
+              login: 'custom-maintainer',
+              role_name: 'custom-maintainer',
+              permissions: { pull: true, push: true, maintain: true },
+            }],
+      };
+    },
+    getTeamGrants: async () => ({
+      status: 200,
+      data: [{ slug: 'platform', name: 'Platform', permission: 'push' }],
+    }),
+  }, [repository]);
+
+  assert.deepEqual(directPages, [1, 2]);
+  assert.equal(result.items[0].directCollaborators?.length, 101);
+  assert.deepEqual(result.items[0].directCollaborators?.at(-1), {
+    login: 'custom-maintainer',
+    roleName: 'custom-maintainer',
+    permission: 'maintain',
+  });
+  assert.deepEqual(result.items[0].teamGrants, [{
+    slug: 'platform',
+    name: 'Platform',
+    permission: 'push',
+  }]);
+  assert.deepEqual(result.failures, []);
+});
+
+test('collects paginated enterprise SCIM users', async () => {
+  const startIndexes: number[] = [];
+  const scim = await collectEnterpriseScim(async startIndex => {
+    startIndexes.push(startIndex);
+    const firstPage = Array.from({ length: 100 }, (_, index) => ({
+      id: `scim-${index}`,
+      userName: `user-${index}@example.com`,
+      displayName: null,
+      active: true,
+      roles: [{ value: 'user', primary: true }],
+    }));
+    return {
+      status: 200,
+      data: {
+        totalResults: 101,
+        Resources: startIndex === 1
+          ? firstPage
+          : [{
+              id: 'scim-100',
+              userName: 'user-100@example.com',
+              displayName: 'User 100',
+              active: false,
+              roles: [],
+            }],
+      },
+    };
+  });
+
+  assert.deepEqual(startIndexes, [1, 101]);
+  assert.equal(scim.totalResults, 101);
+  assert.equal(scim.identities.length, 101);
+  assert.deepEqual(scim.identities.find(identity => identity.scimId === 'scim-100'), {
+    scimId: 'scim-100',
+    userName: 'user-100@example.com',
+    displayName: 'User 100',
+    active: false,
+    roles: [],
+  });
 });
 
 test('collects repositories across organizations with pagination', async () => {
@@ -1250,6 +1389,88 @@ test('evaluates default branch controls without treating unknown or nonexistent 
     repositoriesWithoutDefaultBranches: 1,
     rulesetProtectedDefaultBranches: 0,
   });
+});
+
+test('evaluates identity access without duplicating privileged outside-collaborator penalties', () => {
+  const evaluation = evaluateAssessmentBaseline({
+    organizations: [],
+    members: [
+      { login: 'acme_admin', name: null, isOwner: true },
+      { login: 'owner-one', name: null, isOwner: true },
+      { login: 'member-one', name: null, isOwner: false },
+      { login: 'writer-one', name: null, isOwner: false },
+    ],
+    ownerCount: 2,
+    repositories: [],
+    teams: [],
+    setupAccountLogin: 'acme_admin',
+    organizationAccess: [{
+      organizationLogin: 'acme-org',
+      defaultRepositoryPermission: 'write',
+      membersCanCreateRepositories: true,
+      membersCanCreatePublicRepositories: true,
+      membersCanCreatePrivateRepositories: true,
+      membersCanCreateInternalRepositories: true,
+      membersCanForkPrivateRepositories: false,
+      twoFactorRequirementEnabled: false,
+      adminLogins: ['owner-one'],
+      outsideCollaboratorLogins: ['external-one'],
+    }],
+    repositoryAccess: [{
+      nameWithOwner: 'acme-org/repository',
+      visibility: 'PRIVATE',
+      isArchived: false,
+      isFork: false,
+      directCollaborators: [
+        { login: 'external-one', roleName: 'admin', permission: 'admin' },
+        { login: 'member-one', roleName: 'maintain', permission: 'maintain' },
+        { login: 'writer-one', roleName: 'write', permission: 'write' },
+      ],
+      teamGrants: [{ slug: 'platform', name: 'Platform', permission: 'push' }],
+    }],
+    scim: {
+      totalResults: 2,
+      identities: [
+        {
+          scimId: '1',
+          userName: 'owner@example.com',
+          displayName: 'Owner',
+          active: true,
+          roles: ['user'],
+        },
+        {
+          scimId: '2',
+          userName: 'former@example.com',
+          displayName: 'Former',
+          active: false,
+          roles: ['user'],
+        },
+      ],
+    },
+    now: new Date('2026-09-10T00:00:00Z'),
+  });
+
+  assert.equal(evaluation.healthScore, 40);
+  assert.deepEqual(evaluation.findings.map(finding => finding.ruleKey), [
+    'organization-default-repository-write',
+    'organization-public-repository-creation-enabled',
+    'outside-collaborator-review',
+    'outside-collaborator-privileged-repository-access',
+    'direct-privileged-repository-access',
+    'direct-write-repository-access-review',
+  ]);
+  assert.deepEqual(
+    evaluation.findings.find(
+      finding => finding.ruleKey === 'direct-privileged-repository-access'
+    )?.affectedResources,
+    ['acme-org/repository:member-one (maintain)']
+  );
+  assert.equal(evaluation.metrics.humanEnterpriseMembers, 3);
+  assert.equal(evaluation.metrics.scimIdentities, 2);
+  assert.equal(evaluation.metrics.activeScimIdentities, 1);
+  assert.equal(evaluation.metrics.inactiveScimIdentities, 1);
+  assert.equal(evaluation.metrics.directRepositoryGrantCount, 3);
+  assert.equal(evaluation.metrics.teamRepositoryGrantCount, 1);
 });
 
 test('flags unconditional ruleset bypass while excluding pull-request-only and disabled exceptions', () => {

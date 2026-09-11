@@ -8,9 +8,12 @@ import {
   collectEnterpriseCopilotSeats,
   collectEnterpriseIdentity,
   collectEnterpriseOrganizations,
+  collectEnterpriseScim,
   collectEnterpriseSecurityDefaults,
+  collectOrganizationAccess,
   collectOrganizationRepositories,
   collectOrganizationTeams,
+  collectRepositoryAccess,
   collectRepositoryRules,
   collectRepositorySecurity,
   collectRulesetDetails,
@@ -64,7 +67,9 @@ export async function POST(request: Request) {
   const runId = uuidv4();
   const organizationCollectorId = uuidv4();
   const identityCollectorId = uuidv4();
+  const organizationAccessCollectorId = uuidv4();
   const repositoryCollectorId = uuidv4();
+  const repositoryAccessCollectorId = uuidv4();
   const teamCollectorId = uuidv4();
   const securityCollectorId = uuidv4();
   const repositorySecurityCollectorId = uuidv4();
@@ -74,6 +79,7 @@ export async function POST(request: Request) {
   const actionsDepthCollectorId = uuidv4();
   const copilotCollectorId = uuidv4();
   const billingCollectorId = uuidv4();
+  const scimCollectorId = uuidv4();
   const collectorIds = {
     organizations: organizationCollectorId,
     identity: identityCollectorId,
@@ -106,6 +112,73 @@ export async function POST(request: Request) {
       organizationLogins
     );
     const repositoryDurationMs = Math.round(performance.now() - repositoryStartedAt);
+    const organizationAccessStartedAt = performance.now();
+    const organizationAccessResult = await collectOrganizationAccess({
+      getOrganization: organizationLogin => requestWithStatus(() => octokit.request(
+        'GET /orgs/{org}',
+        {
+          org: organizationLogin,
+          headers: { 'X-GitHub-Api-Version': '2026-03-10' },
+        }
+      )),
+      getAdministrators: (organizationLogin, page, perPage) => requestWithStatus(
+        () => octokit.request(
+          'GET /orgs/{org}/members',
+          {
+            org: organizationLogin,
+            role: 'admin',
+            page,
+            per_page: perPage,
+            headers: { 'X-GitHub-Api-Version': '2026-03-10' },
+          }
+        )
+      ),
+      getOutsideCollaborators: (organizationLogin, page, perPage) => requestWithStatus(
+        () => octokit.request(
+          'GET /orgs/{org}/outside_collaborators',
+          {
+            org: organizationLogin,
+            page,
+            per_page: perPage,
+            headers: { 'X-GitHub-Api-Version': '2026-03-10' },
+          }
+        )
+      ),
+    }, organizationLogins);
+    const organizationAccessDurationMs = Math.round(
+      performance.now() - organizationAccessStartedAt
+    );
+    const repositoryAccessStartedAt = performance.now();
+    const repositoryAccessResult = await collectRepositoryAccess({
+      getDirectCollaborators: (owner, repo, page, perPage) => requestWithStatus(
+        () => octokit.request(
+          'GET /repos/{owner}/{repo}/collaborators',
+          {
+            owner,
+            repo,
+            affiliation: 'direct',
+            page,
+            per_page: perPage,
+            headers: { 'X-GitHub-Api-Version': '2026-03-10' },
+          }
+        )
+      ),
+      getTeamGrants: (owner, repo, page, perPage) => requestWithStatus(
+        () => octokit.request(
+          'GET /repos/{owner}/{repo}/teams',
+          {
+            owner,
+            repo,
+            page,
+            per_page: perPage,
+            headers: { 'X-GitHub-Api-Version': '2026-03-10' },
+          }
+        )
+      ),
+    }, repositoryResult.items);
+    const repositoryAccessDurationMs = Math.round(
+      performance.now() - repositoryAccessStartedAt
+    );
     activeCollector = 'teams';
     const teamStartedAt = performance.now();
     const teamResult = await collectOrganizationTeams(
@@ -322,12 +395,29 @@ export async function POST(request: Request) {
         )
       ).data)
     ));
+    const scimResult = await collectOptionalEvidence(() => (
+      collectEnterpriseScim((startIndex, count) => requestWithStatus(
+        () => octokit.request(
+          'GET /scim/v2/enterprises/{enterprise}/Users',
+          {
+            enterprise: environment.enterprise_slug,
+            startIndex,
+            count,
+            headers: { 'X-GitHub-Api-Version': '2026-03-10' },
+          }
+        )
+      ))
+    ));
     const evaluation = evaluateAssessmentBaseline({
       organizations,
       members: identity.members,
       ownerCount: identity.ownerLogins.length,
       repositories: repositoryResult.items,
       teams: teamResult.items,
+      organizationAccess: organizationAccessResult.items,
+      repositoryAccess: repositoryAccessResult.items,
+      scim: scimResult.value,
+      setupAccountLogin: `${environment.enterprise_slug}_admin`,
       securityDefaults: securityResult.value,
       repositorySecurity: repositorySecurityResult.items,
       repositoryRules: repositoryRulesResult.items,
@@ -343,7 +433,15 @@ export async function POST(request: Request) {
       durationMs,
       organizationCollector: { id: organizationCollectorId, durationMs: organizationDurationMs },
       identityCollector: { id: identityCollectorId, durationMs: identityDurationMs },
+      organizationAccessCollector: {
+        id: organizationAccessCollectorId,
+        durationMs: organizationAccessDurationMs,
+      },
       repositoryCollector: { id: repositoryCollectorId, durationMs: repositoryDurationMs },
+      repositoryAccessCollector: {
+        id: repositoryAccessCollectorId,
+        durationMs: repositoryAccessDurationMs,
+      },
       teamCollector: { id: teamCollectorId, durationMs: teamDurationMs },
       organizations,
       members: identity.members,
@@ -352,6 +450,11 @@ export async function POST(request: Request) {
       repositoryFailures: repositoryResult.failures,
       teams: teamResult.items,
       teamFailures: teamResult.failures,
+      organizationAccess: organizationAccessResult.items,
+      organizationAccessFailures: organizationAccessResult.failures,
+      repositoryAccess: repositoryAccessResult.items,
+      repositoryAccessFailures: repositoryAccessResult.failures,
+      scim: scimResult.value,
       securityCollector: {
         id: securityCollectorId,
         durationMs: securityResult.durationMs,
@@ -388,6 +491,11 @@ export async function POST(request: Request) {
         id: billingCollectorId,
         durationMs: billingResult.durationMs,
         error: billingResult.error,
+      },
+      scimCollector: {
+        id: scimCollectorId,
+        durationMs: scimResult.durationMs,
+        error: scimResult.error,
       },
       securityDefaults: securityResult.value,
       repositorySecurity: repositorySecurityResult.items,

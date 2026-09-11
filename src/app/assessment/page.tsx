@@ -5,8 +5,11 @@ import { TopBar } from '@/components/TopBar';
 import { useApp } from '@/components/AppContext';
 import type {
   AssessmentActionsEvidence,
+  AssessmentOrganizationAccess,
+  AssessmentRepositoryAccess,
   AssessmentRepositoryRules,
   AssessmentRulesetDetail,
+  AssessmentScimInventory,
 } from '@/lib/assessment';
 
 const INVENTORY_METRICS = [
@@ -20,7 +23,7 @@ const INVENTORY_METRICS = [
 ];
 
 const ASSESSMENT_DOMAINS = [
-  { key: 'identity', name: 'Identity & access', detail: 'Members and enterprise owner resilience' },
+  { key: 'identity', name: 'Identity & access', detail: 'Owners, organization defaults, access grants, and SCIM provisioning' },
   { key: 'repositories', name: 'Repository governance', detail: 'Visibility, archival state, and repository activity' },
   { key: 'security', name: 'Security posture', detail: 'Secret scanning, code scanning, Dependabot, security configurations' },
   { key: 'actions', name: 'Actions & runners', detail: 'Workflow permissions, fork trust, runner groups, and runner health' },
@@ -65,6 +68,9 @@ interface AssessmentSnapshot {
   error: string | null;
   metrics: Record<string, number>;
   collectors: AssessmentCollectorResult[];
+  organizationAccess: AssessmentOrganizationAccess[];
+  repositoryAccess: AssessmentRepositoryAccess[];
+  scim: AssessmentScimInventory | null;
   repositorySecurity: AssessmentRepositorySecurity[];
   repositoryRules: AssessmentRepositoryRules[];
   rulesets: AssessmentRulesetDetail[];
@@ -147,6 +153,13 @@ export default function AssessmentPage() {
     low: findings.filter(finding => finding.severity === 'low').length,
   };
   const repositoryCollector = snapshot?.collectors.find(collector => collector.collector_key === 'repositories');
+  const organizationAccessCollector = snapshot?.collectors.find(
+    collector => collector.collector_key === 'organizationAccess'
+  );
+  const repositoryAccessCollector = snapshot?.collectors.find(
+    collector => collector.collector_key === 'repositoryAccess'
+  );
+  const scimCollector = snapshot?.collectors.find(collector => collector.collector_key === 'scim');
   const securityCollector = snapshot?.collectors.find(collector => collector.collector_key === 'security');
   const repositorySecurityCollector = snapshot?.collectors.find(
     collector => collector.collector_key === 'repositorySecurity'
@@ -164,6 +177,9 @@ export default function AssessmentPage() {
   const copilotCollector = snapshot?.collectors.find(collector => collector.collector_key === 'copilot');
   const billingCollector = snapshot?.collectors.find(collector => collector.collector_key === 'billing');
   const repositorySecurity = snapshot?.repositorySecurity || [];
+  const organizationAccess = snapshot?.organizationAccess || [];
+  const repositoryAccess = snapshot?.repositoryAccess || [];
+  const scim = snapshot?.scim;
   const repositoryRules = snapshot?.repositoryRules || [];
   const rulesets = snapshot?.rulesets || [];
   const eligibleRepositorySecurity = repositorySecurity.filter(
@@ -176,7 +192,16 @@ export default function AssessmentPage() {
     runnersByGroup.set(runner.runnerGroupId, (runnersByGroup.get(runner.runnerGroupId) ?? 0) + 1);
   }
   const domainStatuses: Record<AssessmentDomainKey, string> = {
-    identity: baselineEvaluated ? 'Baseline' : 'Not assessed',
+    identity: baselineEvaluated
+      ? organizationAccessCollector?.status === 'completed'
+        && repositoryAccessCollector?.status === 'completed'
+        && scimCollector?.status === 'completed'
+        ? 'Access depth'
+        : organizationAccessCollector?.status === 'partial'
+          || repositoryAccessCollector?.status === 'partial'
+          ? 'Partial access depth'
+          : 'Baseline'
+      : 'Not assessed',
     repositories: baselineEvaluated
       ? repositoryRulesCollector?.status === 'completed'
         && rulesetDetailsCollector?.status === 'completed'
@@ -281,6 +306,7 @@ export default function AssessmentPage() {
                       collector.collector_key === 'repositorySecurity'
                       || collector.collector_key === 'repositoryRules'
                       || collector.collector_key === 'rulesetDetails'
+                      || collector.collector_key === 'repositoryAccess'
                     )
                       ? `${failures.length} incomplete repository ${failures.length === 1 ? 'check' : 'checks'}`
                       : collector.collector_key === 'actionsDepth'
@@ -400,6 +426,199 @@ export default function AssessmentPage() {
                 );
               })}
             </div>
+          </section>
+
+          <section aria-labelledby="identity-governance-heading" className="border border-border bg-panel rounded-lg overflow-hidden">
+            <div className="px-4 py-3 border-b border-border flex flex-col gap-2 md:flex-row md:items-end md:justify-between">
+              <div>
+                <h2 id="identity-governance-heading" className="text-sm font-semibold text-text-primary">
+                  Identity & access governance
+                </h2>
+                <p className="text-xs text-text-muted mt-0.5">
+                  Organization defaults, direct repository grants, team access, and managed-user provisioning.
+                </p>
+              </div>
+              <span className="text-xs text-text-muted">
+                {organizationAccess.length > 0
+                  ? `${organizationAccess.length} organizations measured`
+                  : 'Awaiting assessment'}
+              </span>
+            </div>
+            <div className="grid sm:grid-cols-2 lg:grid-cols-5 divide-y sm:divide-y-0 sm:divide-x divide-border">
+              <IdentityAccessSignal
+                label="Organization settings"
+                value={snapshot?.metrics.organizationsWithAccessSettings}
+                suffix={`of ${snapshot?.metrics.organizations ?? '--'}`}
+              />
+              <IdentityAccessSignal
+                label="Public repo creation"
+                value={snapshot?.metrics.organizationsWithPublicRepositoryCreation}
+                suffix="organizations"
+                caution={(snapshot?.metrics.organizationsWithPublicRepositoryCreation ?? 0) > 0}
+              />
+              <IdentityAccessSignal
+                label="Outside access"
+                value={snapshot?.metrics.outsideCollaboratorCount}
+                suffix="collaborators"
+                caution={(snapshot?.metrics.outsideCollaboratorCount ?? 0) > 0}
+              />
+              <IdentityAccessSignal
+                label="Direct access"
+                value={snapshot?.metrics.directRepositoryGrantCount}
+                suffix="repository grants"
+                caution={(snapshot?.metrics.directRepositoryGrantCount ?? 0) > 0}
+              />
+              <IdentityAccessSignal
+                label="Managed identities"
+                value={snapshot?.metrics.activeScimIdentities}
+                suffix={`active / ${snapshot?.metrics.humanEnterpriseMembers ?? '--'} human members`}
+              />
+            </div>
+            {organizationAccess.length > 0 && (
+              <details className="border-t border-border">
+                <summary className="px-4 py-3 text-xs font-medium text-accent cursor-pointer">
+                  Review organization access policy ({organizationAccess.length})
+                </summary>
+                <div className="border-t border-border">
+                  <p className="px-4 py-3 text-[11px] text-text-muted bg-surface">
+                    GitHub&apos;s organization 2FA requirement does not measure MFA enforced by an upstream
+                    identity provider. It is shown as GitHub evidence only and does not create a finding.
+                  </p>
+                  <div className="overflow-x-auto">
+                    <table className="w-full min-w-[980px] text-left">
+                      <thead className="bg-surface">
+                        <tr className="text-[10px] uppercase tracking-wide text-text-muted">
+                          <th className="px-4 py-2 font-medium">Organization</th>
+                          <th className="px-3 py-2 font-medium">Base permission</th>
+                          <th className="px-3 py-2 font-medium">Member repo creation</th>
+                          <th className="px-3 py-2 font-medium">Private forks</th>
+                          <th className="px-3 py-2 font-medium">GitHub 2FA</th>
+                          <th className="px-3 py-2 font-medium">Administrators</th>
+                          <th className="px-3 py-2 font-medium">Outside collaborators</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-border">
+                        {organizationAccess.map(organization => (
+                          <tr key={organization.organizationLogin} className="text-xs align-top">
+                            <td className="px-4 py-2.5 font-mono text-text-primary">
+                              {organization.organizationLogin}
+                            </td>
+                            <td className="px-3 py-2.5 text-text-secondary">
+                              {organization.defaultRepositoryPermission ?? '? Unavailable'}
+                            </td>
+                            <td className="px-3 py-2.5 text-text-secondary">
+                              <RepositoryCreationPolicy organization={organization} />
+                            </td>
+                            <td className="px-3 py-2.5">
+                              <EvidenceBoolean
+                                value={organization.membersCanForkPrivateRepositories}
+                                trueLabel="Allowed"
+                                falseLabel="✔ Blocked"
+                              />
+                            </td>
+                            <td className="px-3 py-2.5">
+                              <EvidenceBoolean
+                                value={organization.twoFactorRequirementEnabled}
+                                trueLabel="Required"
+                                falseLabel="Not required here"
+                              />
+                            </td>
+                            <td className="px-3 py-2.5 text-text-secondary">
+                              <IdentityList values={organization.adminLogins} emptyLabel="— None returned" />
+                            </td>
+                            <td className="px-3 py-2.5 text-text-secondary">
+                              <IdentityList
+                                values={organization.outsideCollaboratorLogins}
+                                emptyLabel="✔ None"
+                              />
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              </details>
+            )}
+            {repositoryAccess.length > 0 && (
+              <details className="border-t border-border">
+                <summary className="px-4 py-3 text-xs font-medium text-accent cursor-pointer">
+                  Review repository access paths ({repositoryAccess.length})
+                </summary>
+                <div className="overflow-x-auto border-t border-border">
+                  <table className="w-full min-w-[820px] text-left">
+                    <thead className="bg-surface">
+                      <tr className="text-[10px] uppercase tracking-wide text-text-muted">
+                        <th className="px-4 py-2 font-medium">Repository</th>
+                        <th className="px-3 py-2 font-medium">Direct grants</th>
+                        <th className="px-3 py-2 font-medium">Team grants</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-border">
+                      {repositoryAccess.map(repository => (
+                        <tr key={repository.nameWithOwner} className="text-xs align-top">
+                          <td className="px-4 py-2.5">
+                            <span className="font-mono text-text-primary">{repository.nameWithOwner}</span>
+                            {(repository.isArchived || repository.isFork) && (
+                              <span className="ml-2 text-[10px] text-text-muted">
+                                ({repository.isArchived ? 'Archived' : 'Fork'})
+                              </span>
+                            )}
+                          </td>
+                          <td className="px-3 py-2.5 text-text-secondary">
+                            <RepositoryDirectGrants grants={repository.directCollaborators} />
+                          </td>
+                          <td className="px-3 py-2.5 text-text-secondary">
+                            <RepositoryTeamGrants grants={repository.teamGrants} />
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </details>
+            )}
+            {scim && (
+              <details className="border-t border-border">
+                <summary className="px-4 py-3 text-xs font-medium text-accent cursor-pointer">
+                  Review managed-user provisioning ({scim.totalResults})
+                </summary>
+                <div className="overflow-x-auto border-t border-border">
+                  <table className="w-full min-w-[700px] text-left">
+                    <thead className="bg-surface">
+                      <tr className="text-[10px] uppercase tracking-wide text-text-muted">
+                        <th className="px-4 py-2 font-medium">SCIM identity</th>
+                        <th className="px-3 py-2 font-medium">Display name</th>
+                        <th className="px-3 py-2 font-medium">Provisioning state</th>
+                        <th className="px-3 py-2 font-medium">Roles</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-border">
+                      {scim.identities.map(identity => (
+                        <tr key={identity.scimId} className="text-xs">
+                          <td className="px-4 py-2.5 font-mono text-text-primary">{identity.userName}</td>
+                          <td className="px-3 py-2.5 text-text-secondary">{identity.displayName ?? '—'}</td>
+                          <td className="px-3 py-2.5">
+                            {identity.active
+                              ? <span className="font-medium text-success">✔ Active</span>
+                              : <span className="font-medium text-text-secondary">Inactive</span>}
+                          </td>
+                          <td className="px-3 py-2.5 text-text-secondary">
+                            {identity.roles.join(', ') || '— None reported'}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </details>
+            )}
+            {scimCollector?.status === 'failed' && (
+              <p className="border-t border-border px-4 py-3 text-xs text-text-muted">
+                Managed-user provisioning evidence was unavailable to this credential. No provisioning
+                finding was created.
+              </p>
+            )}
           </section>
 
           <section aria-labelledby="branch-governance-heading" className="border border-border bg-panel rounded-lg overflow-hidden">
@@ -959,6 +1178,116 @@ function ActionsPolicySignal({
       <p className="text-[11px] text-text-muted">{label}</p>
       <p className={`text-sm font-medium mt-1 ${valueClass}`}>{value ?? '? Not collected'}</p>
     </div>
+  );
+}
+
+function IdentityAccessSignal({
+  label,
+  value,
+  suffix,
+  caution = false,
+}: {
+  label: string;
+  value: number | undefined;
+  suffix: string;
+  caution?: boolean;
+}) {
+  return (
+    <div className="px-4 py-3 min-w-0">
+      <p className="text-[11px] text-text-muted">{label}</p>
+      <p className={`text-lg font-semibold mt-1 tabular-nums ${
+        caution ? 'text-warning' : value === undefined ? 'text-text-muted' : 'text-text-primary'
+      }`}>
+        {value === undefined ? '—' : value}
+      </p>
+      <p className="text-[10px] text-text-muted">
+        {caution ? '! Review · ' : ''}{suffix}
+      </p>
+    </div>
+  );
+}
+
+function RepositoryCreationPolicy({
+  organization,
+}: {
+  organization: AssessmentOrganizationAccess;
+}) {
+  const settings = [
+    ['public', organization.membersCanCreatePublicRepositories],
+    ['private', organization.membersCanCreatePrivateRepositories],
+    ['internal', organization.membersCanCreateInternalRepositories],
+  ] as const;
+  if (settings.every(([, value]) => value === null)) {
+    return <span className="text-text-muted">? Unavailable</span>;
+  }
+  const enabled = settings.filter(([, value]) => value === true).map(([label]) => label);
+  if (enabled.length === 0) return <span className="text-success">✔ Restricted</span>;
+  return (
+    <span className={organization.membersCanCreatePublicRepositories ? 'text-warning' : undefined}>
+      {organization.membersCanCreatePublicRepositories ? '! ' : ''}{enabled.join(', ')}
+    </span>
+  );
+}
+
+function EvidenceBoolean({
+  value,
+  trueLabel,
+  falseLabel,
+}: {
+  value: boolean | null;
+  trueLabel: string;
+  falseLabel: string;
+}) {
+  if (value === null) return <span className="text-text-muted">? Unavailable</span>;
+  return <span className="text-text-secondary">{value ? trueLabel : falseLabel}</span>;
+}
+
+function IdentityList({
+  values,
+  emptyLabel,
+}: {
+  values: string[] | null;
+  emptyLabel: string;
+}) {
+  if (values === null) return <span className="text-text-muted">? Unavailable</span>;
+  if (values.length === 0) return <span className="text-success">{emptyLabel}</span>;
+  return <span>{values.join(', ')}</span>;
+}
+
+function RepositoryDirectGrants({
+  grants,
+}: {
+  grants: AssessmentRepositoryAccess['directCollaborators'];
+}) {
+  if (grants === null) return <span className="text-text-muted">? Unavailable</span>;
+  if (grants.length === 0) return <span className="text-success">✔ None</span>;
+  return (
+    <span className="space-y-1">
+      {grants.map(grant => (
+        <span key={grant.login} className="block">
+          {grant.login} · {grant.permission}
+          {grant.permission === 'unknown' && ` (${grant.roleName})`}
+        </span>
+      ))}
+    </span>
+  );
+}
+
+function RepositoryTeamGrants({
+  grants,
+}: {
+  grants: AssessmentRepositoryAccess['teamGrants'];
+}) {
+  if (grants === null) return <span className="text-text-muted">? Unavailable</span>;
+  if (grants.length === 0) return <span className="text-text-muted">— None</span>;
+  return (
+    <span className="space-y-1">
+      {grants.map(grant => (
+        <span key={grant.slug} className="block">
+          {grant.name} · {grant.permission}
+        </span>
+      ))}
+    </span>
   );
 }
 

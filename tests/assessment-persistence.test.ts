@@ -30,7 +30,9 @@ test('persists and reloads repository security and Actions evidence', async () =
       durationMs: 100,
       organizationCollector: { id: 'collector-organizations', durationMs: 1 },
       identityCollector: { id: 'collector-identity', durationMs: 1 },
+      organizationAccessCollector: { id: 'collector-organization-access', durationMs: 1 },
       repositoryCollector: { id: 'collector-repositories', durationMs: 1 },
+      repositoryAccessCollector: { id: 'collector-repository-access', durationMs: 1 },
       teamCollector: { id: 'collector-teams', durationMs: 1 },
       securityCollector: { id: 'collector-security', durationMs: 1, error: null },
       repositorySecurityCollector: { id: 'collector-repository-security', durationMs: 1 },
@@ -40,6 +42,7 @@ test('persists and reloads repository security and Actions evidence', async () =
       actionsDepthCollector: { id: 'collector-actions-depth', durationMs: 1, error: null },
       copilotCollector: { id: 'collector-copilot', durationMs: 1, error: null },
       billingCollector: { id: 'collector-billing', durationMs: 1, error: null },
+      scimCollector: { id: 'collector-scim', durationMs: 1, error: null },
       organizations: [],
       members: [],
       ownerCount: 0,
@@ -47,6 +50,54 @@ test('persists and reloads repository security and Actions evidence', async () =
       repositoryFailures: [],
       teams: [],
       teamFailures: [],
+      organizationAccess: [{
+        organizationLogin: 'acme',
+        defaultRepositoryPermission: 'read',
+        membersCanCreateRepositories: true,
+        membersCanCreatePublicRepositories: false,
+        membersCanCreatePrivateRepositories: true,
+        membersCanCreateInternalRepositories: true,
+        membersCanForkPrivateRepositories: false,
+        twoFactorRequirementEnabled: false,
+        adminLogins: ['owner-one'],
+        outsideCollaboratorLogins: [],
+      }],
+      organizationAccessFailures: [{
+        organizationLogin: 'acme',
+        check: 'outside-collaborators',
+        error: 'Outside collaborators returned HTTP 403',
+      }],
+      repositoryAccess: [{
+        nameWithOwner: 'acme/repository',
+        visibility: 'PRIVATE',
+        isArchived: false,
+        isFork: false,
+        directCollaborators: [{
+          login: 'developer-one',
+          roleName: 'write',
+          permission: 'write',
+        }],
+        teamGrants: [{
+          slug: 'platform',
+          name: 'Platform',
+          permission: 'push',
+        }],
+      }],
+      repositoryAccessFailures: [{
+        nameWithOwner: 'acme/repository',
+        check: 'team-grants',
+        error: 'Team grants returned HTTP 403',
+      }],
+      scim: {
+        totalResults: 1,
+        identities: [{
+          scimId: 'scim-1',
+          userName: 'developer@example.com',
+          displayName: 'Developer One',
+          active: true,
+          roles: ['user'],
+        }],
+      },
       securityDefaults: [],
       repositorySecurity: [{
         nameWithOwner: 'acme/repository',
@@ -174,6 +225,44 @@ test('persists and reloads repository security and Actions evidence', async () =
 
     const snapshot = getAssessmentById('run-1');
     assert.ok(snapshot);
+    assert.deepEqual(snapshot.organizationAccess, [{
+      organizationLogin: 'acme',
+      defaultRepositoryPermission: 'read',
+      membersCanCreateRepositories: true,
+      membersCanCreatePublicRepositories: false,
+      membersCanCreatePrivateRepositories: true,
+      membersCanCreateInternalRepositories: true,
+      membersCanForkPrivateRepositories: false,
+      twoFactorRequirementEnabled: false,
+      adminLogins: ['owner-one'],
+      outsideCollaboratorLogins: [],
+    }]);
+    assert.deepEqual(snapshot.repositoryAccess, [{
+      nameWithOwner: 'acme/repository',
+      visibility: 'PRIVATE',
+      isArchived: false,
+      isFork: false,
+      directCollaborators: [{
+        login: 'developer-one',
+        roleName: 'write',
+        permission: 'write',
+      }],
+      teamGrants: [{
+        slug: 'platform',
+        name: 'Platform',
+        permission: 'push',
+      }],
+    }]);
+    assert.deepEqual(snapshot.scim, {
+      totalResults: 1,
+      identities: [{
+        scimId: 'scim-1',
+        userName: 'developer@example.com',
+        displayName: 'Developer One',
+        active: true,
+        roles: ['user'],
+      }],
+    });
     assert.deepEqual(snapshot.repositorySecurity, [{
       nameWithOwner: 'acme/repository',
       visibility: 'PRIVATE',

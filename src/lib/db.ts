@@ -9,6 +9,10 @@ import type {
   AssessmentBudget,
   AssessmentCopilotSeatInventory,
   AssessmentEvaluation,
+  AssessmentOrganizationAccess,
+  AssessmentOrganizationAccessFailure,
+  AssessmentRepositoryAccess,
+  AssessmentRepositoryAccessFailure,
   AssessmentRepositoryRules,
   AssessmentRepositoryRulesFailure,
   AssessmentRepositorySecurity,
@@ -16,6 +20,7 @@ import type {
   AssessmentRulesetDetail,
   AssessmentRulesetDetailFailure,
   AssessmentSecurityDefault,
+  AssessmentScimInventory,
 } from './assessment';
 
 const DB_PATH = path.join(process.cwd(), 'data', 'harness.db');
@@ -211,6 +216,85 @@ function initSchema(db: Database.Database) {
       name TEXT NOT NULL,
       privacy TEXT NOT NULL,
       PRIMARY KEY(run_id, organization_login, slug)
+    );
+
+    CREATE TABLE IF NOT EXISTS assessment_organization_access (
+      run_id TEXT NOT NULL REFERENCES assessment_runs(id) ON DELETE CASCADE,
+      organization_login TEXT NOT NULL,
+      default_repository_permission TEXT,
+      members_can_create_repositories INTEGER,
+      members_can_create_public_repositories INTEGER,
+      members_can_create_private_repositories INTEGER,
+      members_can_create_internal_repositories INTEGER,
+      members_can_fork_private_repositories INTEGER,
+      two_factor_requirement_enabled INTEGER,
+      admin_logins TEXT,
+      outside_collaborator_logins TEXT,
+      PRIMARY KEY(run_id, organization_login)
+    );
+
+    CREATE TABLE IF NOT EXISTS assessment_organization_access_failures (
+      run_id TEXT NOT NULL REFERENCES assessment_runs(id) ON DELETE CASCADE,
+      organization_login TEXT NOT NULL,
+      check_key TEXT NOT NULL,
+      error TEXT NOT NULL,
+      PRIMARY KEY(run_id, organization_login, check_key)
+    );
+
+    CREATE TABLE IF NOT EXISTS assessment_repository_access (
+      run_id TEXT NOT NULL REFERENCES assessment_runs(id) ON DELETE CASCADE,
+      name_with_owner TEXT NOT NULL,
+      visibility TEXT NOT NULL,
+      is_archived INTEGER NOT NULL DEFAULT 0,
+      is_fork INTEGER NOT NULL DEFAULT 0,
+      direct_collaborators_available INTEGER NOT NULL DEFAULT 0,
+      team_grants_available INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY(run_id, name_with_owner)
+    );
+
+    CREATE TABLE IF NOT EXISTS assessment_repository_direct_collaborators (
+      run_id TEXT NOT NULL,
+      name_with_owner TEXT NOT NULL,
+      login TEXT NOT NULL,
+      role_name TEXT NOT NULL,
+      permission TEXT NOT NULL,
+      PRIMARY KEY(run_id, name_with_owner, login),
+      FOREIGN KEY(run_id, name_with_owner)
+        REFERENCES assessment_repository_access(run_id, name_with_owner) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS assessment_repository_team_grants (
+      run_id TEXT NOT NULL,
+      name_with_owner TEXT NOT NULL,
+      team_slug TEXT NOT NULL,
+      team_name TEXT NOT NULL,
+      permission TEXT NOT NULL,
+      PRIMARY KEY(run_id, name_with_owner, team_slug),
+      FOREIGN KEY(run_id, name_with_owner)
+        REFERENCES assessment_repository_access(run_id, name_with_owner) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS assessment_repository_access_failures (
+      run_id TEXT NOT NULL REFERENCES assessment_runs(id) ON DELETE CASCADE,
+      name_with_owner TEXT NOT NULL,
+      check_key TEXT NOT NULL,
+      error TEXT NOT NULL,
+      PRIMARY KEY(run_id, name_with_owner, check_key)
+    );
+
+    CREATE TABLE IF NOT EXISTS assessment_scim_inventory (
+      run_id TEXT PRIMARY KEY REFERENCES assessment_runs(id) ON DELETE CASCADE,
+      total_results INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS assessment_scim_identities (
+      run_id TEXT NOT NULL REFERENCES assessment_runs(id) ON DELETE CASCADE,
+      scim_id TEXT NOT NULL,
+      user_name TEXT NOT NULL,
+      display_name TEXT,
+      active INTEGER NOT NULL,
+      roles TEXT NOT NULL,
+      PRIMARY KEY(run_id, scim_id)
     );
 
     CREATE TABLE IF NOT EXISTS assessment_findings (
@@ -886,7 +970,9 @@ export function completeAssessment(input: {
   durationMs: number;
   organizationCollector: { id: string; durationMs: number };
   identityCollector: { id: string; durationMs: number };
+  organizationAccessCollector: { id: string; durationMs: number };
   repositoryCollector: { id: string; durationMs: number };
+  repositoryAccessCollector: { id: string; durationMs: number };
   teamCollector: { id: string; durationMs: number };
   securityCollector: { id: string; durationMs: number; error: string | null };
   repositorySecurityCollector: { id: string; durationMs: number };
@@ -896,6 +982,7 @@ export function completeAssessment(input: {
   actionsDepthCollector: { id: string; durationMs: number; error: string | null };
   copilotCollector: { id: string; durationMs: number; error: string | null };
   billingCollector: { id: string; durationMs: number; error: string | null };
+  scimCollector: { id: string; durationMs: number; error: string | null };
   organizations: Array<{
     githubId: number;
     nodeId: string;
@@ -928,6 +1015,11 @@ export function completeAssessment(input: {
     privacy: string;
   }>;
   teamFailures: Array<{ organizationLogin: string; error: string }>;
+  organizationAccess: AssessmentOrganizationAccess[];
+  organizationAccessFailures: AssessmentOrganizationAccessFailure[];
+  repositoryAccess: AssessmentRepositoryAccess[];
+  repositoryAccessFailures: AssessmentRepositoryAccessFailure[];
+  scim: AssessmentScimInventory | null;
   securityDefaults: AssessmentSecurityDefault[] | null;
   repositorySecurity: AssessmentRepositorySecurity[];
   repositorySecurityFailures: AssessmentRepositorySecurityFailure[];
@@ -959,6 +1051,46 @@ export function completeAssessment(input: {
     INSERT INTO assessment_teams
       (run_id, github_id, node_id, organization_login, slug, name, privacy)
     VALUES (?, ?, ?, ?, ?, ?, ?)
+  `);
+  const insertOrganizationAccess = db.prepare(`
+    INSERT INTO assessment_organization_access
+      (run_id, organization_login, default_repository_permission,
+       members_can_create_repositories, members_can_create_public_repositories,
+       members_can_create_private_repositories, members_can_create_internal_repositories,
+       members_can_fork_private_repositories, two_factor_requirement_enabled,
+       admin_logins, outside_collaborator_logins)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  const insertOrganizationAccessFailure = db.prepare(`
+    INSERT INTO assessment_organization_access_failures
+      (run_id, organization_login, check_key, error)
+    VALUES (?, ?, ?, ?)
+  `);
+  const insertRepositoryAccess = db.prepare(`
+    INSERT INTO assessment_repository_access
+      (run_id, name_with_owner, visibility, is_archived, is_fork,
+       direct_collaborators_available, team_grants_available)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `);
+  const insertRepositoryDirectCollaborator = db.prepare(`
+    INSERT INTO assessment_repository_direct_collaborators
+      (run_id, name_with_owner, login, role_name, permission)
+    VALUES (?, ?, ?, ?, ?)
+  `);
+  const insertRepositoryTeamGrant = db.prepare(`
+    INSERT INTO assessment_repository_team_grants
+      (run_id, name_with_owner, team_slug, team_name, permission)
+    VALUES (?, ?, ?, ?, ?)
+  `);
+  const insertRepositoryAccessFailure = db.prepare(`
+    INSERT INTO assessment_repository_access_failures
+      (run_id, name_with_owner, check_key, error)
+    VALUES (?, ?, ?, ?)
+  `);
+  const insertScimIdentity = db.prepare(`
+    INSERT INTO assessment_scim_identities
+      (run_id, scim_id, user_name, display_name, active, roles)
+    VALUES (?, ?, ?, ?, ?, ?)
   `);
   const insertFinding = db.prepare(`
     INSERT INTO assessment_findings
@@ -1083,6 +1215,84 @@ export function completeAssessment(input: {
         team.name,
         team.privacy
       );
+    }
+    for (const organization of input.organizationAccess) {
+      insertOrganizationAccess.run(
+        input.runId,
+        organization.organizationLogin,
+        organization.defaultRepositoryPermission,
+        nullableBooleanToInteger(organization.membersCanCreateRepositories),
+        nullableBooleanToInteger(organization.membersCanCreatePublicRepositories),
+        nullableBooleanToInteger(organization.membersCanCreatePrivateRepositories),
+        nullableBooleanToInteger(organization.membersCanCreateInternalRepositories),
+        nullableBooleanToInteger(organization.membersCanForkPrivateRepositories),
+        nullableBooleanToInteger(organization.twoFactorRequirementEnabled),
+        organization.adminLogins === null ? null : JSON.stringify(organization.adminLogins),
+        organization.outsideCollaboratorLogins === null
+          ? null
+          : JSON.stringify(organization.outsideCollaboratorLogins)
+      );
+    }
+    for (const failure of input.organizationAccessFailures) {
+      insertOrganizationAccessFailure.run(
+        input.runId,
+        failure.organizationLogin,
+        failure.check,
+        failure.error
+      );
+    }
+    for (const repository of input.repositoryAccess) {
+      insertRepositoryAccess.run(
+        input.runId,
+        repository.nameWithOwner,
+        repository.visibility,
+        repository.isArchived ? 1 : 0,
+        repository.isFork ? 1 : 0,
+        repository.directCollaborators === null ? 0 : 1,
+        repository.teamGrants === null ? 0 : 1
+      );
+      for (const collaborator of repository.directCollaborators ?? []) {
+        insertRepositoryDirectCollaborator.run(
+          input.runId,
+          repository.nameWithOwner,
+          collaborator.login,
+          collaborator.roleName,
+          collaborator.permission
+        );
+      }
+      for (const team of repository.teamGrants ?? []) {
+        insertRepositoryTeamGrant.run(
+          input.runId,
+          repository.nameWithOwner,
+          team.slug,
+          team.name,
+          team.permission
+        );
+      }
+    }
+    for (const failure of input.repositoryAccessFailures) {
+      insertRepositoryAccessFailure.run(
+        input.runId,
+        failure.nameWithOwner,
+        failure.check,
+        failure.error
+      );
+    }
+    if (input.scim) {
+      db.prepare(`
+        INSERT INTO assessment_scim_inventory (run_id, total_results)
+        VALUES (?, ?)
+      `).run(input.runId, input.scim.totalResults);
+      for (const identity of input.scim.identities) {
+        insertScimIdentity.run(
+          input.runId,
+          identity.scimId,
+          identity.userName,
+          identity.displayName,
+          identity.active ? 1 : 0,
+          JSON.stringify(identity.roles)
+        );
+      }
     }
     db.prepare(`
       INSERT INTO assessment_metrics (run_id, metric_key, value)
@@ -1332,6 +1542,18 @@ export function completeAssessment(input: {
     db.prepare(`
       INSERT INTO assessment_collector_results
         (id, run_id, collector_key, status, item_count, duration_ms, error)
+      VALUES (?, ?, 'organizationAccess', ?, ?, ?, ?)
+    `).run(
+      input.organizationAccessCollector.id,
+      input.runId,
+      input.organizationAccessFailures.length > 0 ? 'partial' : 'completed',
+      input.organizationAccess.length,
+      input.organizationAccessCollector.durationMs,
+      formatOrganizationAccessFailures(input.organizationAccessFailures)
+    );
+    db.prepare(`
+      INSERT INTO assessment_collector_results
+        (id, run_id, collector_key, status, item_count, duration_ms, error)
       VALUES (?, ?, 'repositories', ?, ?, ?, ?)
     `).run(
       input.repositoryCollector.id,
@@ -1340,6 +1562,18 @@ export function completeAssessment(input: {
       input.repositories.length,
       input.repositoryCollector.durationMs,
       formatAssessmentFailures(input.repositoryFailures)
+    );
+    db.prepare(`
+      INSERT INTO assessment_collector_results
+        (id, run_id, collector_key, status, item_count, duration_ms, error)
+      VALUES (?, ?, 'repositoryAccess', ?, ?, ?, ?)
+    `).run(
+      input.repositoryAccessCollector.id,
+      input.runId,
+      input.repositoryAccessFailures.length > 0 ? 'partial' : 'completed',
+      input.repositoryAccess.length,
+      input.repositoryAccessCollector.durationMs,
+      formatRepositoryAccessFailures(input.repositoryAccessFailures)
     );
     db.prepare(`
       INSERT INTO assessment_collector_results
@@ -1462,6 +1696,18 @@ export function completeAssessment(input: {
       input.billingCollector.error
     );
     db.prepare(`
+      INSERT INTO assessment_collector_results
+        (id, run_id, collector_key, status, item_count, duration_ms, error)
+      VALUES (?, ?, 'scim', ?, ?, ?, ?)
+    `).run(
+      input.scimCollector.id,
+      input.runId,
+      input.scimCollector.error ? 'failed' : 'completed',
+      input.scim?.identities.length ?? 0,
+      input.scimCollector.durationMs,
+      input.scimCollector.error
+    );
+    db.prepare(`
       UPDATE assessment_runs
       SET status = 'completed', completed_at = datetime('now'), duration_ms = ?
       WHERE id = ?
@@ -1552,6 +1798,28 @@ function formatActionsFailures(
     .join('\n');
 }
 
+function formatOrganizationAccessFailures(
+  failures: AssessmentOrganizationAccessFailure[]
+): string | null {
+  if (failures.length === 0) return null;
+  return failures
+    .map(failure => (
+      `${failure.organizationLogin} [${failure.check}]: ${failure.error.replace(/\s+/g, ' ').trim()}`
+    ))
+    .join('\n');
+}
+
+function formatRepositoryAccessFailures(
+  failures: AssessmentRepositoryAccessFailure[]
+): string | null {
+  if (failures.length === 0) return null;
+  return failures
+    .map(failure => (
+      `${failure.nameWithOwner} [${failure.check}]: ${failure.error.replace(/\s+/g, ' ').trim()}`
+    ))
+    .join('\n');
+}
+
 export function getAssessmentById(runId: string) {
   const run = getDb().prepare('SELECT * FROM assessment_runs WHERE id = ?').get(runId) as AssessmentRunRow | undefined;
   return run ? getAssessmentSnapshot(run) : null;
@@ -1587,6 +1855,80 @@ function getAssessmentSnapshot(run: AssessmentRunRow) {
     summary: string;
     recommendation: string;
     affected_resources: string;
+  }>;
+  const organizationAccess = getDb().prepare(`
+    SELECT organization_login, default_repository_permission,
+      members_can_create_repositories, members_can_create_public_repositories,
+      members_can_create_private_repositories, members_can_create_internal_repositories,
+      members_can_fork_private_repositories, two_factor_requirement_enabled,
+      admin_logins, outside_collaborator_logins
+    FROM assessment_organization_access
+    WHERE run_id = ?
+    ORDER BY organization_login
+  `).all(run.id) as Array<{
+    organization_login: string;
+    default_repository_permission: string | null;
+    members_can_create_repositories: number | null;
+    members_can_create_public_repositories: number | null;
+    members_can_create_private_repositories: number | null;
+    members_can_create_internal_repositories: number | null;
+    members_can_fork_private_repositories: number | null;
+    two_factor_requirement_enabled: number | null;
+    admin_logins: string | null;
+    outside_collaborator_logins: string | null;
+  }>;
+  const repositoryAccess = getDb().prepare(`
+    SELECT name_with_owner, visibility, is_archived, is_fork,
+      direct_collaborators_available, team_grants_available
+    FROM assessment_repository_access
+    WHERE run_id = ?
+    ORDER BY name_with_owner
+  `).all(run.id) as Array<{
+    name_with_owner: string;
+    visibility: string;
+    is_archived: number;
+    is_fork: number;
+    direct_collaborators_available: number;
+    team_grants_available: number;
+  }>;
+  const directCollaborators = getDb().prepare(`
+    SELECT name_with_owner, login, role_name, permission
+    FROM assessment_repository_direct_collaborators
+    WHERE run_id = ?
+    ORDER BY name_with_owner, login
+  `).all(run.id) as Array<{
+    name_with_owner: string;
+    login: string;
+    role_name: string;
+    permission: 'admin' | 'maintain' | 'write' | 'triage' | 'read' | 'unknown';
+  }>;
+  const repositoryTeamGrants = getDb().prepare(`
+    SELECT name_with_owner, team_slug, team_name, permission
+    FROM assessment_repository_team_grants
+    WHERE run_id = ?
+    ORDER BY name_with_owner, team_slug
+  `).all(run.id) as Array<{
+    name_with_owner: string;
+    team_slug: string;
+    team_name: string;
+    permission: string;
+  }>;
+  const scimInventory = getDb().prepare(`
+    SELECT total_results
+    FROM assessment_scim_inventory
+    WHERE run_id = ?
+  `).get(run.id) as { total_results: number } | undefined;
+  const scimIdentities = getDb().prepare(`
+    SELECT scim_id, user_name, display_name, active, roles
+    FROM assessment_scim_identities
+    WHERE run_id = ?
+    ORDER BY user_name
+  `).all(run.id) as Array<{
+    scim_id: string;
+    user_name: string;
+    display_name: string | null;
+    active: number;
+    roles: string;
   }>;
   const repositorySecurity = getDb().prepare(`
     SELECT name_with_owner, visibility, is_archived, is_fork, default_branch, code_security,
@@ -1741,6 +2083,32 @@ function getAssessmentSnapshot(run: AssessmentRunRow) {
     bypassActorsByRuleset.set(actor.ruleset_id, actors);
   }
   const failedActionsChecks = new Set(actionsFailures.map(failure => failure.check_key));
+  const directCollaboratorsByRepository = new Map<
+    string,
+    NonNullable<AssessmentRepositoryAccess['directCollaborators']>
+  >();
+  for (const collaborator of directCollaborators) {
+    const entries = directCollaboratorsByRepository.get(collaborator.name_with_owner) ?? [];
+    entries.push({
+      login: collaborator.login,
+      roleName: collaborator.role_name,
+      permission: collaborator.permission,
+    });
+    directCollaboratorsByRepository.set(collaborator.name_with_owner, entries);
+  }
+  const teamGrantsByRepository = new Map<
+    string,
+    NonNullable<AssessmentRepositoryAccess['teamGrants']>
+  >();
+  for (const team of repositoryTeamGrants) {
+    const entries = teamGrantsByRepository.get(team.name_with_owner) ?? [];
+    entries.push({
+      slug: team.team_slug,
+      name: team.team_name,
+      permission: team.permission,
+    });
+    teamGrantsByRepository.set(team.name_with_owner, entries);
+  }
 
   return {
     id: run.id,
@@ -1752,6 +2120,50 @@ function getAssessmentSnapshot(run: AssessmentRunRow) {
     error: run.error,
     metrics: Object.fromEntries(metrics.map(metric => [metric.metric_key, metric.value])),
     collectors,
+    organizationAccess: organizationAccess.map(organization => ({
+      organizationLogin: organization.organization_login,
+      defaultRepositoryPermission: organization.default_repository_permission,
+      membersCanCreateRepositories:
+        nullableIntegerToBoolean(organization.members_can_create_repositories),
+      membersCanCreatePublicRepositories:
+        nullableIntegerToBoolean(organization.members_can_create_public_repositories),
+      membersCanCreatePrivateRepositories:
+        nullableIntegerToBoolean(organization.members_can_create_private_repositories),
+      membersCanCreateInternalRepositories:
+        nullableIntegerToBoolean(organization.members_can_create_internal_repositories),
+      membersCanForkPrivateRepositories:
+        nullableIntegerToBoolean(organization.members_can_fork_private_repositories),
+      twoFactorRequirementEnabled:
+        nullableIntegerToBoolean(organization.two_factor_requirement_enabled),
+      adminLogins: organization.admin_logins === null
+        ? null
+        : JSON.parse(organization.admin_logins) as string[],
+      outsideCollaboratorLogins: organization.outside_collaborator_logins === null
+        ? null
+        : JSON.parse(organization.outside_collaborator_logins) as string[],
+    })),
+    repositoryAccess: repositoryAccess.map(repository => ({
+      nameWithOwner: repository.name_with_owner,
+      visibility: repository.visibility,
+      isArchived: repository.is_archived === 1,
+      isFork: repository.is_fork === 1,
+      directCollaborators: repository.direct_collaborators_available === 1
+        ? directCollaboratorsByRepository.get(repository.name_with_owner) ?? []
+        : null,
+      teamGrants: repository.team_grants_available === 1
+        ? teamGrantsByRepository.get(repository.name_with_owner) ?? []
+        : null,
+    })),
+    scim: scimInventory ? {
+      totalResults: scimInventory.total_results,
+      identities: scimIdentities.map(identity => ({
+        scimId: identity.scim_id,
+        userName: identity.user_name,
+        displayName: identity.display_name,
+        active: identity.active === 1,
+        roles: JSON.parse(identity.roles) as string[],
+      })),
+    } : null,
     repositorySecurity: repositorySecurity.map(repository => ({
       nameWithOwner: repository.name_with_owner,
       visibility: repository.visibility,
