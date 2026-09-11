@@ -318,6 +318,11 @@ test('persists and reloads repository security and Actions evidence', async () =
       evaluation: {
         healthScore: 100,
         assessedDomainCount: 3,
+        domainScores: {
+          identity: 100,
+          repositories: 100,
+          security: 100,
+        },
         findings: [],
         metrics: {
           codeScanningDefaultSetupRepositories: 1,
@@ -427,6 +432,11 @@ test('persists and reloads repository security and Actions evidence', async () =
       ],
     }]);
     assert.equal(snapshot.metrics.codeScanningDefaultSetupRepositories, 1);
+    assert.deepEqual(snapshot.domainScores, {
+      identity: 100,
+      repositories: 100,
+      security: 100,
+    });
     assert.deepEqual(snapshot.actionsEvidence, {
       selectedActions: null,
       workflowPermissions: {
@@ -559,6 +569,34 @@ test('persists and reloads repository security and Actions evidence', async () =
       item_count: 1,
       duration_ms: 1,
       error: 'Repository acme/partial [99]: Ruleset detail returned HTTP 403',
+    });
+
+    createAssessmentRun('run-legacy', 'environment-1');
+    db.prepare(`
+      UPDATE assessment_runs
+      SET status = 'completed', completed_at = datetime('now'), duration_ms = 1
+      WHERE id = 'run-legacy'
+    `).run();
+    db.prepare(`
+      INSERT INTO assessment_metrics (run_id, metric_key, value)
+      VALUES
+        ('run-legacy', 'healthScore', 80),
+        ('run-legacy', 'assessedDomains', 2)
+    `).run();
+    db.prepare(`
+      INSERT INTO assessment_findings
+        (run_id, rule_key, domain, severity, title, summary, recommendation, affected_resources)
+      VALUES
+        ('run-legacy', 'legacy-repository-finding', 'repositories', 'high',
+         'Legacy repository finding', 'Legacy summary', 'Legacy recommendation', '[]')
+    `).run();
+
+    const legacySnapshot = getAssessmentById('run-legacy');
+    assert.ok(legacySnapshot);
+    assert.equal(legacySnapshot.metrics.healthScore, 90);
+    assert.deepEqual(legacySnapshot.domainScores, {
+      identity: 100,
+      repositories: 80,
     });
   } finally {
     closeDatabase?.();

@@ -1246,8 +1246,12 @@ test('evaluates evidence-backed identity and repository baseline findings', () =
     now: new Date('2026-09-10T00:00:00Z'),
   });
 
-  assert.equal(evaluation.healthScore, 65);
+  assert.equal(evaluation.healthScore, 83);
   assert.equal(evaluation.assessedDomainCount, 2);
+  assert.deepEqual(evaluation.domainScores, {
+    identity: 80,
+    repositories: 85,
+  });
   assert.deepEqual(
     evaluation.findings.map(finding => finding.ruleKey),
     [
@@ -1324,7 +1328,13 @@ test('evaluates enterprise security defaults and Actions policy', () => {
   });
 
   assert.equal(evaluation.assessedDomainCount, 4);
-  assert.equal(evaluation.healthScore, 70);
+  assert.equal(evaluation.healthScore, 93);
+  assert.deepEqual(evaluation.domainScores, {
+    identity: 100,
+    repositories: 100,
+    security: 90,
+    actions: 80,
+  });
   assert.deepEqual(
     evaluation.findings.map(finding => finding.ruleKey),
     [
@@ -1395,7 +1405,12 @@ test('evaluates workflow permissions and self-hosted runner trust boundaries', (
   });
 
   assert.equal(evaluation.assessedDomainCount, 3);
-  assert.equal(evaluation.healthScore, 5);
+  assert.equal(evaluation.healthScore, 68);
+  assert.deepEqual(evaluation.domainScores, {
+    identity: 100,
+    repositories: 100,
+    actions: 5,
+  });
   assert.deepEqual(
     evaluation.findings.map(finding => finding.ruleKey),
     [
@@ -1482,7 +1497,7 @@ test('evaluates measured repository security coverage without treating unknown s
   });
 
   assert.equal(evaluation.assessedDomainCount, 3);
-  assert.equal(evaluation.healthScore, 85);
+  assert.equal(evaluation.healthScore, 95);
   assert.deepEqual(evaluation.findings.map(finding => finding.ruleKey), [
     'repository-security-core-features-disabled',
     'repository-security-configuration-unassigned',
@@ -1571,7 +1586,7 @@ test('evaluates default branch controls without treating unknown or nonexistent 
     now: new Date('2026-09-10T00:00:00Z'),
   });
 
-  assert.equal(evaluation.healthScore, 55);
+  assert.equal(evaluation.healthScore, 78);
   assert.deepEqual(evaluation.findings.map(finding => finding.ruleKey), [
     'default-branch-protection-missing',
     'default-branch-review-controls-incomplete',
@@ -1656,7 +1671,7 @@ test('evaluates identity access without duplicating privileged outside-collabora
     now: new Date('2026-09-10T00:00:00Z'),
   });
 
-  assert.equal(evaluation.healthScore, 40);
+  assert.equal(evaluation.healthScore, 70);
   assert.deepEqual(evaluation.findings.map(finding => finding.ruleKey), [
     'organization-default-repository-write',
     'organization-public-repository-creation-enabled',
@@ -1724,7 +1739,7 @@ test('flags unconditional ruleset bypass while excluding pull-request-only and d
     now: new Date('2026-09-10T00:00:00Z'),
   });
 
-  assert.equal(evaluation.healthScore, 85);
+  assert.equal(evaluation.healthScore, 93);
   assert.deepEqual(evaluation.findings.map(finding => finding.ruleKey), [
     'ruleset-broad-unconditional-bypass',
     'ruleset-scoped-unconditional-bypass-review',
@@ -1862,7 +1877,7 @@ test('evaluates Copilot seat utilization and enterprise budget controls', () => 
   });
 
   assert.equal(evaluation.assessedDomainCount, 4);
-  assert.equal(evaluation.healthScore, 75);
+  assert.equal(evaluation.healthScore, 94);
   assert.deepEqual(
     evaluation.findings.map(finding => finding.ruleKey),
     [
@@ -1994,7 +2009,7 @@ test('evaluates Copilot policy and billing ownership depth conservatively', () =
   });
 
   assert.equal(evaluation.assessedDomainCount, 4);
-  assert.equal(evaluation.healthScore, 65);
+  assert.equal(evaluation.healthScore, 91);
   assert.deepEqual(evaluation.findings.map(finding => finding.ruleKey), [
     'copilot-assign-all-seat-management',
     'copilot-public-code-suggestions-review',

@@ -490,10 +490,18 @@ export interface AssessmentBillingEvidence {
 }
 
 export type AssessmentSeverity = 'critical' | 'high' | 'medium' | 'low';
+export type AssessmentDomain =
+  | 'identity'
+  | 'repositories'
+  | 'security'
+  | 'actions'
+  | 'copilot'
+  | 'billing';
+export type AssessmentDomainScores = Partial<Record<AssessmentDomain, number>>;
 
 export interface AssessmentFinding {
   ruleKey: string;
-  domain: 'identity' | 'repositories' | 'security' | 'actions' | 'copilot' | 'billing';
+  domain: AssessmentDomain;
   severity: AssessmentSeverity;
   title: string;
   summary: string;
@@ -504,6 +512,7 @@ export interface AssessmentFinding {
 export interface AssessmentEvaluation {
   healthScore: number;
   assessedDomainCount: number;
+  domainScores: AssessmentDomainScores;
   findings: AssessmentFinding[];
   metrics: Record<string, number>;
 }
@@ -609,6 +618,28 @@ const SEVERITY_IMPACT: Record<AssessmentSeverity, number> = {
   medium: 10,
   low: 5,
 };
+
+export function calculateAssessmentScores(
+  findings: ReadonlyArray<Pick<AssessmentFinding, 'domain' | 'severity'>>,
+  assessedDomains: readonly AssessmentDomain[]
+): { healthScore: number; domainScores: AssessmentDomainScores } {
+  const uniqueDomains = [...new Set(assessedDomains)];
+  const domainScores = Object.fromEntries(
+    uniqueDomains.map(domain => {
+      const deduction = findings
+        .filter(finding => finding.domain === domain)
+        .reduce((total, finding) => total + SEVERITY_IMPACT[finding.severity], 0);
+      return [domain, Math.max(0, 100 - deduction)];
+    })
+  ) as AssessmentDomainScores;
+  const healthScore = uniqueDomains.length === 0
+    ? 100
+    : Math.round(
+      uniqueDomains.reduce((total, domain) => total + (domainScores[domain] ?? 0), 0)
+        / uniqueDomains.length
+    );
+  return { healthScore, domainScores };
+}
 
 const SCIM_ROLE_LABELS: Readonly<Record<string, string>> = {
   user: 'User',
@@ -3411,18 +3442,17 @@ export function evaluateAssessmentBaseline(input: {
     }
   }
 
-  const healthScore = Math.max(
-    0,
-    100 - findings.reduce((total, finding) => total + SEVERITY_IMPACT[finding.severity], 0)
-  );
+  const assessedDomains: AssessmentDomain[] = ['identity', 'repositories'];
+  if (input.securityDefaults || input.repositorySecurity) assessedDomains.push('security');
+  if (input.actionsPolicy || input.actionsEvidence) assessedDomains.push('actions');
+  if (input.copilotSeats || input.copilotEvidence) assessedDomains.push('copilot');
+  if (input.budgets || input.billingEvidence) assessedDomains.push('billing');
+  const { healthScore, domainScores } = calculateAssessmentScores(findings, assessedDomains);
 
   return {
     healthScore,
-    assessedDomainCount: 2
-      + (input.securityDefaults || input.repositorySecurity ? 1 : 0)
-      + (input.actionsPolicy || input.actionsEvidence ? 1 : 0)
-      + (input.copilotSeats || input.copilotEvidence ? 1 : 0)
-      + (input.budgets || input.billingEvidence ? 1 : 0),
+    assessedDomainCount: assessedDomains.length,
+    domainScores,
     findings,
     metrics: {
       activeRepositories: activeRepositories.length,

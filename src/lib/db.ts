@@ -3,6 +3,7 @@ import path from 'path';
 import crypto from 'crypto';
 import fs from 'fs';
 import type { ImportedEndpoint } from './openapi-import';
+import { calculateAssessmentScores } from './assessment';
 import type {
   AssessmentActionsEvidence,
   AssessmentActionsPolicy,
@@ -10,7 +11,10 @@ import type {
   AssessmentBudget,
   AssessmentCopilotEvidence,
   AssessmentCopilotSeatInventory,
+  AssessmentDomain,
+  AssessmentDomainScores,
   AssessmentEvaluation,
+  AssessmentFinding,
   AssessmentOrganizationAccess,
   AssessmentOrganizationAccessFailure,
   AssessmentRepositoryAccess,
@@ -22,6 +26,7 @@ import type {
   AssessmentRulesetDetail,
   AssessmentRulesetDetailFailure,
   AssessmentSecurityDefault,
+  AssessmentSeverity,
   AssessmentScimInventory,
 } from './assessment';
 
@@ -1461,6 +1466,9 @@ export function completeAssessment(input: {
     insertMetric.run(input.runId, 'teams', input.teams.length);
     insertMetric.run(input.runId, 'healthScore', input.evaluation.healthScore);
     insertMetric.run(input.runId, 'assessedDomains', input.evaluation.assessedDomainCount);
+    for (const [domain, score] of Object.entries(input.evaluation.domainScores)) {
+      insertMetric.run(input.runId, `domainScore.${domain}`, score);
+    }
     for (const [metricKey, value] of Object.entries(input.evaluation.metrics)) {
       insertMetric.run(input.runId, metricKey, value);
     }
@@ -2169,8 +2177,8 @@ function getAssessmentSnapshot(run: AssessmentRunRow) {
       title
   `).all(run.id) as Array<{
     rule_key: string;
-    domain: string;
-    severity: string;
+    domain: AssessmentDomain;
+    severity: AssessmentSeverity;
     title: string;
     summary: string;
     recommendation: string;
@@ -2606,6 +2614,43 @@ function getAssessmentSnapshot(run: AssessmentRunRow) {
   const metricValues = Object.fromEntries(
     metrics.map(metric => [metric.metric_key, metric.value])
   ) as Record<string, number>;
+  const normalizedFindings: AssessmentFinding[] = findings.map(finding => ({
+    ruleKey: finding.rule_key,
+    domain: finding.domain,
+    severity: finding.severity,
+    title: finding.title,
+    summary: finding.summary,
+    recommendation: finding.recommendation,
+    affectedResources: JSON.parse(finding.affected_resources) as string[],
+  }));
+  const allDomains: AssessmentDomain[] = [
+    'identity',
+    'repositories',
+    'security',
+    'actions',
+    'copilot',
+    'billing',
+  ];
+  let assessedDomains = allDomains.filter(
+    domain => metricValues[`domainScore.${domain}`] !== undefined
+  );
+  if (assessedDomains.length === 0 && metricValues.healthScore !== undefined) {
+    assessedDomains = ['identity', 'repositories'];
+    const collectorHasEvidence = (...keys: string[]) => collectors.some(
+      collector => keys.includes(collector.collector_key) && collector.status !== 'failed'
+    );
+    if (collectorHasEvidence('security', 'repositorySecurity')) assessedDomains.push('security');
+    if (collectorHasEvidence('actions', 'actionsDepth')) assessedDomains.push('actions');
+    if (collectorHasEvidence('copilot', 'copilotDepth')) assessedDomains.push('copilot');
+    if (collectorHasEvidence('billing', 'billingDepth')) assessedDomains.push('billing');
+  }
+  const recalculatedScores = assessedDomains.length > 0
+    ? calculateAssessmentScores(normalizedFindings, assessedDomains)
+    : { healthScore: metricValues.healthScore ?? 100, domainScores: {} as AssessmentDomainScores };
+  if (metricValues.healthScore !== undefined) {
+    metricValues.healthScore = recalculatedScores.healthScore;
+    metricValues.assessedDomains = assessedDomains.length;
+  }
 
   return {
     id: run.id,
@@ -2616,6 +2661,7 @@ function getAssessmentSnapshot(run: AssessmentRunRow) {
     durationMs: run.duration_ms,
     error: run.error,
     metrics: metricValues,
+    domainScores: recalculatedScores.domainScores,
     collectors,
     organizationAccess: organizationAccess.map(organization => ({
       organizationLogin: organization.organization_login,
@@ -2885,14 +2931,6 @@ function getAssessmentSnapshot(run: AssessmentRunRow) {
         error: failure.error,
       })),
     } : null,
-    findings: findings.map(finding => ({
-      ruleKey: finding.rule_key,
-      domain: finding.domain,
-      severity: finding.severity,
-      title: finding.title,
-      summary: finding.summary,
-      recommendation: finding.recommendation,
-      affectedResources: JSON.parse(finding.affected_resources) as string[],
-    })),
+    findings: normalizedFindings,
   };
 }

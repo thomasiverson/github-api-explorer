@@ -72,6 +72,7 @@ interface AssessmentSnapshot {
   durationMs: number | null;
   error: string | null;
   metrics: Record<string, number>;
+  domainScores: Partial<Record<AssessmentDomainKey, number>>;
   collectors: AssessmentCollectorResult[];
   organizationAccess: AssessmentOrganizationAccess[];
   repositoryAccess: AssessmentRepositoryAccess[];
@@ -384,7 +385,7 @@ export default function AssessmentPage() {
                     {isLoading
                       ? 'Loading the latest snapshot...'
                       : baselineEvaluated
-                        ? 'Baseline score reflects only domains with completed evidence collection.'
+                        ? 'Baseline score is the equal-weight average of domains with completed evidence collection.'
                         : snapshot?.status === 'completed'
                           ? 'Inventory collected. Run again to evaluate the baseline rules.'
                           : 'No completed assessment snapshot exists for this environment.'}
@@ -401,7 +402,7 @@ export default function AssessmentPage() {
                       <div className={`text-3xl font-semibold ${baselineEvaluated ? 'text-text-primary' : 'text-text-muted'}`}>
                         {baselineEvaluated ? baselineScore : '--'}
                       </div>
-                      <div className="text-[10px] uppercase text-text-muted">Baseline</div>
+                      <div className="text-[10px] uppercase text-text-muted">Domain average</div>
                     </div>
                   </div>
                 </div>
@@ -437,11 +438,11 @@ export default function AssessmentPage() {
                     ? `${completedCollectors} completed${partialCollectors.length ? `, ${partialCollectors.length} partial` : ''}${failedCollectors.length ? `, ${failedCollectors.length} failed` : ''}`
                     : 'Not run'}
                 />
-                <StatusRow label="Rule profile" value="Enterprise baseline" />
+                <StatusRow label="Rule profile" value="Equal-weight domains" />
               </div>
               <div className="mt-5 pt-4 border-t border-border">
                 <p className="text-xs text-text-secondary">
-                  Scores start at 100 and deduct 30, 20, 10, or 5 points for each critical, high, medium, or low baseline finding.
+                  Each assessed domain starts at 100 and deducts 30, 20, 10, or 5 points for each critical, high, medium, or low finding. Domain scores stop at zero, and the displayed score is their rounded average.
                 </p>
               </div>
             </aside>
@@ -466,6 +467,28 @@ export default function AssessmentPage() {
                   </p>
                   <p className="text-[11px] text-text-muted mt-2">{metric.description}</p>
                 </div>
+                );
+              })}
+            </div>
+          </section>
+
+          <section aria-labelledby="domains-heading" className="border border-border bg-panel rounded-lg overflow-hidden">
+            <div className="px-4 py-3 border-b border-border">
+              <h2 id="domains-heading" className="text-sm font-semibold text-text-primary">Assessment domains</h2>
+              <p className="text-xs text-text-muted mt-0.5">Each assessed domain contributes equally to the overall score; collection coverage remains separate.</p>
+            </div>
+            <div className="divide-y divide-border">
+              {ASSESSMENT_DOMAINS.map(domain => {
+                const score = snapshot?.domainScores?.[domain.key];
+                return (
+                  <div key={domain.name} className="px-4 py-3 grid gap-2 sm:grid-cols-[190px_1fr_120px_80px] sm:items-center">
+                    <span className="text-sm font-medium text-text-primary">{domain.name}</span>
+                    <span className="text-xs text-text-secondary">{domain.detail}</span>
+                    <span className="text-xs text-text-muted sm:text-right">{domainStatuses[domain.key]}</span>
+                    <span className="text-xs font-medium tabular-nums text-text-primary sm:text-right">
+                      {score === undefined ? '—' : `${score} / 100`}
+                    </span>
+                  </div>
                 );
               })}
             </div>
@@ -1550,26 +1573,10 @@ export default function AssessmentPage() {
             )}
           </section>
 
-          <section aria-labelledby="domains-heading" className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_360px]">
+          <section aria-labelledby="findings-heading">
             <div className="border border-border bg-panel rounded-lg overflow-hidden">
               <div className="px-4 py-3 border-b border-border">
-                <h2 id="domains-heading" className="text-sm font-semibold text-text-primary">Assessment domains</h2>
-                <p className="text-xs text-text-muted mt-0.5">Health is scored by domain with collection coverage shown separately.</p>
-              </div>
-              <div className="divide-y divide-border">
-                {ASSESSMENT_DOMAINS.map(domain => (
-                  <div key={domain.name} className="px-4 py-3 grid gap-2 sm:grid-cols-[190px_1fr_100px] sm:items-center">
-                    <span className="text-sm font-medium text-text-primary">{domain.name}</span>
-                    <span className="text-xs text-text-secondary">{domain.detail}</span>
-                    <span className="text-xs text-text-muted sm:text-right">{domainStatuses[domain.key]}</span>
-                  </div>
-                ))}
-              </div>
-            </div>
-
-            <div className="border border-border bg-panel rounded-lg overflow-hidden">
-              <div className="px-4 py-3 border-b border-border">
-                <h2 className="text-sm font-semibold text-text-primary">Priority findings</h2>
+                <h2 id="findings-heading" className="text-sm font-semibold text-text-primary">Priority findings</h2>
                 <p className="text-xs text-text-muted mt-0.5">Highest-impact issues requiring attention.</p>
               </div>
               {findings.length > 0 ? (
