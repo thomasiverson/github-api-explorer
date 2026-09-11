@@ -10,6 +10,7 @@ import {
   type AssessmentBudget,
   type AssessmentCopilotEvidence,
   type AssessmentCopilotSeatInventory,
+  type AssessmentFinding,
   type AssessmentOrganizationAccess,
   type AssessmentRepositoryAccess,
   type AssessmentRepositoryRules,
@@ -86,16 +87,6 @@ interface AssessmentSnapshot {
   budgets: AssessmentBudget[] | null;
   billingEvidence: AssessmentBillingEvidence | null;
   findings: AssessmentFinding[];
-}
-
-interface AssessmentFinding {
-  ruleKey: string;
-  domain: AssessmentDomainKey;
-  severity: 'critical' | 'high' | 'medium' | 'low';
-  title: string;
-  summary: string;
-  recommendation: string;
-  affectedResources: string[];
 }
 
 export default function AssessmentPage() {
@@ -1582,30 +1573,13 @@ export default function AssessmentPage() {
               {findings.length > 0 ? (
                 <div className="divide-y divide-border">
                   {findings.map(finding => (
-                    <article key={finding.ruleKey} className="p-4">
-                      <div className="flex items-start justify-between gap-3">
-                        <h3 className="text-sm font-medium text-text-primary">{finding.title}</h3>
-                        <span className={`shrink-0 text-[10px] font-semibold uppercase ${severityClass(finding.severity)}`}>
-                          {finding.severity}
-                        </span>
-                      </div>
-                      <p className="text-xs text-text-secondary mt-2">{finding.summary}</p>
-                      <p className="text-xs text-text-primary mt-2">
-                        <span className="font-medium">Next step:</span> {finding.recommendation}
-                      </p>
-                      {finding.affectedResources.length > 0 && (
-                        <details className="mt-2">
-                          <summary className="text-xs text-accent cursor-pointer">
-                            {finding.affectedResources.length} affected {finding.affectedResources.length === 1 ? 'resource' : 'resources'}
-                          </summary>
-                          <ul className="mt-2 space-y-1 max-h-28 overflow-y-auto">
-                            {finding.affectedResources.map(resource => (
-                              <li key={resource} className="text-[11px] font-mono text-text-muted break-all">{resource}</li>
-                            ))}
-                          </ul>
-                        </details>
-                      )}
-                    </article>
+                    <FindingDrillDown
+                      key={finding.ruleKey}
+                      finding={finding}
+                      collectors={snapshot?.collectors ?? []}
+                      completedAt={snapshot?.completedAt ?? null}
+                      runId={snapshot?.id ?? null}
+                    />
                   ))}
                 </div>
               ) : (
@@ -1629,6 +1603,163 @@ export default function AssessmentPage() {
         </div>
       </main>
     </div>
+  );
+}
+
+function FindingDrillDown({
+  finding,
+  collectors,
+  completedAt,
+  runId,
+}: {
+  finding: AssessmentFinding;
+  collectors: AssessmentCollectorResult[];
+  completedAt: string | null;
+  runId: string | null;
+}) {
+  const domain = ASSESSMENT_DOMAINS.find(candidate => candidate.key === finding.domain);
+  const evidenceSources = finding.evidenceSources ?? [];
+  const expectedState = finding.expectedState
+    || 'Run the assessment again to attach the expected baseline to this historical finding.';
+
+  return (
+    <article className="px-4 py-3">
+      <details className="group">
+        <summary className="list-none cursor-pointer rounded-md focus:outline-none focus-visible:ring-2 focus-visible:ring-accent">
+          <span className="flex items-start justify-between gap-3">
+            <span className="text-sm font-medium text-text-primary">{finding.title}</span>
+            <span className={`shrink-0 text-[10px] font-semibold uppercase ${severityClass(finding.severity)}`}>
+              {finding.severity}
+            </span>
+          </span>
+          <span className="mt-2 block text-xs text-text-secondary">{finding.summary}</span>
+          <span className="mt-3 flex items-center justify-between gap-3 text-xs">
+            <span className="inline-flex items-center gap-1.5 font-medium text-accent">
+              <span className="group-open:hidden">Review evidence</span>
+              <span className="hidden group-open:inline">Hide evidence</span>
+              <svg
+                width="12"
+                height="12"
+                viewBox="0 0 16 16"
+                fill="currentColor"
+                className="transition-transform group-open:rotate-180"
+                aria-hidden="true"
+              >
+                <path d="M3.22 5.97a.75.75 0 0 1 1.06 0L8 9.69l3.72-3.72a.75.75 0 1 1 1.06 1.06l-4.25 4.25a.75.75 0 0 1-1.06 0L3.22 7.03a.75.75 0 0 1 0-1.06Z" />
+              </svg>
+            </span>
+            <span className="text-text-muted">{domain?.name ?? finding.domain}</span>
+          </span>
+        </summary>
+
+        <div className="mt-4 border-t border-border pt-4">
+          <div className="grid gap-3 lg:grid-cols-2">
+            <div className="rounded-md border border-border bg-surface px-3 py-3">
+              <p className="text-[10px] font-semibold uppercase tracking-wide text-text-muted">
+                Observed state
+              </p>
+              <p className="mt-1.5 text-xs text-text-primary">{finding.summary}</p>
+            </div>
+            <div className="rounded-md border border-border bg-surface px-3 py-3">
+              <p className="text-[10px] font-semibold uppercase tracking-wide text-text-muted">
+                Expected baseline
+              </p>
+              <p className="mt-1.5 text-xs text-text-primary">{expectedState}</p>
+            </div>
+          </div>
+
+          <div className="mt-3 rounded-md border border-border">
+            <div className="border-b border-border px-3 py-2">
+              <h4 className="text-xs font-semibold text-text-primary">Evidence trail</h4>
+            </div>
+            {evidenceSources.length > 0 ? (
+              <ul className="divide-y divide-border">
+                {evidenceSources.map(source => {
+                  const collector = collectors.find(
+                    candidate => candidate.collector_key === source.collectorKey
+                  );
+                  return (
+                    <li key={`${source.collectorKey}:${source.endpoint}`} className="px-3 py-2.5">
+                      <div className="flex flex-wrap items-start justify-between gap-x-4 gap-y-1">
+                        <div className="min-w-0">
+                          <p className="text-xs font-medium text-text-primary">{source.label}</p>
+                          <p className="mt-0.5 break-all font-mono text-[10px] text-text-muted">
+                            {source.endpoint}
+                          </p>
+                        </div>
+                        <CollectorEvidenceStatus collector={collector} />
+                      </div>
+                    </li>
+                  );
+                })}
+              </ul>
+            ) : (
+              <p className="px-3 py-3 text-xs text-text-muted">
+                This historical rule does not include collector metadata.
+              </p>
+            )}
+          </div>
+
+          <div className="mt-3 grid gap-3 lg:grid-cols-2">
+            <div>
+              <h4 className="text-xs font-semibold text-text-primary">Affected scope</h4>
+              {finding.affectedResources.length > 0 ? (
+                <>
+                  <p className="mt-1 text-[11px] text-text-muted">
+                    {finding.affectedResources.length} affected {finding.affectedResources.length === 1 ? 'resource' : 'resources'}
+                  </p>
+                  <ul className="mt-2 max-h-36 space-y-1 overflow-y-auto rounded-md border border-border bg-surface px-3 py-2">
+                    {finding.affectedResources.map(resource => (
+                      <li key={resource} className="break-all font-mono text-[11px] text-text-secondary">
+                        {resource}
+                      </li>
+                    ))}
+                  </ul>
+                </>
+              ) : (
+                <p className="mt-1 text-xs text-text-secondary">
+                  Enterprise-wide setting; no individual resource list applies.
+                </p>
+              )}
+            </div>
+            <div>
+              <h4 className="text-xs font-semibold text-text-primary">Recommended action</h4>
+              <p className="mt-1 text-xs text-text-secondary">{finding.recommendation}</p>
+            </div>
+          </div>
+
+          <p className="mt-4 border-t border-border pt-3 text-[10px] text-text-muted">
+            Collected {formatAssessmentDate(completedAt)}
+            {runId ? ` in assessment ${runId}` : ''}
+          </p>
+        </div>
+      </details>
+    </article>
+  );
+}
+
+function CollectorEvidenceStatus({
+  collector,
+}: {
+  collector: AssessmentCollectorResult | undefined;
+}) {
+  if (!collector) {
+    return <span className="shrink-0 text-[11px] text-text-muted">? Not recorded</span>;
+  }
+  if (collector.status === 'failed') {
+    return <span className="shrink-0 text-[11px] font-medium text-danger">✘ Failed</span>;
+  }
+  if (collector.status === 'partial') {
+    return (
+      <span className="shrink-0 text-right text-[11px] font-medium text-warning">
+        ! Partial · {collector.item_count.toLocaleString()} records
+      </span>
+    );
+  }
+  return (
+    <span className="shrink-0 text-right text-[11px] font-medium text-success">
+      ✔ Complete · {collector.item_count.toLocaleString()} records · {collector.duration_ms.toLocaleString()} ms
+    </span>
   );
 }
 

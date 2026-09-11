@@ -3,7 +3,7 @@ import path from 'path';
 import crypto from 'crypto';
 import fs from 'fs';
 import type { ImportedEndpoint } from './openapi-import';
-import { calculateAssessmentScores } from './assessment';
+import { calculateAssessmentScores, getAssessmentFindingEvidence } from './assessment';
 import type {
   AssessmentActionsEvidence,
   AssessmentActionsPolicy,
@@ -313,6 +313,8 @@ function initSchema(db: Database.Database) {
       summary TEXT NOT NULL,
       recommendation TEXT NOT NULL,
       affected_resources TEXT NOT NULL DEFAULT '[]',
+      expected_state TEXT NOT NULL DEFAULT '',
+      evidence_sources TEXT NOT NULL DEFAULT '[]',
       PRIMARY KEY(run_id, rule_key)
     );
 
@@ -620,6 +622,15 @@ function initSchema(db: Database.Database) {
   ).all() as Array<{ name: string }>;
   if (!budgetColumns.some(column => column.name === 'alert_recipients')) {
     db.exec("ALTER TABLE assessment_budgets ADD COLUMN alert_recipients TEXT NOT NULL DEFAULT '[]'");
+  }
+  const findingColumns = db.prepare(
+    'PRAGMA table_info(assessment_findings)'
+  ).all() as Array<{ name: string }>;
+  if (!findingColumns.some(column => column.name === 'expected_state')) {
+    db.exec("ALTER TABLE assessment_findings ADD COLUMN expected_state TEXT NOT NULL DEFAULT ''");
+  }
+  if (!findingColumns.some(column => column.name === 'evidence_sources')) {
+    db.exec("ALTER TABLE assessment_findings ADD COLUMN evidence_sources TEXT NOT NULL DEFAULT '[]'");
   }
 }
 
@@ -1213,8 +1224,9 @@ export function completeAssessment(input: {
   `);
   const insertFinding = db.prepare(`
     INSERT INTO assessment_findings
-      (run_id, rule_key, domain, severity, title, summary, recommendation, affected_resources)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      (run_id, rule_key, domain, severity, title, summary, recommendation, affected_resources,
+       expected_state, evidence_sources)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const insertSecurityDefault = db.prepare(`
     INSERT INTO assessment_security_defaults
@@ -1481,7 +1493,9 @@ export function completeAssessment(input: {
         finding.title,
         finding.summary,
         finding.recommendation,
-        JSON.stringify(finding.affectedResources)
+        JSON.stringify(finding.affectedResources),
+        finding.expectedState,
+        JSON.stringify(finding.evidenceSources)
       );
     }
     for (const securityDefault of input.securityDefaults || []) {
@@ -2164,7 +2178,8 @@ function getAssessmentSnapshot(run: AssessmentRunRow) {
     error: string | null;
   }>;
   const findings = getDb().prepare(`
-    SELECT rule_key, domain, severity, title, summary, recommendation, affected_resources
+    SELECT rule_key, domain, severity, title, summary, recommendation, affected_resources,
+      expected_state, evidence_sources
     FROM assessment_findings
     WHERE run_id = ?
     ORDER BY
@@ -2183,6 +2198,8 @@ function getAssessmentSnapshot(run: AssessmentRunRow) {
     summary: string;
     recommendation: string;
     affected_resources: string;
+    expected_state: string;
+    evidence_sources: string;
   }>;
   const organizationAccess = getDb().prepare(`
     SELECT organization_login, default_repository_permission,
@@ -2614,15 +2631,25 @@ function getAssessmentSnapshot(run: AssessmentRunRow) {
   const metricValues = Object.fromEntries(
     metrics.map(metric => [metric.metric_key, metric.value])
   ) as Record<string, number>;
-  const normalizedFindings: AssessmentFinding[] = findings.map(finding => ({
-    ruleKey: finding.rule_key,
-    domain: finding.domain,
-    severity: finding.severity,
-    title: finding.title,
-    summary: finding.summary,
-    recommendation: finding.recommendation,
-    affectedResources: JSON.parse(finding.affected_resources) as string[],
-  }));
+  const normalizedFindings: AssessmentFinding[] = findings.map(finding => {
+    const fallbackEvidence = getAssessmentFindingEvidence(finding.rule_key);
+    const evidenceSources = JSON.parse(
+      finding.evidence_sources
+    ) as AssessmentFinding['evidenceSources'];
+    return {
+      ruleKey: finding.rule_key,
+      domain: finding.domain,
+      severity: finding.severity,
+      title: finding.title,
+      summary: finding.summary,
+      recommendation: finding.recommendation,
+      affectedResources: JSON.parse(finding.affected_resources) as string[],
+      expectedState: finding.expected_state || fallbackEvidence.expectedState,
+      evidenceSources: evidenceSources.length > 0
+        ? evidenceSources
+        : fallbackEvidence.evidenceSources,
+    };
+  });
   const allDomains: AssessmentDomain[] = [
     'identity',
     'repositories',

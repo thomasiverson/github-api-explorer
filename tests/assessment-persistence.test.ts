@@ -316,14 +316,28 @@ test('persists and reloads repository security and Actions evidence', async () =
         }],
       },
       evaluation: {
-        healthScore: 100,
+        healthScore: 98,
         assessedDomainCount: 3,
         domainScores: {
           identity: 100,
           repositories: 100,
-          security: 100,
+          security: 95,
         },
-        findings: [],
+        findings: [{
+          ruleKey: 'persisted-evidence-test',
+          domain: 'security',
+          severity: 'low',
+          title: 'Persisted evidence finding',
+          summary: 'Observed state persisted with the assessment.',
+          recommendation: 'Review the persisted evidence.',
+          affectedResources: ['acme/repository'],
+          expectedState: 'Expected state persisted with the assessment.',
+          evidenceSources: [{
+            collectorKey: 'repositorySecurity',
+            label: 'Persisted evidence source',
+            endpoint: 'REST GET /repos/{owner}/{repo}',
+          }],
+        }],
         metrics: {
           codeScanningDefaultSetupRepositories: 1,
           eligibleSecurityRepositories: 1,
@@ -435,8 +449,23 @@ test('persists and reloads repository security and Actions evidence', async () =
     assert.deepEqual(snapshot.domainScores, {
       identity: 100,
       repositories: 100,
-      security: 100,
+      security: 95,
     });
+    assert.deepEqual(snapshot.findings, [{
+      ruleKey: 'persisted-evidence-test',
+      domain: 'security',
+      severity: 'low',
+      title: 'Persisted evidence finding',
+      summary: 'Observed state persisted with the assessment.',
+      recommendation: 'Review the persisted evidence.',
+      affectedResources: ['acme/repository'],
+      expectedState: 'Expected state persisted with the assessment.',
+      evidenceSources: [{
+        collectorKey: 'repositorySecurity',
+        label: 'Persisted evidence source',
+        endpoint: 'REST GET /repos/{owner}/{repo}',
+      }],
+    }]);
     assert.deepEqual(snapshot.actionsEvidence, {
       selectedActions: null,
       workflowPermissions: {
@@ -587,7 +616,7 @@ test('persists and reloads repository security and Actions evidence', async () =
       INSERT INTO assessment_findings
         (run_id, rule_key, domain, severity, title, summary, recommendation, affected_resources)
       VALUES
-        ('run-legacy', 'legacy-repository-finding', 'repositories', 'high',
+        ('run-legacy', 'default-branch-protection-missing', 'repositories', 'high',
          'Legacy repository finding', 'Legacy summary', 'Legacy recommendation', '[]')
     `).run();
 
@@ -598,6 +627,15 @@ test('persists and reloads repository security and Actions evidence', async () =
       identity: 100,
       repositories: 80,
     });
+    assert.equal(
+      legacySnapshot.findings[0].expectedState,
+      'Every existing default branch is protected by active ruleset rules or classic branch protection.'
+    );
+    assert.deepEqual(legacySnapshot.findings[0].evidenceSources, [{
+      collectorKey: 'repositoryRules',
+      label: 'Effective default-branch controls',
+      endpoint: 'REST GET /repos/{owner}/{repo}/rules/branches/{branch} and /branches/{branch}/protection',
+    }]);
   } finally {
     closeDatabase?.();
     process.chdir(originalWorkingDirectory);

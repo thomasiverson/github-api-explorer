@@ -499,6 +499,12 @@ export type AssessmentDomain =
   | 'billing';
 export type AssessmentDomainScores = Partial<Record<AssessmentDomain, number>>;
 
+export interface AssessmentFindingEvidenceSource {
+  collectorKey: string;
+  label: string;
+  endpoint: string;
+}
+
 export interface AssessmentFinding {
   ruleKey: string;
   domain: AssessmentDomain;
@@ -507,6 +513,8 @@ export interface AssessmentFinding {
   summary: string;
   recommendation: string;
   affectedResources: string[];
+  expectedState: string;
+  evidenceSources: AssessmentFindingEvidenceSource[];
 }
 
 export interface AssessmentEvaluation {
@@ -618,6 +626,288 @@ const SEVERITY_IMPACT: Record<AssessmentSeverity, number> = {
   medium: 10,
   low: 5,
 };
+
+const EVIDENCE_SOURCES = {
+  identity: {
+    collectorKey: 'identity',
+    label: 'Enterprise member and owner inventory',
+    endpoint: 'GraphQL Enterprise.members',
+  },
+  repositories: {
+    collectorKey: 'repositories',
+    label: 'Organization repository inventory',
+    endpoint: 'GraphQL Organization.repositories',
+  },
+  organizationAccess: {
+    collectorKey: 'organizationAccess',
+    label: 'Organization access settings and collaborators',
+    endpoint: 'REST GET /orgs/{org}, /orgs/{org}/members, and /orgs/{org}/outside_collaborators',
+  },
+  repositoryAccess: {
+    collectorKey: 'repositoryAccess',
+    label: 'Repository collaborators and team grants',
+    endpoint: 'REST GET /repos/{owner}/{repo}/collaborators and /repos/{owner}/{repo}/teams',
+  },
+  repositoryRules: {
+    collectorKey: 'repositoryRules',
+    label: 'Effective default-branch controls',
+    endpoint: 'REST GET /repos/{owner}/{repo}/rules/branches/{branch} and /branches/{branch}/protection',
+  },
+  rulesetDetails: {
+    collectorKey: 'rulesetDetails',
+    label: 'Active ruleset details and bypass actors',
+    endpoint: 'REST GET enterprise, organization, and repository ruleset details',
+  },
+  securityDefaults: {
+    collectorKey: 'security',
+    label: 'Enterprise security configuration defaults',
+    endpoint: 'REST GET /enterprises/{enterprise}/code-security/configurations/defaults',
+  },
+  repositorySecurity: {
+    collectorKey: 'repositorySecurity',
+    label: 'Repository security features and configuration',
+    endpoint: 'REST repository, code-scanning, vulnerability-alert, and code-security-configuration APIs',
+  },
+  actionsPolicy: {
+    collectorKey: 'actions',
+    label: 'Enterprise Actions policy',
+    endpoint: 'REST GET /enterprises/{enterprise}/actions/permissions',
+  },
+  actionsSelected: {
+    collectorKey: 'actionsDepth',
+    label: 'Selected Actions allow list',
+    endpoint: 'REST GET /enterprises/{enterprise}/actions/permissions/selected-actions',
+  },
+  actionsWorkflow: {
+    collectorKey: 'actionsDepth',
+    label: 'Workflow token policy',
+    endpoint: 'REST GET /enterprises/{enterprise}/actions/permissions/workflow',
+  },
+  actionsForks: {
+    collectorKey: 'actionsDepth',
+    label: 'Private-fork workflow policy',
+    endpoint: 'REST GET /enterprises/{enterprise}/actions/permissions/fork-pr-workflows-private-repos',
+  },
+  actionsRunners: {
+    collectorKey: 'actionsDepth',
+    label: 'Enterprise runner groups and self-hosted runners',
+    endpoint: 'REST GET /enterprises/{enterprise}/actions/runner-groups and /actions/runners',
+  },
+  copilotSeats: {
+    collectorKey: 'copilot',
+    label: 'Enterprise Copilot seat activity',
+    endpoint: 'REST GET /enterprises/{enterprise}/copilot/billing/seats',
+  },
+  copilotOrganization: {
+    collectorKey: 'copilotDepth',
+    label: 'Organization Copilot policy',
+    endpoint: 'REST GET /orgs/{org}/copilot/billing',
+  },
+  copilotCodingAgent: {
+    collectorKey: 'copilotDepth',
+    label: 'Copilot coding-agent repository policy',
+    endpoint: 'REST GET /orgs/{org}/copilot/coding-agent/permissions',
+  },
+  budgets: {
+    collectorKey: 'billing',
+    label: 'Enterprise budget inventory',
+    endpoint: 'REST GET /enterprises/{enterprise}/settings/billing/budgets',
+  },
+  costCenters: {
+    collectorKey: 'billingDepth',
+    label: 'Active cost centers and assigned resources',
+    endpoint: 'REST GET /enterprises/{enterprise}/settings/billing/cost-centers',
+  },
+} satisfies Record<string, AssessmentFindingEvidenceSource>;
+
+interface AssessmentFindingEvidenceDefinition {
+  expectedState: string;
+  evidenceSources: AssessmentFindingEvidenceSource[];
+}
+
+const FINDING_EVIDENCE_DEFINITIONS: Record<string, AssessmentFindingEvidenceDefinition> = {
+  'enterprise-owner-inventory-empty': {
+    expectedState: 'At least two active enterprise owners are discoverable to the assessment credential.',
+    evidenceSources: [EVIDENCE_SOURCES.identity],
+  },
+  'enterprise-owner-single-point-of-failure': {
+    expectedState: 'At least two separately managed, active enterprise owners are assigned.',
+    evidenceSources: [EVIDENCE_SOURCES.identity],
+  },
+  'organization-default-repository-admin': {
+    expectedState: 'Organization base repository permission is read or none.',
+    evidenceSources: [EVIDENCE_SOURCES.organizationAccess],
+  },
+  'organization-default-repository-write': {
+    expectedState: 'Organization base repository permission is read or none.',
+    evidenceSources: [EVIDENCE_SOURCES.organizationAccess],
+  },
+  'organization-public-repository-creation-enabled': {
+    expectedState: 'Public repository creation is restricted or governed by a documented disclosure review.',
+    evidenceSources: [EVIDENCE_SOURCES.organizationAccess],
+  },
+  'outside-collaborator-review': {
+    expectedState: 'Every outside collaborator has a current sponsor, limited access, and a periodic review date.',
+    evidenceSources: [EVIDENCE_SOURCES.organizationAccess],
+  },
+  'outside-collaborator-privileged-repository-access': {
+    expectedState: 'Outside collaborators do not hold direct administrator or maintain repository access.',
+    evidenceSources: [EVIDENCE_SOURCES.organizationAccess, EVIDENCE_SOURCES.repositoryAccess],
+  },
+  'direct-privileged-repository-access': {
+    expectedState: 'Durable administrator and maintain access is granted through governed teams.',
+    evidenceSources: [EVIDENCE_SOURCES.repositoryAccess],
+  },
+  'direct-write-repository-access-review': {
+    expectedState: 'Durable write access is granted through governed teams rather than direct user grants.',
+    evidenceSources: [EVIDENCE_SOURCES.repositoryAccess],
+  },
+  'stale-active-repositories': {
+    expectedState: `Active repositories are updated within ${STALE_REPOSITORY_DAYS} days or have documented ownership and retention.`,
+    evidenceSources: [EVIDENCE_SOURCES.repositories],
+  },
+  'public-repository-review': {
+    expectedState: 'Every public repository has an active owner and documented approval for public disclosure.',
+    evidenceSources: [EVIDENCE_SOURCES.repositories],
+  },
+  'default-branch-protection-missing': {
+    expectedState: 'Every existing default branch is protected by active ruleset rules or classic branch protection.',
+    evidenceSources: [EVIDENCE_SOURCES.repositoryRules],
+  },
+  'default-branch-review-controls-incomplete': {
+    expectedState: 'Protected default branches require pull requests and at least one approving review.',
+    evidenceSources: [EVIDENCE_SOURCES.repositoryRules],
+  },
+  'default-branch-status-checks-missing': {
+    expectedState: 'Protected default branches require trusted build, test, and security status checks.',
+    evidenceSources: [EVIDENCE_SOURCES.repositoryRules],
+  },
+  'default-branch-history-controls-incomplete': {
+    expectedState: 'Protected default branches block force pushes and branch deletion.',
+    evidenceSources: [EVIDENCE_SOURCES.repositoryRules],
+  },
+  'ruleset-broad-unconditional-bypass': {
+    expectedState: 'Active rulesets do not grant broad roles an always or exempt bypass.',
+    evidenceSources: [EVIDENCE_SOURCES.rulesetDetails],
+  },
+  'ruleset-scoped-unconditional-bypass-review': {
+    expectedState: 'Every unconditional principal exception has a current business need and named owner.',
+    evidenceSources: [EVIDENCE_SOURCES.rulesetDetails],
+  },
+  'security-defaults-missing': {
+    expectedState: 'An enterprise code security configuration is the default for new repositories.',
+    evidenceSources: [EVIDENCE_SOURCES.securityDefaults],
+  },
+  'security-defaults-incomplete-visibility-coverage': {
+    expectedState: 'Default security configurations cover new public, private, and internal repositories.',
+    evidenceSources: [EVIDENCE_SOURCES.securityDefaults],
+  },
+  'security-defaults-core-features-disabled': {
+    expectedState: 'Default configurations enable dependency graph, Dependabot alerts, code scanning, secret scanning, and push protection.',
+    evidenceSources: [EVIDENCE_SOURCES.securityDefaults],
+  },
+  'repository-security-core-features-disabled': {
+    expectedState: 'Applicable core repository security features are enabled or covered by a documented exception.',
+    evidenceSources: [EVIDENCE_SOURCES.repositorySecurity],
+  },
+  'repository-security-configuration-unassigned': {
+    expectedState: 'Active non-fork repositories are governed by an approved code security configuration.',
+    evidenceSources: [EVIDENCE_SOURCES.repositorySecurity],
+  },
+  'actions-unrestricted-sources': {
+    expectedState: 'Actions are limited to enterprise-owned or explicitly approved sources.',
+    evidenceSources: [EVIDENCE_SOURCES.actionsPolicy],
+  },
+  'actions-sha-pinning-not-required': {
+    expectedState: 'Workflow dependencies are required to use full-length immutable commit SHA references.',
+    evidenceSources: [EVIDENCE_SOURCES.actionsPolicy],
+  },
+  'actions-selected-policy-broad-patterns': {
+    expectedState: 'The selected Actions allow list contains only explicitly approved, scoped patterns.',
+    evidenceSources: [EVIDENCE_SOURCES.actionsSelected],
+  },
+  'actions-default-workflow-write-permissions': {
+    expectedState: 'The default GITHUB_TOKEN permission is read, with write scopes granted explicitly.',
+    evidenceSources: [EVIDENCE_SOURCES.actionsWorkflow],
+  },
+  'actions-workflows-can-approve-pull-requests': {
+    expectedState: 'Workflows cannot approve pull requests unless a documented automation exception requires it.',
+    evidenceSources: [EVIDENCE_SOURCES.actionsWorkflow],
+  },
+  'actions-private-fork-workflows-receive-privileged-data': {
+    expectedState: 'Private-fork workflows do not receive write tokens, secrets, or variables.',
+    evidenceSources: [EVIDENCE_SOURCES.actionsForks],
+  },
+  'actions-private-fork-workflows-run-without-approval': {
+    expectedState: 'Private-fork pull-request workflows require approval before they run.',
+    evidenceSources: [EVIDENCE_SOURCES.actionsForks],
+  },
+  'actions-runner-groups-allow-public-repositories': {
+    expectedState: 'Self-hosted runner groups do not accept jobs from public repositories.',
+    evidenceSources: [EVIDENCE_SOURCES.actionsRunners],
+  },
+  'actions-runner-groups-broadly-accessible': {
+    expectedState: 'Runner groups are limited to approved organizations and trusted reusable workflows.',
+    evidenceSources: [EVIDENCE_SOURCES.actionsRunners],
+  },
+  'actions-self-hosted-runners-offline': {
+    expectedState: 'Persistent registered runners are online and monitored, or removed when retired.',
+    evidenceSources: [EVIDENCE_SOURCES.actionsRunners],
+  },
+  'copilot-inactive-seats': {
+    expectedState: `Billed Copilot seats show activity within ${COPILOT_ACTIVITY_DAYS} days after the adoption window or have a documented retention need.`,
+    evidenceSources: [EVIDENCE_SOURCES.copilotSeats],
+  },
+  'copilot-assign-all-seat-management': {
+    expectedState: 'Universal Copilot seat assignment is explicitly approved and periodically reviewed for cost effectiveness.',
+    evidenceSources: [EVIDENCE_SOURCES.copilotOrganization],
+  },
+  'copilot-public-code-suggestions-review': {
+    expectedState: 'The public-code suggestion policy matches documented legal and engineering guidance.',
+    evidenceSources: [EVIDENCE_SOURCES.copilotOrganization],
+  },
+  'copilot-coding-agent-all-repositories': {
+    expectedState: 'Coding-agent access is limited to approved repositories or universal access is explicitly accepted.',
+    evidenceSources: [EVIDENCE_SOURCES.copilotCodingAgent],
+  },
+  'billing-budgets-missing': {
+    expectedState: 'Material metered products and user populations have intentional budget controls.',
+    evidenceSources: [EVIDENCE_SOURCES.budgets],
+  },
+  'billing-budget-enforcement-disabled': {
+    expectedState: 'Budgets prevent further usage at the limit or have a documented exception.',
+    evidenceSources: [EVIDENCE_SOURCES.budgets],
+  },
+  'billing-budget-alerting-disabled': {
+    expectedState: 'Shared budgets that require advance notice have alerting enabled.',
+    evidenceSources: [EVIDENCE_SOURCES.budgets],
+  },
+  'billing-budget-alert-recipients-missing': {
+    expectedState: 'Every shared alerting budget has at least one accountable recipient.',
+    evidenceSources: [EVIDENCE_SOURCES.budgets],
+  },
+  'billing-empty-active-cost-centers': {
+    expectedState: 'Every active cost center has its intended users, teams, organizations, or repositories assigned.',
+    evidenceSources: [EVIDENCE_SOURCES.costCenters],
+  },
+  'billing-budget-cost-center-not-found': {
+    expectedState: 'Every cost-center budget references a cost center in the active inventory.',
+    evidenceSources: [EVIDENCE_SOURCES.budgets, EVIDENCE_SOURCES.costCenters],
+  },
+};
+
+const DEFAULT_FINDING_EXPECTED_STATE =
+  'The observed condition is resolved or retained as a documented, approved exception.';
+
+export function getAssessmentFindingEvidence(
+  ruleKey: string
+): AssessmentFindingEvidenceDefinition {
+  const definition = FINDING_EVIDENCE_DEFINITIONS[ruleKey];
+  return {
+    expectedState: definition?.expectedState ?? DEFAULT_FINDING_EXPECTED_STATE,
+    evidenceSources: (definition?.evidenceSources ?? []).map(source => ({ ...source })),
+  };
+}
 
 export function calculateAssessmentScores(
   findings: ReadonlyArray<Pick<AssessmentFinding, 'domain' | 'severity'>>,
@@ -2458,7 +2748,7 @@ export function evaluateAssessmentBaseline(input: {
   billingEvidence?: AssessmentBillingEvidence | null;
   now?: Date;
 }): AssessmentEvaluation {
-  const findings: AssessmentFinding[] = [];
+  const findings: Array<Omit<AssessmentFinding, 'expectedState' | 'evidenceSources'>> = [];
   const now = input.now ?? new Date();
   const staleThreshold = now.getTime() - STALE_REPOSITORY_DAYS * 24 * 60 * 60 * 1000;
   const activeRepositories = input.repositories.filter(repository => !repository.isArchived);
@@ -3447,13 +3737,20 @@ export function evaluateAssessmentBaseline(input: {
   if (input.actionsPolicy || input.actionsEvidence) assessedDomains.push('actions');
   if (input.copilotSeats || input.copilotEvidence) assessedDomains.push('copilot');
   if (input.budgets || input.billingEvidence) assessedDomains.push('billing');
-  const { healthScore, domainScores } = calculateAssessmentScores(findings, assessedDomains);
+  const detailedFindings = findings.map(finding => ({
+    ...finding,
+    ...getAssessmentFindingEvidence(finding.ruleKey),
+  }));
+  const { healthScore, domainScores } = calculateAssessmentScores(
+    detailedFindings,
+    assessedDomains
+  );
 
   return {
     healthScore,
     assessedDomainCount: assessedDomains.length,
     domainScores,
-    findings,
+    findings: detailedFindings,
     metrics: {
       activeRepositories: activeRepositories.length,
       archivedRepositories: input.repositories.filter(repository => repository.isArchived).length,

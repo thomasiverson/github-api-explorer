@@ -1260,6 +1260,15 @@ test('evaluates evidence-backed identity and repository baseline findings', () =
       'public-repository-review',
     ]
   );
+  assert.equal(
+    evaluation.findings[0].expectedState,
+    'At least two separately managed, active enterprise owners are assigned.'
+  );
+  assert.deepEqual(evaluation.findings[0].evidenceSources, [{
+    collectorKey: 'identity',
+    label: 'Enterprise member and owner inventory',
+    endpoint: 'GraphQL Enterprise.members',
+  }]);
   assert.deepEqual(evaluation.metrics, {
     activeRepositories: 1,
     archivedRepositories: 1,
