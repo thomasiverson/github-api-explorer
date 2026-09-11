@@ -41,7 +41,9 @@ test('persists and reloads repository security and Actions evidence', async () =
       actionsCollector: { id: 'collector-actions', durationMs: 1, error: null },
       actionsDepthCollector: { id: 'collector-actions-depth', durationMs: 1, error: null },
       copilotCollector: { id: 'collector-copilot', durationMs: 1, error: null },
+      copilotDepthCollector: { id: 'collector-copilot-depth', durationMs: 1, error: null },
       billingCollector: { id: 'collector-billing', durationMs: 1, error: null },
+      billingDepthCollector: { id: 'collector-billing-depth', durationMs: 1, error: null },
       scimCollector: { id: 'collector-scim', durationMs: 1, error: null },
       organizations: [],
       members: [],
@@ -208,8 +210,111 @@ test('persists and reloads repository security and Actions evidence', async () =
           error: 'Selected Actions policy returned HTTP 403',
         }],
       },
-      copilotSeats: null,
-      budgets: null,
+      copilotSeats: {
+        totalSeats: 1,
+        rawAssignmentCount: 1,
+        seats: [{
+          login: 'developer-one',
+          planType: 'enterprise',
+          createdAt: '2026-01-01T00:00:00Z',
+          lastAuthenticatedAt: '2026-09-01T00:00:00Z',
+          lastActivityAt: '2026-09-09T00:00:00Z',
+          lastActivityEditor: 'vscode',
+          pendingCancellationDate: null,
+          assignmentCount: 1,
+          assignmentSources: [{
+            organization: 'acme',
+            team: 'platform',
+            teamType: 'organization',
+          }],
+        }],
+      },
+      copilotEvidence: {
+        contentExclusionRuleCount: 2,
+        organizations: [{
+          organizationLogin: 'acme',
+          seatTotal: 1,
+          seatsAddedThisCycle: 0,
+          seatsPendingCancellation: 0,
+          seatsPendingInvitation: 0,
+          activeSeatsThisCycle: 1,
+          inactiveSeatsThisCycle: 0,
+          planType: 'enterprise',
+          seatManagementSetting: 'assign_selected',
+          publicCodeSuggestions: 'block',
+          ideChat: 'enabled',
+          platformChat: 'enabled',
+          cli: 'disabled',
+          codingAgentRepositoryScope: 'selected',
+        }],
+        failures: [{
+          scope: 'acme',
+          check: 'coding-agent',
+          error: 'Coding agent returned HTTP 403',
+        }],
+      },
+      budgets: [{
+        id: 'budget-1',
+        budgetType: 'ProductPricing',
+        productSku: 'ai_credits',
+        scope: 'enterprise',
+        amount: 1000,
+        consumedAmount: 25,
+        preventsFurtherUsage: true,
+        alertingEnabled: true,
+        alertRecipientCount: 1,
+        alertRecipients: ['owner-one'],
+        entityName: 'acme',
+        user: null,
+        expiresAt: null,
+      }],
+      billingEvidence: {
+        costCenters: [{
+          id: 'center-1',
+          name: 'Engineering',
+          state: 'active',
+          azureSubscription: null,
+          aiCreditPoolEnabled: false,
+          aiCreditPoolTargetAmount: null,
+          aiCreditPoolCurrentAmount: null,
+          resources: [{ type: 'User', name: 'developer-one' }],
+        }],
+        effectiveBudgets: [{
+          user: 'developer-one',
+          budgetId: 'budget-1',
+          amount: 1000,
+          consumedAmount: 25,
+          applicableBudgetIds: ['budget-1'],
+        }],
+        multiUserBudgetStates: [{
+          budgetId: 'budget-1',
+          user: 'developer-one',
+          consumedAmount: 25,
+          targetAmount: 1000,
+          overrideBudgetId: null,
+        }],
+        usage: {
+          year: 2026,
+          month: 9,
+          day: null,
+          items: [{
+            product: 'Copilot',
+            sku: 'copilot_ai_unit',
+            unitType: 'ai-units',
+            grossQuantity: 3,
+            grossAmount: 3,
+            discountQuantity: 1,
+            discountAmount: 1,
+            netQuantity: 2,
+            netAmount: 2,
+          }],
+        },
+        failures: [{
+          scope: 'Research',
+          check: 'cost-center-resources',
+          error: 'Cost center returned HTTP 403',
+        }],
+      },
       evaluation: {
         healthScore: 100,
         assessedDomainCount: 3,
@@ -219,6 +324,8 @@ test('persists and reloads repository security and Actions evidence', async () =
           eligibleSecurityRepositories: 1,
           runnerGroupCount: 1,
           selfHostedRunnerCount: 1,
+          copilotSeats: 1,
+          budgets: 1,
         },
       },
     });
@@ -360,6 +467,45 @@ test('persists and reloads repository security and Actions evidence', async () =
         error: 'Selected Actions policy returned HTTP 403',
       }],
     });
+    assert.deepEqual(snapshot.copilotSeats, {
+      totalSeats: 1,
+      rawAssignmentCount: 1,
+      seats: [{
+        login: 'developer-one',
+        planType: 'enterprise',
+        createdAt: '2026-01-01T00:00:00Z',
+        lastAuthenticatedAt: '2026-09-01T00:00:00Z',
+        lastActivityAt: '2026-09-09T00:00:00Z',
+        lastActivityEditor: 'vscode',
+        pendingCancellationDate: null,
+        assignmentCount: 1,
+        assignmentSources: [{
+          organization: 'acme',
+          team: 'platform',
+          teamType: 'organization',
+        }],
+      }],
+    });
+    assert.equal(snapshot.copilotEvidence?.contentExclusionRuleCount, 2);
+    assert.equal(snapshot.copilotEvidence?.organizations[0].codingAgentRepositoryScope, 'selected');
+    assert.deepEqual(snapshot.copilotEvidence?.failures, [{
+      scope: 'acme',
+      check: 'coding-agent',
+      error: 'Coding agent returned HTTP 403',
+    }]);
+    assert.deepEqual(snapshot.budgets?.[0].alertRecipients, ['owner-one']);
+    assert.deepEqual(snapshot.billingEvidence?.costCenters[0].resources, [{
+      type: 'User',
+      name: 'developer-one',
+    }]);
+    assert.equal(snapshot.billingEvidence?.effectiveBudgets[0].budgetId, 'budget-1');
+    assert.equal(snapshot.billingEvidence?.multiUserBudgetStates[0].targetAmount, 1000);
+    assert.equal(snapshot.billingEvidence?.usage?.items[0].netAmount, 2);
+    assert.deepEqual(snapshot.billingEvidence?.failures, [{
+      scope: 'Research',
+      check: 'cost-center-resources',
+      error: 'Cost center returned HTTP 403',
+    }]);
     assert.deepEqual(snapshot.collectors.find(
       collector => collector.collector_key === 'repositorySecurity'
     ), {
@@ -377,6 +523,24 @@ test('persists and reloads repository security and Actions evidence', async () =
       item_count: 5,
       duration_ms: 1,
       error: 'selected-actions: Selected Actions policy returned HTTP 403',
+    });
+    assert.deepEqual(snapshot.collectors.find(
+      collector => collector.collector_key === 'copilotDepth'
+    ), {
+      collector_key: 'copilotDepth',
+      status: 'partial',
+      item_count: 3,
+      duration_ms: 1,
+      error: 'acme [coding-agent]: Coding agent returned HTTP 403',
+    });
+    assert.deepEqual(snapshot.collectors.find(
+      collector => collector.collector_key === 'billingDepth'
+    ), {
+      collector_key: 'billingDepth',
+      status: 'partial',
+      item_count: 4,
+      duration_ms: 1,
+      error: 'Research [cost-center-resources]: Cost center returned HTTP 403',
     });
     assert.deepEqual(snapshot.collectors.find(
       collector => collector.collector_key === 'repositoryRules'

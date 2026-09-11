@@ -4,6 +4,8 @@ import { createOctokit } from '@/lib/auth';
 import {
   collectEnterpriseActionsEvidence,
   collectEnterpriseActionsPolicy,
+  collectBillingGovernance,
+  collectCopilotGovernance,
   collectEnterpriseBudgets,
   collectEnterpriseCopilotSeats,
   collectEnterpriseIdentity,
@@ -78,7 +80,9 @@ export async function POST(request: Request) {
   const actionsCollectorId = uuidv4();
   const actionsDepthCollectorId = uuidv4();
   const copilotCollectorId = uuidv4();
+  const copilotDepthCollectorId = uuidv4();
   const billingCollectorId = uuidv4();
+  const billingDepthCollectorId = uuidv4();
   const scimCollectorId = uuidv4();
   const collectorIds = {
     organizations: organizationCollectorId,
@@ -382,6 +386,35 @@ export async function POST(request: Request) {
         )
       ).data)
     ));
+    const copilotDepthResult = await collectOptionalEvidence(() => (
+      collectCopilotGovernance({
+        getContentExclusion: () => requestWithStatus(() => octokit.request(
+          'GET /enterprises/{enterprise}/copilot/content_exclusion',
+          {
+            enterprise: environment.enterprise_slug,
+            headers: { 'X-GitHub-Api-Version': '2026-03-10' },
+          }
+        )),
+        getOrganizationSettings: organizationLogin => requestWithStatus(
+          () => octokit.request(
+            'GET /orgs/{org}/copilot/billing',
+            {
+              org: organizationLogin,
+              headers: { 'X-GitHub-Api-Version': '2026-03-10' },
+            }
+          )
+        ),
+        getCodingAgentPermissions: organizationLogin => requestWithStatus(
+          () => octokit.request(
+            'GET /orgs/{org}/copilot/coding-agent/permissions',
+            {
+              org: organizationLogin,
+              headers: { 'X-GitHub-Api-Version': '2026-03-10' },
+            }
+          )
+        ),
+      }, organizationLogins)
+    ));
     const billingResult = await collectOptionalEvidence(() => (
       collectEnterpriseBudgets(async (page, perPage) => (
         await octokit.request(
@@ -394,6 +427,64 @@ export async function POST(request: Request) {
           }
         )
       ).data)
+    ));
+    const humanMemberLogins = identity.members
+      .map(member => member.login)
+      .filter(login => login.toLowerCase() !== `${environment.enterprise_slug}_admin`.toLowerCase());
+    const billingDepthResult = await collectOptionalEvidence(() => (
+      collectBillingGovernance({
+        getCostCenters: () => requestWithStatus(() => octokit.request(
+          'GET /enterprises/{enterprise}/settings/billing/cost-centers',
+          {
+            enterprise: environment.enterprise_slug,
+            state: 'active',
+            headers: { 'X-GitHub-Api-Version': '2026-03-10' },
+          }
+        )),
+        getCostCenter: (costCenterId, page, perPage) => requestWithStatus(
+          () => octokit.request(
+            'GET /enterprises/{enterprise}/settings/billing/cost-centers/{cost_center_id}',
+            {
+              enterprise: environment.enterprise_slug,
+              cost_center_id: costCenterId,
+              page,
+              per_page: perPage,
+              headers: { 'X-GitHub-Api-Version': '2026-03-10' },
+            }
+          )
+        ),
+        getEffectiveBudget: (user, page, perPage) => requestWithStatus(
+          () => octokit.request(
+            'GET /enterprises/{enterprise}/settings/billing/budgets',
+            {
+              enterprise: environment.enterprise_slug,
+              user,
+              page,
+              per_page: perPage,
+              headers: { 'X-GitHub-Api-Version': '2026-03-10' },
+            }
+          )
+        ),
+        getBudgetUserStates: (budgetId, page, perPage) => requestWithStatus(
+          () => octokit.request(
+            'GET /enterprises/{enterprise}/settings/billing/budgets/{budget_id}/user-states',
+            {
+              enterprise: environment.enterprise_slug,
+              budget_id: budgetId,
+              page,
+              per_page: perPage,
+              headers: { 'X-GitHub-Api-Version': '2026-03-10' },
+            }
+          )
+        ),
+        getUsageSummary: () => requestWithStatus(() => octokit.request(
+          'GET /enterprises/{enterprise}/settings/billing/usage/summary',
+          {
+            enterprise: environment.enterprise_slug,
+            headers: { 'X-GitHub-Api-Version': '2026-03-10' },
+          }
+        )),
+      }, billingResult.value ?? [], humanMemberLogins)
     ));
     const scimResult = await collectOptionalEvidence(() => (
       collectEnterpriseScim((startIndex, count) => requestWithStatus(
@@ -425,7 +516,9 @@ export async function POST(request: Request) {
       actionsPolicy: actionsResult.value,
       actionsEvidence: actionsDepthResult.value,
       copilotSeats: copilotResult.value,
+      copilotEvidence: copilotDepthResult.value,
       budgets: billingResult.value,
+      billingEvidence: billingDepthResult.value,
     });
     const durationMs = Math.round(performance.now() - startedAt);
     completeAssessment({
@@ -487,10 +580,20 @@ export async function POST(request: Request) {
         durationMs: copilotResult.durationMs,
         error: copilotResult.error,
       },
+      copilotDepthCollector: {
+        id: copilotDepthCollectorId,
+        durationMs: copilotDepthResult.durationMs,
+        error: copilotDepthResult.error,
+      },
       billingCollector: {
         id: billingCollectorId,
         durationMs: billingResult.durationMs,
         error: billingResult.error,
+      },
+      billingDepthCollector: {
+        id: billingDepthCollectorId,
+        durationMs: billingDepthResult.durationMs,
+        error: billingDepthResult.error,
       },
       scimCollector: {
         id: scimCollectorId,
@@ -507,7 +610,9 @@ export async function POST(request: Request) {
       actionsPolicy: actionsResult.value,
       actionsEvidence: actionsDepthResult.value,
       copilotSeats: copilotResult.value,
+      copilotEvidence: copilotDepthResult.value,
       budgets: billingResult.value,
+      billingEvidence: billingDepthResult.value,
       evaluation,
     });
     return NextResponse.json(getAssessmentById(runId), { status: 201 });

@@ -6,7 +6,9 @@ import type { ImportedEndpoint } from './openapi-import';
 import type {
   AssessmentActionsEvidence,
   AssessmentActionsPolicy,
+  AssessmentBillingEvidence,
   AssessmentBudget,
+  AssessmentCopilotEvidence,
   AssessmentCopilotSeatInventory,
   AssessmentEvaluation,
   AssessmentOrganizationAccess,
@@ -471,9 +473,43 @@ function initSchema(db: Database.Database) {
       created_at TEXT NOT NULL,
       last_authenticated_at TEXT,
       last_activity_at TEXT,
+      last_activity_editor TEXT,
       pending_cancellation_date TEXT,
       assignment_count INTEGER NOT NULL DEFAULT 1,
+      assignment_sources TEXT NOT NULL DEFAULT '[]',
       PRIMARY KEY(run_id, login)
+    );
+
+    CREATE TABLE IF NOT EXISTS assessment_copilot_governance (
+      run_id TEXT PRIMARY KEY REFERENCES assessment_runs(id) ON DELETE CASCADE,
+      content_exclusion_rule_count INTEGER
+    );
+
+    CREATE TABLE IF NOT EXISTS assessment_copilot_organizations (
+      run_id TEXT NOT NULL REFERENCES assessment_runs(id) ON DELETE CASCADE,
+      organization_login TEXT NOT NULL,
+      seat_total INTEGER,
+      seats_added_this_cycle INTEGER,
+      seats_pending_cancellation INTEGER,
+      seats_pending_invitation INTEGER,
+      active_seats_this_cycle INTEGER,
+      inactive_seats_this_cycle INTEGER,
+      plan_type TEXT,
+      seat_management_setting TEXT,
+      public_code_suggestions TEXT,
+      ide_chat TEXT,
+      platform_chat TEXT,
+      cli TEXT,
+      coding_agent_repository_scope TEXT,
+      PRIMARY KEY(run_id, organization_login)
+    );
+
+    CREATE TABLE IF NOT EXISTS assessment_copilot_failures (
+      run_id TEXT NOT NULL REFERENCES assessment_runs(id) ON DELETE CASCADE,
+      scope TEXT NOT NULL,
+      check_key TEXT NOT NULL,
+      error TEXT NOT NULL,
+      PRIMARY KEY(run_id, scope, check_key)
     );
 
     CREATE TABLE IF NOT EXISTS assessment_budgets (
@@ -487,10 +523,69 @@ function initSchema(db: Database.Database) {
       prevents_further_usage INTEGER NOT NULL DEFAULT 0,
       alerting_enabled INTEGER NOT NULL DEFAULT 0,
       alert_recipient_count INTEGER NOT NULL DEFAULT 0,
+      alert_recipients TEXT NOT NULL DEFAULT '[]',
       entity_name TEXT,
       user_login TEXT,
       expires_at TEXT,
       PRIMARY KEY(run_id, budget_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS assessment_cost_centers (
+      run_id TEXT NOT NULL REFERENCES assessment_runs(id) ON DELETE CASCADE,
+      cost_center_id TEXT NOT NULL,
+      name TEXT NOT NULL,
+      state TEXT NOT NULL,
+      azure_subscription TEXT,
+      ai_credit_pool_enabled INTEGER NOT NULL DEFAULT 0,
+      ai_credit_pool_target_amount REAL,
+      ai_credit_pool_current_amount REAL,
+      resources_available INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY(run_id, cost_center_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS assessment_cost_center_resources (
+      run_id TEXT NOT NULL REFERENCES assessment_runs(id) ON DELETE CASCADE,
+      cost_center_id TEXT NOT NULL,
+      ordinal INTEGER NOT NULL,
+      resource_type TEXT NOT NULL,
+      resource_name TEXT NOT NULL,
+      PRIMARY KEY(run_id, cost_center_id, ordinal)
+    );
+
+    CREATE TABLE IF NOT EXISTS assessment_effective_budgets (
+      run_id TEXT NOT NULL REFERENCES assessment_runs(id) ON DELETE CASCADE,
+      user_login TEXT NOT NULL,
+      budget_id TEXT,
+      amount REAL,
+      consumed_amount REAL,
+      applicable_budget_ids TEXT NOT NULL DEFAULT '[]',
+      PRIMARY KEY(run_id, user_login)
+    );
+
+    CREATE TABLE IF NOT EXISTS assessment_budget_user_states (
+      run_id TEXT NOT NULL REFERENCES assessment_runs(id) ON DELETE CASCADE,
+      budget_id TEXT NOT NULL,
+      user_login TEXT NOT NULL,
+      consumed_amount REAL NOT NULL,
+      target_amount REAL NOT NULL,
+      override_budget_id TEXT,
+      PRIMARY KEY(run_id, budget_id, user_login)
+    );
+
+    CREATE TABLE IF NOT EXISTS assessment_billing_usage (
+      run_id TEXT PRIMARY KEY REFERENCES assessment_runs(id) ON DELETE CASCADE,
+      period_year INTEGER NOT NULL,
+      period_month INTEGER,
+      period_day INTEGER,
+      items TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS assessment_billing_failures (
+      run_id TEXT NOT NULL REFERENCES assessment_runs(id) ON DELETE CASCADE,
+      scope TEXT NOT NULL,
+      check_key TEXT NOT NULL,
+      error TEXT NOT NULL,
+      PRIMARY KEY(run_id, scope, check_key)
     );
   `);
 
@@ -505,6 +600,21 @@ function initSchema(db: Database.Database) {
   ).all() as Array<{ name: string }>;
   if (!repositoryRulesColumns.some(column => column.name === 'active_rulesets')) {
     db.exec('ALTER TABLE assessment_repository_rules ADD COLUMN active_rulesets TEXT');
+  }
+  const copilotSeatColumns = db.prepare(
+    'PRAGMA table_info(assessment_copilot_seats)'
+  ).all() as Array<{ name: string }>;
+  if (!copilotSeatColumns.some(column => column.name === 'last_activity_editor')) {
+    db.exec('ALTER TABLE assessment_copilot_seats ADD COLUMN last_activity_editor TEXT');
+  }
+  if (!copilotSeatColumns.some(column => column.name === 'assignment_sources')) {
+    db.exec("ALTER TABLE assessment_copilot_seats ADD COLUMN assignment_sources TEXT NOT NULL DEFAULT '[]'");
+  }
+  const budgetColumns = db.prepare(
+    'PRAGMA table_info(assessment_budgets)'
+  ).all() as Array<{ name: string }>;
+  if (!budgetColumns.some(column => column.name === 'alert_recipients')) {
+    db.exec("ALTER TABLE assessment_budgets ADD COLUMN alert_recipients TEXT NOT NULL DEFAULT '[]'");
   }
 }
 
@@ -981,7 +1091,9 @@ export function completeAssessment(input: {
   actionsCollector: { id: string; durationMs: number; error: string | null };
   actionsDepthCollector: { id: string; durationMs: number; error: string | null };
   copilotCollector: { id: string; durationMs: number; error: string | null };
+  copilotDepthCollector: { id: string; durationMs: number; error: string | null };
   billingCollector: { id: string; durationMs: number; error: string | null };
+  billingDepthCollector: { id: string; durationMs: number; error: string | null };
   scimCollector: { id: string; durationMs: number; error: string | null };
   organizations: Array<{
     githubId: number;
@@ -1030,7 +1142,9 @@ export function completeAssessment(input: {
   actionsPolicy: AssessmentActionsPolicy | null;
   actionsEvidence: AssessmentActionsEvidence | null;
   copilotSeats: AssessmentCopilotSeatInventory | null;
+  copilotEvidence: AssessmentCopilotEvidence | null;
   budgets: AssessmentBudget[] | null;
+  billingEvidence: AssessmentBillingEvidence | null;
   evaluation: AssessmentEvaluation;
 }) {
   const db = getDb();
@@ -1169,15 +1283,54 @@ export function completeAssessment(input: {
   const insertCopilotSeat = db.prepare(`
     INSERT INTO assessment_copilot_seats
       (run_id, login, plan_type, created_at, last_authenticated_at, last_activity_at,
-       pending_cancellation_date, assignment_count)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+       last_activity_editor, pending_cancellation_date, assignment_count, assignment_sources)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  const insertCopilotOrganization = db.prepare(`
+    INSERT INTO assessment_copilot_organizations
+      (run_id, organization_login, seat_total, seats_added_this_cycle,
+       seats_pending_cancellation, seats_pending_invitation, active_seats_this_cycle,
+       inactive_seats_this_cycle, plan_type, seat_management_setting,
+       public_code_suggestions, ide_chat, platform_chat, cli,
+       coding_agent_repository_scope)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  const insertCopilotFailure = db.prepare(`
+    INSERT INTO assessment_copilot_failures (run_id, scope, check_key, error)
+    VALUES (?, ?, ?, ?)
   `);
   const insertBudget = db.prepare(`
     INSERT INTO assessment_budgets
       (run_id, budget_id, budget_type, product_sku, scope, amount, consumed_amount,
-       prevents_further_usage, alerting_enabled, alert_recipient_count, entity_name,
-       user_login, expires_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       prevents_further_usage, alerting_enabled, alert_recipient_count, alert_recipients,
+       entity_name, user_login, expires_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  const insertCostCenter = db.prepare(`
+    INSERT INTO assessment_cost_centers
+      (run_id, cost_center_id, name, state, azure_subscription,
+       ai_credit_pool_enabled, ai_credit_pool_target_amount,
+       ai_credit_pool_current_amount, resources_available)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  const insertCostCenterResource = db.prepare(`
+    INSERT INTO assessment_cost_center_resources
+      (run_id, cost_center_id, ordinal, resource_type, resource_name)
+    VALUES (?, ?, ?, ?, ?)
+  `);
+  const insertEffectiveBudget = db.prepare(`
+    INSERT INTO assessment_effective_budgets
+      (run_id, user_login, budget_id, amount, consumed_amount, applicable_budget_ids)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `);
+  const insertBudgetUserState = db.prepare(`
+    INSERT INTO assessment_budget_user_states
+      (run_id, budget_id, user_login, consumed_amount, target_amount, override_budget_id)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `);
+  const insertBillingFailure = db.prepare(`
+    INSERT INTO assessment_billing_failures (run_id, scope, check_key, error)
+    VALUES (?, ?, ?, ?)
   `);
   const complete = db.transaction(() => {
     for (const organization of input.organizations) {
@@ -1498,9 +1651,44 @@ export function completeAssessment(input: {
         seat.createdAt,
         seat.lastAuthenticatedAt,
         seat.lastActivityAt,
+        seat.lastActivityEditor,
         seat.pendingCancellationDate,
-        seat.assignmentCount
+        seat.assignmentCount,
+        JSON.stringify(seat.assignmentSources)
       );
+    }
+    if (input.copilotEvidence) {
+      db.prepare(`
+        INSERT INTO assessment_copilot_governance (run_id, content_exclusion_rule_count)
+        VALUES (?, ?)
+      `).run(input.runId, input.copilotEvidence.contentExclusionRuleCount);
+      for (const organization of input.copilotEvidence.organizations) {
+        insertCopilotOrganization.run(
+          input.runId,
+          organization.organizationLogin,
+          organization.seatTotal,
+          organization.seatsAddedThisCycle,
+          organization.seatsPendingCancellation,
+          organization.seatsPendingInvitation,
+          organization.activeSeatsThisCycle,
+          organization.inactiveSeatsThisCycle,
+          organization.planType,
+          organization.seatManagementSetting,
+          organization.publicCodeSuggestions,
+          organization.ideChat,
+          organization.platformChat,
+          organization.cli,
+          organization.codingAgentRepositoryScope
+        );
+      }
+      for (const failure of input.copilotEvidence.failures) {
+        insertCopilotFailure.run(
+          input.runId,
+          failure.scope,
+          failure.check,
+          failure.error
+        );
+      }
     }
     for (const budget of input.budgets || []) {
       insertBudget.run(
@@ -1514,10 +1702,76 @@ export function completeAssessment(input: {
         budget.preventsFurtherUsage ? 1 : 0,
         budget.alertingEnabled ? 1 : 0,
         budget.alertRecipientCount,
+        JSON.stringify(budget.alertRecipients),
         budget.entityName,
         budget.user,
         budget.expiresAt
       );
+    }
+    if (input.billingEvidence) {
+      for (const costCenter of input.billingEvidence.costCenters) {
+        insertCostCenter.run(
+          input.runId,
+          costCenter.id,
+          costCenter.name,
+          costCenter.state,
+          costCenter.azureSubscription,
+          costCenter.aiCreditPoolEnabled ? 1 : 0,
+          costCenter.aiCreditPoolTargetAmount,
+          costCenter.aiCreditPoolCurrentAmount,
+          costCenter.resources === null ? 0 : 1
+        );
+        for (const [index, resource] of (costCenter.resources ?? []).entries()) {
+          insertCostCenterResource.run(
+            input.runId,
+            costCenter.id,
+            index,
+            resource.type,
+            resource.name
+          );
+        }
+      }
+      for (const budget of input.billingEvidence.effectiveBudgets) {
+        insertEffectiveBudget.run(
+          input.runId,
+          budget.user,
+          budget.budgetId,
+          budget.amount,
+          budget.consumedAmount,
+          JSON.stringify(budget.applicableBudgetIds)
+        );
+      }
+      for (const state of input.billingEvidence.multiUserBudgetStates) {
+        insertBudgetUserState.run(
+          input.runId,
+          state.budgetId,
+          state.user,
+          state.consumedAmount,
+          state.targetAmount,
+          state.overrideBudgetId
+        );
+      }
+      if (input.billingEvidence.usage) {
+        db.prepare(`
+          INSERT INTO assessment_billing_usage
+            (run_id, period_year, period_month, period_day, items)
+          VALUES (?, ?, ?, ?, ?)
+        `).run(
+          input.runId,
+          input.billingEvidence.usage.year,
+          input.billingEvidence.usage.month,
+          input.billingEvidence.usage.day,
+          JSON.stringify(input.billingEvidence.usage.items)
+        );
+      }
+      for (const failure of input.billingEvidence.failures) {
+        insertBillingFailure.run(
+          input.runId,
+          failure.scope,
+          failure.check,
+          failure.error
+        );
+      }
     }
     db.prepare(`
       INSERT INTO assessment_collector_results
@@ -1683,6 +1937,24 @@ export function completeAssessment(input: {
       input.copilotCollector.durationMs,
       input.copilotCollector.error
     );
+    const copilotDepthFailures = input.copilotEvidence?.failures ?? [];
+    db.prepare(`
+      INSERT INTO assessment_collector_results
+        (id, run_id, collector_key, status, item_count, duration_ms, error)
+      VALUES (?, ?, 'copilotDepth', ?, ?, ?, ?)
+    `).run(
+      input.copilotDepthCollector.id,
+      input.runId,
+      input.copilotDepthCollector.error
+        ? 'failed'
+        : copilotDepthFailures.length > 0 ? 'partial' : 'completed',
+      input.copilotEvidence
+        ? input.copilotEvidence.organizations.length
+          + (input.copilotEvidence.contentExclusionRuleCount ?? 0)
+        : 0,
+      input.copilotDepthCollector.durationMs,
+      input.copilotDepthCollector.error ?? formatCopilotFailures(copilotDepthFailures)
+    );
     db.prepare(`
       INSERT INTO assessment_collector_results
         (id, run_id, collector_key, status, item_count, duration_ms, error)
@@ -1694,6 +1966,26 @@ export function completeAssessment(input: {
       input.budgets?.length || 0,
       input.billingCollector.durationMs,
       input.billingCollector.error
+    );
+    const billingDepthFailures = input.billingEvidence?.failures ?? [];
+    db.prepare(`
+      INSERT INTO assessment_collector_results
+        (id, run_id, collector_key, status, item_count, duration_ms, error)
+      VALUES (?, ?, 'billingDepth', ?, ?, ?, ?)
+    `).run(
+      input.billingDepthCollector.id,
+      input.runId,
+      input.billingDepthCollector.error
+        ? 'failed'
+        : billingDepthFailures.length > 0 ? 'partial' : 'completed',
+      input.billingEvidence
+        ? input.billingEvidence.costCenters.length
+          + input.billingEvidence.effectiveBudgets.length
+          + input.billingEvidence.multiUserBudgetStates.length
+          + (input.billingEvidence.usage?.items.length ?? 0)
+        : 0,
+      input.billingDepthCollector.durationMs,
+      input.billingDepthCollector.error ?? formatBillingFailures(billingDepthFailures)
     );
     db.prepare(`
       INSERT INTO assessment_collector_results
@@ -1798,6 +2090,28 @@ function formatActionsFailures(
     .join('\n');
 }
 
+function formatCopilotFailures(
+  failures: AssessmentCopilotEvidence['failures']
+): string | null {
+  if (failures.length === 0) return null;
+  return failures
+    .map(failure => (
+      `${failure.scope} [${failure.check}]: ${failure.error.replace(/\s+/g, ' ').trim()}`
+    ))
+    .join('\n');
+}
+
+function formatBillingFailures(
+  failures: AssessmentBillingEvidence['failures']
+): string | null {
+  if (failures.length === 0) return null;
+  return failures
+    .map(failure => (
+      `${failure.scope} [${failure.check}]: ${failure.error.replace(/\s+/g, ' ').trim()}`
+    ))
+    .join('\n');
+}
+
 function formatOrganizationAccessFailures(
   failures: AssessmentOrganizationAccessFailure[]
 ): string | null {
@@ -1834,7 +2148,13 @@ function getAssessmentSnapshot(run: AssessmentRunRow) {
     FROM assessment_collector_results
     WHERE run_id = ?
     ORDER BY collector_key
-  `).all(run.id);
+  `).all(run.id) as Array<{
+    collector_key: string;
+    status: string;
+    item_count: number;
+    duration_ms: number;
+    error: string | null;
+  }>;
   const findings = getDb().prepare(`
     SELECT rule_key, domain, severity, title, summary, recommendation, affected_resources
     FROM assessment_findings
@@ -2072,6 +2392,155 @@ function getAssessmentSnapshot(run: AssessmentRunRow) {
     check_key: AssessmentActionsEvidence['failures'][number]['check'];
     error: string;
   }>;
+  const copilotSeats = getDb().prepare(`
+    SELECT login, plan_type, created_at, last_authenticated_at, last_activity_at,
+      last_activity_editor, pending_cancellation_date, assignment_count, assignment_sources
+    FROM assessment_copilot_seats
+    WHERE run_id = ?
+    ORDER BY login
+  `).all(run.id) as Array<{
+    login: string;
+    plan_type: string;
+    created_at: string;
+    last_authenticated_at: string | null;
+    last_activity_at: string | null;
+    last_activity_editor: string | null;
+    pending_cancellation_date: string | null;
+    assignment_count: number;
+    assignment_sources: string;
+  }>;
+  const copilotGovernance = getDb().prepare(`
+    SELECT content_exclusion_rule_count
+    FROM assessment_copilot_governance
+    WHERE run_id = ?
+  `).get(run.id) as { content_exclusion_rule_count: number | null } | undefined;
+  const copilotOrganizations = getDb().prepare(`
+    SELECT organization_login, seat_total, seats_added_this_cycle,
+      seats_pending_cancellation, seats_pending_invitation, active_seats_this_cycle,
+      inactive_seats_this_cycle, plan_type, seat_management_setting,
+      public_code_suggestions, ide_chat, platform_chat, cli,
+      coding_agent_repository_scope
+    FROM assessment_copilot_organizations
+    WHERE run_id = ?
+    ORDER BY organization_login
+  `).all(run.id) as Array<{
+    organization_login: string;
+    seat_total: number | null;
+    seats_added_this_cycle: number | null;
+    seats_pending_cancellation: number | null;
+    seats_pending_invitation: number | null;
+    active_seats_this_cycle: number | null;
+    inactive_seats_this_cycle: number | null;
+    plan_type: string | null;
+    seat_management_setting: string | null;
+    public_code_suggestions: string | null;
+    ide_chat: string | null;
+    platform_chat: string | null;
+    cli: string | null;
+    coding_agent_repository_scope: string | null;
+  }>;
+  const copilotFailures = getDb().prepare(`
+    SELECT scope, check_key, error
+    FROM assessment_copilot_failures
+    WHERE run_id = ?
+    ORDER BY scope, check_key
+  `).all(run.id) as Array<{
+    scope: string;
+    check_key: AssessmentCopilotEvidence['failures'][number]['check'];
+    error: string;
+  }>;
+  const budgets = getDb().prepare(`
+    SELECT budget_id, budget_type, product_sku, scope, amount, consumed_amount,
+      prevents_further_usage, alerting_enabled, alert_recipient_count,
+      alert_recipients, entity_name, user_login, expires_at
+    FROM assessment_budgets
+    WHERE run_id = ?
+    ORDER BY product_sku, scope, entity_name, user_login
+  `).all(run.id) as Array<{
+    budget_id: string;
+    budget_type: string;
+    product_sku: string;
+    scope: string;
+    amount: number;
+    consumed_amount: number | null;
+    prevents_further_usage: number;
+    alerting_enabled: number;
+    alert_recipient_count: number;
+    alert_recipients: string;
+    entity_name: string | null;
+    user_login: string | null;
+    expires_at: string | null;
+  }>;
+  const costCenters = getDb().prepare(`
+    SELECT cost_center_id, name, state, azure_subscription, ai_credit_pool_enabled,
+      ai_credit_pool_target_amount, ai_credit_pool_current_amount, resources_available
+    FROM assessment_cost_centers
+    WHERE run_id = ?
+    ORDER BY name
+  `).all(run.id) as Array<{
+    cost_center_id: string;
+    name: string;
+    state: string;
+    azure_subscription: string | null;
+    ai_credit_pool_enabled: number;
+    ai_credit_pool_target_amount: number | null;
+    ai_credit_pool_current_amount: number | null;
+    resources_available: number;
+  }>;
+  const costCenterResources = getDb().prepare(`
+    SELECT cost_center_id, resource_type, resource_name
+    FROM assessment_cost_center_resources
+    WHERE run_id = ?
+    ORDER BY cost_center_id, ordinal
+  `).all(run.id) as Array<{
+    cost_center_id: string;
+    resource_type: string;
+    resource_name: string;
+  }>;
+  const effectiveBudgets = getDb().prepare(`
+    SELECT user_login, budget_id, amount, consumed_amount, applicable_budget_ids
+    FROM assessment_effective_budgets
+    WHERE run_id = ?
+    ORDER BY user_login
+  `).all(run.id) as Array<{
+    user_login: string;
+    budget_id: string | null;
+    amount: number | null;
+    consumed_amount: number | null;
+    applicable_budget_ids: string;
+  }>;
+  const budgetUserStates = getDb().prepare(`
+    SELECT budget_id, user_login, consumed_amount, target_amount, override_budget_id
+    FROM assessment_budget_user_states
+    WHERE run_id = ?
+    ORDER BY budget_id, user_login
+  `).all(run.id) as Array<{
+    budget_id: string;
+    user_login: string;
+    consumed_amount: number;
+    target_amount: number;
+    override_budget_id: string | null;
+  }>;
+  const billingUsage = getDb().prepare(`
+    SELECT period_year, period_month, period_day, items
+    FROM assessment_billing_usage
+    WHERE run_id = ?
+  `).get(run.id) as {
+    period_year: number;
+    period_month: number | null;
+    period_day: number | null;
+    items: string;
+  } | undefined;
+  const billingFailures = getDb().prepare(`
+    SELECT scope, check_key, error
+    FROM assessment_billing_failures
+    WHERE run_id = ?
+    ORDER BY scope, check_key
+  `).all(run.id) as Array<{
+    scope: string;
+    check_key: AssessmentBillingEvidence['failures'][number]['check'];
+    error: string;
+  }>;
   const bypassActorsByRuleset = new Map<number, AssessmentRulesetDetail['bypassActors']>();
   for (const actor of rulesetBypassActors) {
     const actors = bypassActorsByRuleset.get(actor.ruleset_id) ?? [];
@@ -2083,6 +2552,30 @@ function getAssessmentSnapshot(run: AssessmentRunRow) {
     bypassActorsByRuleset.set(actor.ruleset_id, actors);
   }
   const failedActionsChecks = new Set(actionsFailures.map(failure => failure.check_key));
+  const hasCopilotCollector = collectors.some(
+    collector => collector.collector_key === 'copilot'
+  );
+  const hasCopilotDepthCollector = collectors.some(
+    collector => collector.collector_key === 'copilotDepth'
+  );
+  const hasBillingCollector = collectors.some(
+    collector => collector.collector_key === 'billing'
+  );
+  const hasBillingDepthCollector = collectors.some(
+    collector => collector.collector_key === 'billingDepth'
+  );
+  const costCenterResourcesById = new Map<
+    string,
+    AssessmentBillingEvidence['costCenters'][number]['resources']
+  >();
+  for (const resource of costCenterResources) {
+    const resources = costCenterResourcesById.get(resource.cost_center_id) ?? [];
+    resources.push({
+      type: resource.resource_type,
+      name: resource.resource_name,
+    });
+    costCenterResourcesById.set(resource.cost_center_id, resources);
+  }
   const directCollaboratorsByRepository = new Map<
     string,
     NonNullable<AssessmentRepositoryAccess['directCollaborators']>
@@ -2110,6 +2603,10 @@ function getAssessmentSnapshot(run: AssessmentRunRow) {
     teamGrantsByRepository.set(team.name_with_owner, entries);
   }
 
+  const metricValues = Object.fromEntries(
+    metrics.map(metric => [metric.metric_key, metric.value])
+  ) as Record<string, number>;
+
   return {
     id: run.id,
     environmentId: run.environment_id,
@@ -2118,7 +2615,7 @@ function getAssessmentSnapshot(run: AssessmentRunRow) {
     completedAt: run.completed_at,
     durationMs: run.duration_ms,
     error: run.error,
-    metrics: Object.fromEntries(metrics.map(metric => [metric.metric_key, metric.value])),
+    metrics: metricValues,
     collectors,
     organizationAccess: organizationAccess.map(organization => ({
       organizationLogin: organization.organization_login,
@@ -2284,6 +2781,106 @@ function getAssessmentSnapshot(run: AssessmentRunRow) {
             labels: JSON.parse(runner.labels) as string[],
           })),
       failures: actionsFailures.map(failure => ({
+        check: failure.check_key,
+        error: failure.error,
+      })),
+    } : null,
+    copilotSeats: hasCopilotCollector ? {
+      totalSeats: metricValues.copilotSeats ?? copilotSeats.length,
+      rawAssignmentCount: copilotSeats.reduce(
+        (total, seat) => total + seat.assignment_count,
+        0
+      ),
+      seats: copilotSeats.map(seat => ({
+        login: seat.login,
+        planType: seat.plan_type,
+        createdAt: seat.created_at,
+        lastAuthenticatedAt: seat.last_authenticated_at,
+        lastActivityAt: seat.last_activity_at,
+        lastActivityEditor: seat.last_activity_editor,
+        pendingCancellationDate: seat.pending_cancellation_date,
+        assignmentCount: seat.assignment_count,
+        assignmentSources: JSON.parse(
+          seat.assignment_sources
+        ) as AssessmentCopilotSeatInventory['seats'][number]['assignmentSources'],
+      })),
+    } : null,
+    copilotEvidence: hasCopilotDepthCollector ? {
+      contentExclusionRuleCount: copilotGovernance?.content_exclusion_rule_count ?? null,
+      organizations: copilotOrganizations.map(organization => ({
+        organizationLogin: organization.organization_login,
+        seatTotal: organization.seat_total,
+        seatsAddedThisCycle: organization.seats_added_this_cycle,
+        seatsPendingCancellation: organization.seats_pending_cancellation,
+        seatsPendingInvitation: organization.seats_pending_invitation,
+        activeSeatsThisCycle: organization.active_seats_this_cycle,
+        inactiveSeatsThisCycle: organization.inactive_seats_this_cycle,
+        planType: organization.plan_type,
+        seatManagementSetting: organization.seat_management_setting,
+        publicCodeSuggestions: organization.public_code_suggestions,
+        ideChat: organization.ide_chat,
+        platformChat: organization.platform_chat,
+        cli: organization.cli,
+        codingAgentRepositoryScope: organization.coding_agent_repository_scope,
+      })),
+      failures: copilotFailures.map(failure => ({
+        scope: failure.scope,
+        check: failure.check_key,
+        error: failure.error,
+      })),
+    } : null,
+    budgets: hasBillingCollector ? budgets.map(budget => ({
+      id: budget.budget_id,
+      budgetType: budget.budget_type,
+      productSku: budget.product_sku,
+      scope: budget.scope,
+      amount: budget.amount,
+      consumedAmount: budget.consumed_amount,
+      preventsFurtherUsage: budget.prevents_further_usage === 1,
+      alertingEnabled: budget.alerting_enabled === 1,
+      alertRecipientCount: budget.alert_recipient_count,
+      alertRecipients: JSON.parse(budget.alert_recipients) as string[],
+      entityName: budget.entity_name,
+      user: budget.user_login,
+      expiresAt: budget.expires_at,
+    })) : null,
+    billingEvidence: hasBillingDepthCollector ? {
+      costCenters: costCenters.map(costCenter => ({
+        id: costCenter.cost_center_id,
+        name: costCenter.name,
+        state: costCenter.state,
+        azureSubscription: costCenter.azure_subscription,
+        aiCreditPoolEnabled: costCenter.ai_credit_pool_enabled === 1,
+        aiCreditPoolTargetAmount: costCenter.ai_credit_pool_target_amount,
+        aiCreditPoolCurrentAmount: costCenter.ai_credit_pool_current_amount,
+        resources: costCenter.resources_available === 1
+          ? costCenterResourcesById.get(costCenter.cost_center_id) ?? []
+          : null,
+      })),
+      effectiveBudgets: effectiveBudgets.map(budget => ({
+        user: budget.user_login,
+        budgetId: budget.budget_id,
+        amount: budget.amount,
+        consumedAmount: budget.consumed_amount,
+        applicableBudgetIds: JSON.parse(budget.applicable_budget_ids) as string[],
+      })),
+      multiUserBudgetStates: budgetUserStates.map(state => ({
+        budgetId: state.budget_id,
+        user: state.user_login,
+        consumedAmount: state.consumed_amount,
+        targetAmount: state.target_amount,
+        overrideBudgetId: state.override_budget_id,
+      })),
+      usage: billingUsage ? {
+        year: billingUsage.period_year,
+        month: billingUsage.period_month,
+        day: billingUsage.period_day,
+        items: JSON.parse(
+          billingUsage.items
+        ) as NonNullable<AssessmentBillingEvidence['usage']>['items'],
+      } : null,
+      failures: billingFailures.map(failure => ({
+        scope: failure.scope,
         check: failure.check_key,
         error: failure.error,
       })),

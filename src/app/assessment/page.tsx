@@ -6,6 +6,10 @@ import { useApp } from '@/components/AppContext';
 import {
   formatScimRoleLabel,
   type AssessmentActionsEvidence,
+  type AssessmentBillingEvidence,
+  type AssessmentBudget,
+  type AssessmentCopilotEvidence,
+  type AssessmentCopilotSeatInventory,
   type AssessmentOrganizationAccess,
   type AssessmentRepositoryAccess,
   type AssessmentRepositoryRules,
@@ -76,6 +80,10 @@ interface AssessmentSnapshot {
   repositoryRules: AssessmentRepositoryRules[];
   rulesets: AssessmentRulesetDetail[];
   actionsEvidence: AssessmentActionsEvidence | null;
+  copilotSeats: AssessmentCopilotSeatInventory | null;
+  copilotEvidence: AssessmentCopilotEvidence | null;
+  budgets: AssessmentBudget[] | null;
+  billingEvidence: AssessmentBillingEvidence | null;
   findings: AssessmentFinding[];
 }
 
@@ -176,7 +184,13 @@ export default function AssessmentPage() {
     collector => collector.collector_key === 'actionsDepth'
   );
   const copilotCollector = snapshot?.collectors.find(collector => collector.collector_key === 'copilot');
+  const copilotDepthCollector = snapshot?.collectors.find(
+    collector => collector.collector_key === 'copilotDepth'
+  );
   const billingCollector = snapshot?.collectors.find(collector => collector.collector_key === 'billing');
+  const billingDepthCollector = snapshot?.collectors.find(
+    collector => collector.collector_key === 'billingDepth'
+  );
   const repositorySecurity = snapshot?.repositorySecurity || [];
   const organizationAccess = snapshot?.organizationAccess || [];
   const repositoryAccess = snapshot?.repositoryAccess || [];
@@ -187,6 +201,26 @@ export default function AssessmentPage() {
     repository => !repository.isArchived && !repository.isFork
   );
   const actionsEvidence = snapshot?.actionsEvidence;
+  const copilotSeats = snapshot?.copilotSeats;
+  const copilotEvidence = snapshot?.copilotEvidence;
+  const budgets = snapshot?.budgets;
+  const billingEvidence = snapshot?.billingEvidence;
+  const budgetById = new Map((budgets ?? []).map(budget => [budget.id, budget]));
+  const budgetStateCountById = new Map<string, number>();
+  for (const state of billingEvidence?.multiUserBudgetStates ?? []) {
+    budgetStateCountById.set(
+      state.budgetId,
+      (budgetStateCountById.get(state.budgetId) ?? 0) + 1
+    );
+  }
+  const costCentersByUser = new Map<string, string[]>();
+  for (const costCenter of billingEvidence?.costCenters ?? []) {
+    for (const resource of costCenter.resources ?? []) {
+      if (resource.type.toLowerCase() !== 'user') continue;
+      const key = resource.name.toLowerCase();
+      costCentersByUser.set(key, [...(costCentersByUser.get(key) ?? []), costCenter.name]);
+    }
+  }
   const runnersByGroup = new Map<number, number>();
   for (const runner of actionsEvidence?.runners ?? []) {
     if (runner.runnerGroupId === null) continue;
@@ -227,10 +261,18 @@ export default function AssessmentPage() {
           : actionsCollector?.status === 'completed' ? 'Baseline' : 'Unavailable'
       : 'Not assessed',
     copilot: baselineEvaluated
-      ? copilotCollector?.status === 'completed' ? 'Baseline' : 'Unavailable'
+      ? copilotDepthCollector?.status === 'completed'
+        ? 'Governance depth'
+        : copilotDepthCollector?.status === 'partial'
+          ? 'Partial governance depth'
+          : copilotCollector?.status === 'completed' ? 'Baseline' : 'Unavailable'
       : 'Not assessed',
     billing: baselineEvaluated
-      ? billingCollector?.status === 'completed' ? 'Baseline' : 'Unavailable'
+      ? billingDepthCollector?.status === 'completed'
+        ? 'Ownership depth'
+        : billingDepthCollector?.status === 'partial'
+          ? 'Partial ownership depth'
+          : billingCollector?.status === 'completed' ? 'Baseline' : 'Unavailable'
       : 'Not assessed',
   };
   const assessmentState = isRunning
@@ -1087,6 +1129,427 @@ export default function AssessmentPage() {
             )}
           </section>
 
+          <section aria-labelledby="copilot-governance-heading" className="border border-border bg-panel rounded-lg overflow-hidden">
+            <div className="px-4 py-3 border-b border-border flex flex-col gap-2 md:flex-row md:items-end md:justify-between">
+              <div>
+                <h2 id="copilot-governance-heading" className="text-sm font-semibold text-text-primary">
+                  Copilot governance & adoption
+                </h2>
+                <p className="text-xs text-text-muted mt-0.5">
+                  Paid-seat activity, assignment provenance, organization policy, and coding-agent reach.
+                </p>
+              </div>
+              <span className="text-xs text-text-muted">
+                {copilotDepthCollector
+                  ? `${copilotEvidence?.organizations.length ?? 0} organizations measured`
+                  : 'Run again for governance depth'}
+              </span>
+            </div>
+            <div className="grid sm:grid-cols-2 lg:grid-cols-5 divide-y sm:divide-y-0 sm:divide-x divide-border">
+              <GovernanceSignal
+                label="Billed users"
+                value={metricValue(snapshot, 'copilotSeats')}
+                detail="Unique enterprise seats"
+              />
+              <GovernanceSignal
+                label="Recent activity"
+                value={formatMetricPair(
+                  snapshot?.metrics.activeCopilotSeats,
+                  snapshot?.metrics.inactiveCopilotSeats
+                )}
+                detail="Active / reclaim candidates"
+                caution={(snapshot?.metrics.inactiveCopilotSeats ?? 0) > 0}
+              />
+              <GovernanceSignal
+                label="Licensed organizations"
+                value={formatMetricPair(
+                  snapshot?.metrics.copilotOrganizationsWithSeats,
+                  snapshot?.metrics.copilotOrganizationsMeasured
+                )}
+                detail="With seats / measured"
+              />
+              <GovernanceSignal
+                label="Coding agent reach"
+                value={metricValue(snapshot, 'copilotOrganizationsWithBroadCodingAgentAccess')}
+                detail="Licensed orgs set to all repositories"
+                caution={(snapshot?.metrics.copilotOrganizationsWithBroadCodingAgentAccess ?? 0) > 0}
+              />
+              <GovernanceSignal
+                label="Content exclusions"
+                value={metricValue(snapshot, 'copilotContentExclusionRules')}
+                detail="Enterprise rules reported"
+              />
+            </div>
+            {copilotSeats || copilotEvidence ? (
+              <>
+                <details className="border-t border-border">
+                  <summary className="px-4 py-3 text-xs font-medium text-accent cursor-pointer">
+                    Review paid-seat activity and assignment paths ({copilotSeats?.seats.length ?? 0})
+                  </summary>
+                  <div className="overflow-x-auto border-t border-border">
+                    <table className="w-full min-w-[900px] text-left">
+                      <caption className="px-4 py-3 text-left text-xs text-text-muted">
+                        GitHub seat activity can lag by 24 hours and retains a rolling 90-day signal. Missing activity is a review candidate, not proof that a seat was never used.
+                      </caption>
+                      <thead className="bg-surface">
+                        <tr className="text-[10px] uppercase tracking-wide text-text-muted">
+                          <th className="px-4 py-2 font-medium">User</th>
+                          <th className="px-3 py-2 font-medium">Plan</th>
+                          <th className="px-3 py-2 font-medium">Last activity</th>
+                          <th className="px-3 py-2 font-medium">Editor</th>
+                          <th className="px-3 py-2 font-medium">Assignment path</th>
+                          <th className="px-3 py-2 font-medium">Lifecycle</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-border">
+                        {(copilotSeats?.seats ?? []).map(seat => (
+                          <tr key={seat.login} className="text-xs">
+                            <td className="px-4 py-2.5 font-mono text-text-primary">{seat.login}</td>
+                            <td className="px-3 py-2.5 text-text-secondary">{formatPolicyLabel(seat.planType)}</td>
+                            <td className="px-3 py-2.5">
+                              <CopilotActivity seat={seat} />
+                            </td>
+                            <td className="px-3 py-2.5 text-text-secondary">
+                              {seat.lastActivityEditor ?? '— Not reported'}
+                            </td>
+                            <td className="px-3 py-2.5 text-text-secondary">
+                              <CopilotAssignmentSources sources={seat.assignmentSources} />
+                            </td>
+                            <td className="px-3 py-2.5">
+                              {seat.pendingCancellationDate
+                                ? <span className="text-warning">! Cancels {formatDate(seat.pendingCancellationDate)}</span>
+                                : <span className="text-success">✔ Assigned</span>}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </details>
+                <details className="border-t border-border">
+                  <summary className="px-4 py-3 text-xs font-medium text-accent cursor-pointer">
+                    Review organization Copilot policy ({copilotEvidence?.organizations.length ?? 0})
+                  </summary>
+                  <div className="border-t border-border">
+                    <p className="px-4 py-3 text-xs text-text-muted">
+                      Findings apply only to organizations with paid seats. Dormant organization defaults remain visible without affecting the score.
+                    </p>
+                    <div className="overflow-x-auto border-t border-border">
+                      <table className="w-full min-w-[980px] text-left">
+                        <caption className="px-4 py-3 text-left text-xs text-text-muted">
+                          These are organization-reported settings. GitHub does not expose a complete readable enterprise policy matrix or each organization&apos;s effective inherited policy.
+                        </caption>
+                        <thead className="bg-surface">
+                          <tr className="text-[10px] uppercase tracking-wide text-text-muted">
+                            <th className="px-4 py-2 font-medium">Organization</th>
+                            <th className="px-3 py-2 font-medium">Seats</th>
+                            <th className="px-3 py-2 font-medium">Cycle activity</th>
+                            <th className="px-3 py-2 font-medium">Seat management</th>
+                            <th className="px-3 py-2 font-medium">Public-code matches</th>
+                            <th className="px-3 py-2 font-medium">Coding agent</th>
+                            <th className="px-3 py-2 font-medium">Surfaces</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-border">
+                          {(copilotEvidence?.organizations ?? []).map(organization => (
+                            <tr key={organization.organizationLogin} className="text-xs">
+                              <td className="px-4 py-2.5 font-mono text-text-primary">
+                                {organization.organizationLogin}
+                              </td>
+                              <td className="px-3 py-2.5 tabular-nums text-text-primary">
+                                {organization.seatTotal ?? '?'}
+                              </td>
+                              <td className="px-3 py-2.5 text-text-secondary">
+                                {organization.activeSeatsThisCycle === null
+                                  ? '? Unavailable'
+                                  : `${organization.activeSeatsThisCycle} active · ${organization.inactiveSeatsThisCycle ?? 0} inactive`}
+                              </td>
+                              <td className="px-3 py-2.5 text-text-secondary">
+                                {formatPolicyLabel(organization.seatManagementSetting)}
+                              </td>
+                              <td className="px-3 py-2.5">
+                                <PolicyState
+                                  value={organization.publicCodeSuggestions}
+                                  cautionValue={(organization.seatTotal ?? 0) > 0 ? 'allow' : undefined}
+                                />
+                              </td>
+                              <td className="px-3 py-2.5">
+                                <PolicyState
+                                  value={organization.codingAgentRepositoryScope}
+                                  cautionValue={(organization.seatTotal ?? 0) > 0 ? 'all' : undefined}
+                                />
+                              </td>
+                              <td className="px-3 py-2.5 text-text-secondary">
+                                IDE {formatPolicyLabel(organization.ideChat)} · Web {formatPolicyLabel(organization.platformChat)} · CLI {formatPolicyLabel(organization.cli)}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                </details>
+              </>
+            ) : (
+              <p className="border-t border-border px-4 py-4 text-xs text-text-muted">
+                Run the assessment again to collect Copilot policy and assignment evidence.
+              </p>
+            )}
+          </section>
+
+          <section aria-labelledby="billing-governance-heading" className="border border-border bg-panel rounded-lg overflow-hidden">
+            <div className="px-4 py-3 border-b border-border flex flex-col gap-2 md:flex-row md:items-end md:justify-between">
+              <div>
+                <h2 id="billing-governance-heading" className="text-sm font-semibold text-text-primary">
+                  Billing ownership & budget hierarchy
+                </h2>
+                <p className="text-xs text-text-muted mt-0.5">
+                  Cost-center membership, shared pools, per-user allowances, alert ownership, and current-period usage.
+                </p>
+              </div>
+              <span className="text-xs text-text-muted">
+                {billingDepthCollector
+                  ? `${billingEvidence?.costCenters.length ?? 0} active cost centers`
+                  : 'Run again for ownership depth'}
+              </span>
+            </div>
+            <div className="grid sm:grid-cols-2 lg:grid-cols-5 divide-y sm:divide-y-0 sm:divide-x divide-border">
+              <GovernanceSignal
+                label="Cost centers"
+                value={metricValue(snapshot, 'activeCostCenters')}
+                detail="Active billing owners"
+              />
+              <GovernanceSignal
+                label="Assigned resources"
+                value={metricValue(snapshot, 'costCenterResources')}
+                detail="Users, teams, orgs, and repositories"
+              />
+              <GovernanceSignal
+                label="Cost-center budgets"
+                value={formatMetricPair(
+                  snapshot?.metrics.sharedCostCenterBudgets,
+                  snapshot?.metrics.perUserCostCenterBudgets
+                )}
+                detail="Shared pool / per-user"
+              />
+              <GovernanceSignal
+                label="Effective allowances"
+                value={formatMetricPair(
+                  snapshot?.metrics.effectiveUserBudgets,
+                  billingEvidence?.effectiveBudgets.length
+                )}
+                detail="Users with effective / checked"
+              />
+              <GovernanceSignal
+                label="Current net usage"
+                value={snapshot?.metrics.billingNetAmount === undefined
+                  ? '—'
+                  : formatCurrency(snapshot.metrics.billingNetAmount)}
+                detail={formatBillingPeriod(billingEvidence?.usage)}
+              />
+            </div>
+            {budgets || billingEvidence ? (
+              <>
+                <details className="border-t border-border">
+                  <summary className="px-4 py-3 text-xs font-medium text-accent cursor-pointer">
+                    Review cost centers and effective user allowances
+                  </summary>
+                  <div className="border-t border-border">
+                    <div className="overflow-x-auto">
+                      <table className="w-full min-w-[840px] text-left">
+                        <caption className="px-4 py-3 text-left text-xs text-text-muted">
+                          Cost-center membership determines shared-pool applicability. It does not create an individual effective budget, and GitHub does not expand indirect team membership.
+                        </caption>
+                        <thead className="bg-surface">
+                          <tr className="text-[10px] uppercase tracking-wide text-text-muted">
+                            <th className="px-4 py-2 font-medium">Cost center</th>
+                            <th className="px-3 py-2 font-medium">Assigned resources</th>
+                            <th className="px-3 py-2 font-medium">AI credit pool</th>
+                            <th className="px-3 py-2 font-medium">Azure subscription</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-border">
+                          {(billingEvidence?.costCenters ?? []).map(costCenter => (
+                            <tr key={costCenter.id} className="text-xs">
+                              <td className="px-4 py-2.5 text-text-primary">
+                                {costCenter.name}
+                                <span className="block font-mono text-[10px] text-text-muted">{costCenter.id}</span>
+                              </td>
+                              <td className="px-3 py-2.5 text-text-secondary">
+                                <CostCenterResources resources={costCenter.resources} />
+                              </td>
+                              <td className="px-3 py-2.5 text-text-secondary">
+                                {formatAiCreditPool(costCenter)}
+                              </td>
+                              <td className="px-3 py-2.5 font-mono text-text-secondary">
+                                {costCenter.azureSubscription ?? '— None'}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                    <div className="overflow-x-auto border-t border-border">
+                      <table className="w-full min-w-[900px] text-left">
+                        <caption className="px-4 py-3 text-left text-xs text-text-muted">
+                          GitHub returns the winning effective allowance and applicable controls, but not a precedence trace. In this enterprise, direct user allowances override cost-center per-user, then enterprise per-user allowances. Shared cost-center pools remain separate.
+                        </caption>
+                        <thead className="bg-surface">
+                          <tr className="text-[10px] uppercase tracking-wide text-text-muted">
+                            <th className="px-4 py-2 font-medium">User</th>
+                            <th className="px-3 py-2 font-medium">Direct user membership</th>
+                            <th className="px-3 py-2 font-medium">Applicable controls</th>
+                            <th className="px-3 py-2 font-medium">Effective allowance</th>
+                            <th className="px-3 py-2 font-medium">Consumed</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-border">
+                          {(billingEvidence?.effectiveBudgets ?? []).map(effective => {
+                            const budget = effective.budgetId
+                              ? budgetById.get(effective.budgetId)
+                              : undefined;
+                            return (
+                              <tr key={effective.user} className="text-xs">
+                                <td className="px-4 py-2.5 font-mono text-text-primary">{effective.user}</td>
+                                <td className="px-3 py-2.5 text-text-secondary">
+                                  {(costCentersByUser.get(effective.user.toLowerCase()) ?? []).join(', ') || '— None'}
+                                </td>
+                                <td className="px-3 py-2.5 text-text-secondary">
+                                  {effective.applicableBudgetIds.length} returned
+                                </td>
+                                <td className="px-3 py-2.5">
+                                  {effective.budgetId
+                                    ? <span className="text-success">✔ {formatCurrency(effective.amount)} · {formatBudgetScope(budget?.scope)}</span>
+                                    : <span className="text-text-muted">— No per-user effective budget</span>}
+                                </td>
+                                <td className="px-3 py-2.5 tabular-nums text-text-secondary">
+                                  {effective.consumedAmount === null
+                                    ? '—'
+                                    : formatCurrency(effective.consumedAmount)}
+                                </td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                </details>
+                <details className="border-t border-border">
+                  <summary className="px-4 py-3 text-xs font-medium text-accent cursor-pointer">
+                    Review budget controls and current usage ({budgets?.length ?? 0})
+                  </summary>
+                  <div className="border-t border-border">
+                    <div className="overflow-x-auto">
+                      <table className="w-full min-w-[1000px] text-left">
+                        <thead className="bg-surface">
+                          <tr className="text-[10px] uppercase tracking-wide text-text-muted">
+                            <th className="px-4 py-2 font-medium">Product</th>
+                            <th className="px-3 py-2 font-medium">Scope</th>
+                            <th className="px-3 py-2 font-medium">Subject</th>
+                            <th className="px-3 py-2 font-medium">Amount / consumed</th>
+                            <th className="px-3 py-2 font-medium">Enforcement</th>
+                            <th className="px-3 py-2 font-medium">Alert ownership</th>
+                            <th className="px-3 py-2 font-medium">User states</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-border">
+                          {(budgets ?? []).map(budget => (
+                            <tr key={budget.id} className="text-xs">
+                              <td className="px-4 py-2.5 font-mono text-text-primary">{budget.productSku}</td>
+                              <td className="px-3 py-2.5 text-text-secondary">{formatBudgetScope(budget.scope)}</td>
+                              <td className="px-3 py-2.5 text-text-secondary">
+                                {budget.user ?? budget.entityName ?? '—'}
+                              </td>
+                              <td className="px-3 py-2.5 tabular-nums text-text-secondary">
+                                {formatCurrency(budget.amount)} / {budget.consumedAmount === null ? '—' : formatCurrency(budget.consumedAmount)}
+                              </td>
+                              <td className="px-3 py-2.5">
+                                {budget.preventsFurtherUsage
+                                  ? <span className="text-success">✔ Stops usage</span>
+                                  : <span className="text-warning">! Allows overage</span>}
+                              </td>
+                              <td className="px-3 py-2.5 text-text-secondary">
+                                <BudgetAlertOwnership budget={budget} />
+                              </td>
+                              <td className="px-3 py-2.5 tabular-nums text-text-secondary">
+                                {budgetStateCountById.get(budget.id) ?? '—'}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                    {billingEvidence?.multiUserBudgetStates.length ? (
+                      <div className="overflow-x-auto border-t border-border">
+                        <table className="w-full min-w-[760px] text-left">
+                          <caption className="px-4 py-3 text-left text-xs text-text-muted">
+                            GitHub reports multi-user states only for users with a current state; this is not a complete membership roster.
+                          </caption>
+                          <thead className="bg-surface">
+                            <tr className="text-[10px] uppercase tracking-wide text-text-muted">
+                              <th className="px-4 py-2 font-medium">Budget</th>
+                              <th className="px-3 py-2 font-medium">User</th>
+                              <th className="px-3 py-2 font-medium">Target</th>
+                              <th className="px-3 py-2 font-medium">Consumed</th>
+                              <th className="px-3 py-2 font-medium">Override</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-border">
+                            {billingEvidence.multiUserBudgetStates.map(state => (
+                              <tr key={`${state.budgetId}-${state.user}`} className="text-xs">
+                                <td className="px-4 py-2.5 font-mono text-text-secondary">
+                                  {budgetById.get(state.budgetId)?.entityName ?? state.budgetId}
+                                </td>
+                                <td className="px-3 py-2.5 font-mono text-text-primary">{state.user}</td>
+                                <td className="px-3 py-2.5 tabular-nums text-text-secondary">{formatCurrency(state.targetAmount)}</td>
+                                <td className="px-3 py-2.5 tabular-nums text-text-secondary">{formatCurrency(state.consumedAmount)}</td>
+                                <td className="px-3 py-2.5 font-mono text-text-muted">{state.overrideBudgetId ?? '— None'}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    ) : null}
+                    {billingEvidence?.usage ? (
+                      <div className="overflow-x-auto border-t border-border">
+                        <table className="w-full min-w-[760px] text-left">
+                          <caption className="px-4 py-3 text-left text-xs text-text-muted">
+                            Current-period usage uses GitHub billing SKU names. Budget product names use a different taxonomy, so coverage is not inferred from name matching.
+                          </caption>
+                          <thead className="bg-surface">
+                            <tr className="text-[10px] uppercase tracking-wide text-text-muted">
+                              <th className="px-4 py-2 font-medium">Product</th>
+                              <th className="px-3 py-2 font-medium">Billing SKU</th>
+                              <th className="px-3 py-2 font-medium">Unit</th>
+                              <th className="px-3 py-2 font-medium">Net quantity</th>
+                              <th className="px-3 py-2 font-medium">Net amount</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-border">
+                            {billingEvidence.usage.items.map(item => (
+                              <tr key={`${item.product}-${item.sku}`} className="text-xs">
+                                <td className="px-4 py-2.5 text-text-primary">{item.product}</td>
+                                <td className="px-3 py-2.5 font-mono text-text-secondary">{item.sku}</td>
+                                <td className="px-3 py-2.5 text-text-secondary">{item.unitType}</td>
+                                <td className="px-3 py-2.5 tabular-nums text-text-secondary">{formatNumber(item.netQuantity)}</td>
+                                <td className="px-3 py-2.5 tabular-nums text-text-primary">{formatCurrency(item.netAmount)}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    ) : null}
+                  </div>
+                </details>
+              </>
+            ) : (
+              <p className="border-t border-border px-4 py-4 text-xs text-text-muted">
+                Run the assessment again to collect cost-center, effective-budget, and usage evidence.
+              </p>
+            )}
+          </section>
+
           <section aria-labelledby="domains-heading" className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_360px]">
             <div className="border border-border bg-panel rounded-lg overflow-hidden">
               <div className="px-4 py-3 border-b border-border">
@@ -1160,6 +1623,182 @@ export default function AssessmentPage() {
       </main>
     </div>
   );
+}
+
+function GovernanceSignal({
+  label,
+  value,
+  detail,
+  caution = false,
+}: {
+  label: string;
+  value: string | number | undefined;
+  detail: string;
+  caution?: boolean;
+}) {
+  return (
+    <div className="px-4 py-3 min-w-0">
+      <p className="text-[11px] text-text-muted">{label}</p>
+      <p className={`text-lg font-semibold mt-1 tabular-nums ${
+        value === undefined ? 'text-text-muted' : caution ? 'text-warning' : 'text-text-primary'
+      }`}>
+        {value ?? '—'}
+      </p>
+      <p className="text-[10px] text-text-muted">{caution ? '! Review · ' : ''}{detail}</p>
+    </div>
+  );
+}
+
+function PolicyState({
+  value,
+  cautionValue,
+}: {
+  value: string | null;
+  cautionValue?: string;
+}) {
+  if (value === null) return <span className="text-text-muted">? Unavailable</span>;
+  const caution = cautionValue !== undefined && value === cautionValue;
+  return (
+    <span className={caution ? 'text-warning' : 'text-text-secondary'}>
+      {caution ? '! ' : ''}{formatPolicyLabel(value)}
+    </span>
+  );
+}
+
+function CopilotActivity({
+  seat,
+}: {
+  seat: AssessmentCopilotSeatInventory['seats'][number];
+}) {
+  if (!seat.lastActivityAt) {
+    return <span className="text-text-muted">— No activity reported</span>;
+  }
+  return <span className="text-success">✔ {formatDate(seat.lastActivityAt)}</span>;
+}
+
+function CopilotAssignmentSources({
+  sources,
+}: {
+  sources: AssessmentCopilotSeatInventory['seats'][number]['assignmentSources'];
+}) {
+  if (sources.length === 0) return <span className="text-text-muted">— Not reported</span>;
+  return (
+    <span className="space-y-1">
+      {sources.map((source, index) => {
+        const label = source.team
+          ? `${source.organization ?? (source.teamType ? formatPolicyLabel(source.teamType) : 'Enterprise team')} / ${source.team}`
+          : source.organization ?? 'Direct enterprise assignment';
+        return <span key={`${label}-${index}`} className="block">{label}</span>;
+      })}
+    </span>
+  );
+}
+
+function CostCenterResources({
+  resources,
+}: {
+  resources: AssessmentBillingEvidence['costCenters'][number]['resources'];
+}) {
+  if (resources === null) return <span className="text-text-muted">? Unavailable</span>;
+  if (resources.length === 0) return <span className="text-warning">! None assigned</span>;
+  return (
+    <span className="space-y-1">
+      {resources.map(resource => (
+        <span key={`${resource.type}-${resource.name}`} className="block">
+          {formatPolicyLabel(resource.type)} · {resource.name}
+        </span>
+      ))}
+    </span>
+  );
+}
+
+function BudgetAlertOwnership({ budget }: { budget: AssessmentBudget }) {
+  if (budget.scope === 'user') {
+    return <span className="text-text-muted">— User alerts unsupported</span>;
+  }
+  if (!budget.alertingEnabled) return <span className="text-warning">! Disabled</span>;
+  if (budget.alertRecipients.length > 0) {
+    return <span className="text-success">✔ {budget.alertRecipients.join(', ')}</span>;
+  }
+  if (budget.alertRecipientCount > 0) {
+    return <span className="text-success">✔ {budget.alertRecipientCount} configured</span>;
+  }
+  return <span className="text-warning">! No recipient</span>;
+}
+
+function metricValue(
+  snapshot: AssessmentSnapshot | null,
+  key: string
+): number | undefined {
+  return snapshot?.metrics[key];
+}
+
+function formatMetricPair(
+  first: number | undefined,
+  second: number | undefined
+): string | undefined {
+  if (first === undefined || second === undefined) return undefined;
+  return `${first}/${second}`;
+}
+
+function formatPolicyLabel(value: string | null | undefined): string {
+  if (!value) return '— Unavailable';
+  return value
+    .replaceAll('_', ' ')
+    .replace(/\b\w/g, character => character.toUpperCase());
+}
+
+function formatBudgetScope(value: string | undefined): string {
+  if (!value) return 'Unknown';
+  const labels: Record<string, string> = {
+    enterprise: 'Enterprise shared',
+    organization: 'Organization shared',
+    repository: 'Repository shared',
+    cost_center: 'Cost-center shared',
+    multi_user_customer: 'Enterprise per-user',
+    multi_user_cost_center: 'Cost-center per-user',
+    user: 'Individual user',
+  };
+  return labels[value] ?? formatPolicyLabel(value);
+}
+
+function formatAiCreditPool(
+  costCenter: AssessmentBillingEvidence['costCenters'][number]
+): string {
+  if (!costCenter.aiCreditPoolEnabled) return '— Disabled';
+  if (costCenter.aiCreditPoolTargetAmount === null) return 'Enabled';
+  return `${formatCurrency(costCenter.aiCreditPoolCurrentAmount)} / ${formatCurrency(costCenter.aiCreditPoolTargetAmount)}`;
+}
+
+function formatBillingPeriod(usage: AssessmentBillingEvidence['usage'] | undefined): string {
+  if (!usage) return 'Usage summary unavailable';
+  const month = usage.month ? `-${String(usage.month).padStart(2, '0')}` : '';
+  const day = usage.day ? `-${String(usage.day).padStart(2, '0')}` : '';
+  return `Period ${usage.year}${month}${day}`;
+}
+
+function formatCurrency(value: number | null | undefined): string {
+  if (value === null || value === undefined) return '—';
+  return new Intl.NumberFormat('en-US', {
+    style: 'currency',
+    currency: 'USD',
+    minimumFractionDigits: 0,
+    maximumFractionDigits: 2,
+  }).format(value);
+}
+
+function formatNumber(value: number): string {
+  return new Intl.NumberFormat('en-US', {
+    maximumFractionDigits: 4,
+  }).format(value);
+}
+
+function formatDate(value: string): string {
+  return new Intl.DateTimeFormat('en-US', {
+    year: 'numeric',
+    month: 'short',
+    day: 'numeric',
+  }).format(new Date(value));
 }
 
 function ActionsPolicySignal({

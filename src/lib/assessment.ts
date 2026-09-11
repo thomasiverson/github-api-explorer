@@ -349,14 +349,56 @@ export interface AssessmentCopilotSeat {
   createdAt: string;
   lastAuthenticatedAt: string | null;
   lastActivityAt: string | null;
+  lastActivityEditor: string | null;
   pendingCancellationDate: string | null;
   assignmentCount: number;
+  assignmentSources: AssessmentCopilotAssignmentSource[];
+}
+
+export interface AssessmentCopilotAssignmentSource {
+  organization: string | null;
+  team: string | null;
+  teamType: string | null;
 }
 
 export interface AssessmentCopilotSeatInventory {
   totalSeats: number;
   rawAssignmentCount: number;
   seats: AssessmentCopilotSeat[];
+}
+
+export interface AssessmentCopilotOrganization {
+  organizationLogin: string;
+  seatTotal: number | null;
+  seatsAddedThisCycle: number | null;
+  seatsPendingCancellation: number | null;
+  seatsPendingInvitation: number | null;
+  activeSeatsThisCycle: number | null;
+  inactiveSeatsThisCycle: number | null;
+  planType: string | null;
+  seatManagementSetting: string | null;
+  publicCodeSuggestions: string | null;
+  ideChat: string | null;
+  platformChat: string | null;
+  cli: string | null;
+  codingAgentRepositoryScope: string | null;
+}
+
+export type AssessmentCopilotCheck =
+  | 'content-exclusion'
+  | 'organization-settings'
+  | 'coding-agent';
+
+export interface AssessmentCopilotFailure {
+  scope: string;
+  check: AssessmentCopilotCheck;
+  error: string;
+}
+
+export interface AssessmentCopilotEvidence {
+  contentExclusionRuleCount: number | null;
+  organizations: AssessmentCopilotOrganization[];
+  failures: AssessmentCopilotFailure[];
 }
 
 export interface AssessmentBudget {
@@ -369,9 +411,82 @@ export interface AssessmentBudget {
   preventsFurtherUsage: boolean;
   alertingEnabled: boolean;
   alertRecipientCount: number;
+  alertRecipients: string[];
   entityName: string | null;
   user: string | null;
   expiresAt: string | null;
+}
+
+export interface AssessmentCostCenterResource {
+  type: string;
+  name: string;
+}
+
+export interface AssessmentCostCenter {
+  id: string;
+  name: string;
+  state: string;
+  azureSubscription: string | null;
+  aiCreditPoolEnabled: boolean;
+  aiCreditPoolTargetAmount: number | null;
+  aiCreditPoolCurrentAmount: number | null;
+  resources: AssessmentCostCenterResource[] | null;
+}
+
+export interface AssessmentEffectiveBudget {
+  user: string;
+  budgetId: string | null;
+  amount: number | null;
+  consumedAmount: number | null;
+  applicableBudgetIds: string[];
+}
+
+export interface AssessmentBudgetUserState {
+  budgetId: string;
+  user: string;
+  consumedAmount: number;
+  targetAmount: number;
+  overrideBudgetId: string | null;
+}
+
+export interface AssessmentBillingUsageItem {
+  product: string;
+  sku: string;
+  unitType: string;
+  grossQuantity: number;
+  grossAmount: number;
+  discountQuantity: number;
+  discountAmount: number;
+  netQuantity: number;
+  netAmount: number;
+}
+
+export interface AssessmentBillingUsage {
+  year: number;
+  month: number | null;
+  day: number | null;
+  items: AssessmentBillingUsageItem[];
+}
+
+export type AssessmentBillingCheck =
+  | 'cost-centers'
+  | 'cost-center-resources'
+  | 'effective-budget'
+  | 'multi-user-budget-states'
+  | 'usage-summary';
+
+export interface AssessmentBillingFailure {
+  scope: string;
+  check: AssessmentBillingCheck;
+  error: string;
+}
+
+export interface AssessmentBillingEvidence {
+  costCenters: AssessmentCostCenter[];
+  effectiveBudgets: AssessmentEffectiveBudget[];
+  multiUserBudgetStates: AssessmentBudgetUserState[];
+  usage: AssessmentBillingUsage | null;
+  failures: AssessmentBillingFailure[];
 }
 
 export type AssessmentSeverity = 'critical' | 'high' | 'medium' | 'low';
@@ -453,6 +568,36 @@ export interface AssessmentActionsRequests {
   getSelfHostedRunnerPolicy: () => Promise<AssessmentRestResponse>;
   getRunnerGroups: (page: number, perPage: number) => Promise<AssessmentRestResponse>;
   getRunners: (page: number, perPage: number) => Promise<AssessmentRestResponse>;
+}
+
+export interface AssessmentCopilotRequests {
+  getContentExclusion: () => Promise<AssessmentRestResponse>;
+  getOrganizationSettings: (
+    organizationLogin: string
+  ) => Promise<AssessmentRestResponse>;
+  getCodingAgentPermissions: (
+    organizationLogin: string
+  ) => Promise<AssessmentRestResponse>;
+}
+
+export interface AssessmentBillingRequests {
+  getCostCenters: () => Promise<AssessmentRestResponse>;
+  getCostCenter: (
+    costCenterId: string,
+    page: number,
+    perPage: number
+  ) => Promise<AssessmentRestResponse>;
+  getEffectiveBudget: (
+    user: string,
+    page: number,
+    perPage: number
+  ) => Promise<AssessmentRestResponse>;
+  getBudgetUserStates: (
+    budgetId: string,
+    page: number,
+    perPage: number
+  ) => Promise<AssessmentRestResponse>;
+  getUsageSummary: () => Promise<AssessmentRestResponse>;
 }
 
 const STALE_REPOSITORY_DAYS = 365;
@@ -2025,6 +2170,10 @@ export async function collectEnterpriseCopilotSeats(
     if (existing.planType !== assignment.planType) {
       throw new Error(`GitHub returned inconsistent Copilot plans for ${assignment.login}`);
     }
+    const assignmentHasLaterActivity = isLaterTimestamp(
+      assignment.lastActivityAt,
+      existing.lastActivityAt
+    );
     seatsByLogin.set(key, {
       ...existing,
       createdAt: earlierTimestamp(existing.createdAt, assignment.createdAt),
@@ -2033,11 +2182,18 @@ export async function collectEnterpriseCopilotSeats(
         assignment.lastAuthenticatedAt
       ),
       lastActivityAt: laterNullableTimestamp(existing.lastActivityAt, assignment.lastActivityAt),
+      lastActivityEditor: assignmentHasLaterActivity
+        ? assignment.lastActivityEditor
+        : existing.lastActivityEditor,
       pendingCancellationDate: earlierNullableTimestamp(
         existing.pendingCancellationDate,
         assignment.pendingCancellationDate
       ),
       assignmentCount: existing.assignmentCount + 1,
+      assignmentSources: mergeCopilotAssignmentSources(
+        existing.assignmentSources,
+        assignment.assignmentSources
+      ),
     });
   }
 
@@ -2077,6 +2233,178 @@ export async function collectEnterpriseBudgets(
   return [...budgetsById.values()];
 }
 
+export async function collectCopilotGovernance(
+  requests: AssessmentCopilotRequests,
+  organizationLogins: string[]
+): Promise<AssessmentCopilotEvidence> {
+  const failures: AssessmentCopilotFailure[] = [];
+  let contentExclusionRuleCount: number | null = null;
+
+  try {
+    const response = await requests.getContentExclusion();
+    if (response.status !== 200) {
+      throw new Error(describeRestFailure('enterprise Copilot content exclusion', response));
+    }
+    contentExclusionRuleCount = countCopilotContentExclusionRules(response.data);
+  } catch (error) {
+    failures.push({
+      scope: 'enterprise',
+      check: 'content-exclusion',
+      error: normalizeAssessmentError(error),
+    });
+  }
+
+  const organizations: AssessmentCopilotOrganization[] = [];
+  for (const organizationLogin of organizationLogins) {
+    const organization: AssessmentCopilotOrganization = {
+      organizationLogin,
+      seatTotal: null,
+      seatsAddedThisCycle: null,
+      seatsPendingCancellation: null,
+      seatsPendingInvitation: null,
+      activeSeatsThisCycle: null,
+      inactiveSeatsThisCycle: null,
+      planType: null,
+      seatManagementSetting: null,
+      publicCodeSuggestions: null,
+      ideChat: null,
+      platformChat: null,
+      cli: null,
+      codingAgentRepositoryScope: null,
+    };
+
+    try {
+      const response = await requests.getOrganizationSettings(organizationLogin);
+      if (response.status !== 200) {
+        throw new Error(describeRestFailure('organization Copilot settings', response));
+      }
+      Object.assign(organization, normalizeCopilotOrganization(response.data));
+    } catch (error) {
+      failures.push({
+        scope: organizationLogin,
+        check: 'organization-settings',
+        error: normalizeAssessmentError(error),
+      });
+    }
+
+    try {
+      const response = await requests.getCodingAgentPermissions(organizationLogin);
+      if (response.status !== 200) {
+        throw new Error(describeRestFailure('organization Copilot coding agent policy', response));
+      }
+      const permissions = readAssessmentObject(response.data);
+      if (!permissions || typeof permissions.enabled_repositories !== 'string') {
+        throw new Error('GitHub returned invalid organization Copilot coding agent policy');
+      }
+      organization.codingAgentRepositoryScope = permissions.enabled_repositories;
+    } catch (error) {
+      failures.push({
+        scope: organizationLogin,
+        check: 'coding-agent',
+        error: normalizeAssessmentError(error),
+      });
+    }
+
+    organizations.push(organization);
+  }
+
+  return { contentExclusionRuleCount, organizations, failures };
+}
+
+export async function collectBillingGovernance(
+  requests: AssessmentBillingRequests,
+  budgets: AssessmentBudget[],
+  userLogins: string[]
+): Promise<AssessmentBillingEvidence> {
+  const failures: AssessmentBillingFailure[] = [];
+  const costCenters: AssessmentCostCenter[] = [];
+
+  try {
+    const response = await requests.getCostCenters();
+    if (response.status !== 200) {
+      throw new Error(describeRestFailure('enterprise billing cost centers', response));
+    }
+    const result = readAssessmentObject(response.data);
+    if (!result || !Array.isArray(result.costCenters)) {
+      throw new Error('GitHub returned invalid enterprise billing cost centers');
+    }
+
+    for (const value of result.costCenters) {
+      const summary = normalizeCostCenter(value, null);
+      try {
+        const details = await collectCostCenterDetails(requests, summary.id);
+        costCenters.push(details);
+      } catch (error) {
+        failures.push({
+          scope: summary.name,
+          check: 'cost-center-resources',
+          error: normalizeAssessmentError(error),
+        });
+        costCenters.push({ ...summary, resources: null });
+      }
+    }
+  } catch (error) {
+    failures.push({
+      scope: 'enterprise',
+      check: 'cost-centers',
+      error: normalizeAssessmentError(error),
+    });
+  }
+
+  const effectiveBudgets: AssessmentEffectiveBudget[] = [];
+  for (const user of uniqueSortedStrings(userLogins)) {
+    try {
+      effectiveBudgets.push(await collectEffectiveBudget(requests, user));
+    } catch (error) {
+      failures.push({
+        scope: user,
+        check: 'effective-budget',
+        error: normalizeAssessmentError(error),
+      });
+    }
+  }
+
+  const multiUserBudgetStates: AssessmentBudgetUserState[] = [];
+  for (const budget of budgets.filter(
+    value => value.scope === 'multi_user_customer' || value.scope === 'multi_user_cost_center'
+  )) {
+    try {
+      multiUserBudgetStates.push(...await collectBudgetUserStates(requests, budget.id));
+    } catch (error) {
+      failures.push({
+        scope: formatBudgetResource(budget),
+        check: 'multi-user-budget-states',
+        error: normalizeAssessmentError(error),
+      });
+    }
+  }
+
+  let usage: AssessmentBillingUsage | null = null;
+  try {
+    const response = await requests.getUsageSummary();
+    if (response.status !== 200) {
+      throw new Error(describeRestFailure('enterprise billing usage summary', response));
+    }
+    usage = normalizeBillingUsage(response.data);
+  } catch (error) {
+    failures.push({
+      scope: 'enterprise',
+      check: 'usage-summary',
+      error: normalizeAssessmentError(error),
+    });
+  }
+
+  return {
+    costCenters: costCenters.sort((left, right) => left.name.localeCompare(right.name)),
+    effectiveBudgets,
+    multiUserBudgetStates: multiUserBudgetStates.sort(
+      (left, right) => left.user.localeCompare(right.user)
+    ),
+    usage,
+    failures,
+  };
+}
+
 export function evaluateAssessmentBaseline(input: {
   organizations: AssessmentOrganization[];
   members: AssessmentMember[];
@@ -2094,7 +2422,9 @@ export function evaluateAssessmentBaseline(input: {
   actionsPolicy?: AssessmentActionsPolicy | null;
   actionsEvidence?: AssessmentActionsEvidence | null;
   copilotSeats?: AssessmentCopilotSeatInventory | null;
+  copilotEvidence?: AssessmentCopilotEvidence | null;
   budgets?: AssessmentBudget[] | null;
+  billingEvidence?: AssessmentBillingEvidence | null;
   now?: Date;
 }): AssessmentEvaluation {
   const findings: AssessmentFinding[] = [];
@@ -2859,6 +3189,73 @@ export function evaluateAssessmentBaseline(input: {
     }
   }
 
+  let copilotOrganizationsMeasured = 0;
+  let copilotOrganizationsWithSeats = 0;
+  let copilotOrganizationsAllowingPublicCode = 0;
+  let copilotOrganizationsAssigningAllSeats = 0;
+  let copilotOrganizationsWithBroadCodingAgentAccess = 0;
+  let copilotContentExclusionRules = 0;
+  if (input.copilotEvidence) {
+    const measuredOrganizations = input.copilotEvidence.organizations.filter(
+      organization => organization.seatTotal !== null
+    );
+    const licensedOrganizations = measuredOrganizations.filter(
+      organization => (organization.seatTotal ?? 0) > 0
+    );
+    const assigningAllSeats = licensedOrganizations.filter(
+      organization => organization.seatManagementSetting === 'assign_all'
+    );
+    const allowingPublicCode = licensedOrganizations.filter(
+      organization => organization.publicCodeSuggestions === 'allow'
+    );
+    const broadCodingAgentAccess = licensedOrganizations.filter(
+      organization => organization.codingAgentRepositoryScope === 'all'
+    );
+
+    copilotOrganizationsMeasured = measuredOrganizations.length;
+    copilotOrganizationsWithSeats = licensedOrganizations.length;
+    copilotOrganizationsAllowingPublicCode = allowingPublicCode.length;
+    copilotOrganizationsAssigningAllSeats = assigningAllSeats.length;
+    copilotOrganizationsWithBroadCodingAgentAccess = broadCodingAgentAccess.length;
+    copilotContentExclusionRules = input.copilotEvidence.contentExclusionRuleCount ?? 0;
+
+    if (assigningAllSeats.length > 0) {
+      findings.push({
+        ruleKey: 'copilot-assign-all-seat-management',
+        domain: 'copilot',
+        severity: 'medium',
+        title: 'Copilot seats are assigned to all organization members',
+        summary: `${assigningAllSeats.length} licensed ${assigningAllSeats.length === 1 ? 'organization assigns' : 'organizations assign'} Copilot seats automatically to every member.`,
+        recommendation: 'Confirm that universal assignment is intentional and cost-effective, or change seat management to selected users and teams.',
+        affectedResources: assigningAllSeats.map(organization => organization.organizationLogin),
+      });
+    }
+    if (allowingPublicCode.length > 0) {
+      findings.push({
+        ruleKey: 'copilot-public-code-suggestions-review',
+        domain: 'copilot',
+        severity: 'low',
+        title: 'Suggestions matching public code are allowed',
+        summary: `${allowingPublicCode.length} licensed ${allowingPublicCode.length === 1 ? 'organization allows' : 'organizations allow'} Copilot suggestions that may match public code.`,
+        recommendation: 'Confirm that the public-code suggestion policy matches legal and engineering guidance, and document the approved position.',
+        affectedResources: allowingPublicCode.map(organization => organization.organizationLogin),
+      });
+    }
+    if (broadCodingAgentAccess.length > 0) {
+      findings.push({
+        ruleKey: 'copilot-coding-agent-all-repositories',
+        domain: 'copilot',
+        severity: 'low',
+        title: 'Copilot coding agent is enabled for all repositories',
+        summary: `${broadCodingAgentAccess.length} licensed ${broadCodingAgentAccess.length === 1 ? 'organization enables' : 'organizations enable'} the coding agent across every repository.`,
+        recommendation: 'Review whether coding-agent access should be limited to explicitly approved repositories.',
+        affectedResources: broadCodingAgentAccess.map(
+          organization => organization.organizationLogin
+        ),
+      });
+    }
+  }
+
   let enforcingBudgets = 0;
   let alertingBudgets = 0;
   let userLevelBudgets = 0;
@@ -2910,6 +3307,108 @@ export function evaluateAssessmentBaseline(input: {
         affectedResources: budgetsWithoutAlerting.map(formatBudgetResource),
       });
     }
+    const alertingWithoutRecipients = input.budgets.filter(
+      budget => budget.alertingEnabled && budget.alertRecipientCount === 0
+    );
+    if (alertingWithoutRecipients.length > 0) {
+      findings.push({
+        ruleKey: 'billing-budget-alert-recipients-missing',
+        domain: 'billing',
+        severity: 'low',
+        title: 'Budget alerting has no accountable recipient',
+        summary: `${alertingWithoutRecipients.length} ${alertingWithoutRecipients.length === 1 ? 'budget enables' : 'budgets enable'} alerting without a reported recipient.`,
+        recommendation: 'Assign at least one accountable recipient to every shared budget with alerting enabled.',
+        affectedResources: alertingWithoutRecipients.map(formatBudgetResource),
+      });
+    }
+  }
+
+  let activeCostCenters = 0;
+  let emptyActiveCostCenters = 0;
+  let costCenterResources = 0;
+  let costCenterUserMemberships = 0;
+  let effectiveUserBudgets = 0;
+  let usersWithoutEffectiveBudgets = 0;
+  let multiUserBudgetStates = 0;
+  let billingUsageItems = 0;
+  let billingNetAmount = 0;
+  let sharedCostCenterBudgets = 0;
+  let perUserCostCenterBudgets = 0;
+  if (input.billingEvidence) {
+    const costCenterInventoryKnown = !input.billingEvidence.failures.some(
+      failure => failure.check === 'cost-centers'
+    );
+    const activeCenters = input.billingEvidence.costCenters.filter(
+      costCenter => costCenter.state === 'active'
+    );
+    const emptyCenters = activeCenters.filter(
+      costCenter => costCenter.resources !== null && costCenter.resources.length === 0
+    );
+    activeCostCenters = activeCenters.length;
+    emptyActiveCostCenters = emptyCenters.length;
+    costCenterResources = activeCenters.reduce(
+      (total, costCenter) => total + (costCenter.resources?.length ?? 0),
+      0
+    );
+    costCenterUserMemberships = activeCenters.reduce(
+      (total, costCenter) => total + (costCenter.resources?.filter(
+        resource => resource.type.toLowerCase() === 'user'
+      ).length ?? 0),
+      0
+    );
+    effectiveUserBudgets = input.billingEvidence.effectiveBudgets.filter(
+      budget => budget.budgetId !== null
+    ).length;
+    usersWithoutEffectiveBudgets = input.billingEvidence.effectiveBudgets.length
+      - effectiveUserBudgets;
+    multiUserBudgetStates = input.billingEvidence.multiUserBudgetStates.length;
+    billingUsageItems = input.billingEvidence.usage?.items.length ?? 0;
+    billingNetAmount = input.billingEvidence.usage?.items.reduce(
+      (total, item) => total + item.netAmount,
+      0
+    ) ?? 0;
+    sharedCostCenterBudgets = input.budgets?.filter(
+      budget => budget.scope === 'cost_center'
+    ).length ?? 0;
+    perUserCostCenterBudgets = input.budgets?.filter(
+      budget => budget.scope === 'multi_user_cost_center'
+    ).length ?? 0;
+
+    if (emptyCenters.length > 0) {
+      findings.push({
+        ruleKey: 'billing-empty-active-cost-centers',
+        domain: 'billing',
+        severity: 'low',
+        title: 'Active cost centers have no assigned resources',
+        summary: `${emptyCenters.length} active cost ${emptyCenters.length === 1 ? 'center has' : 'centers have'} no reported users, teams, organizations, or repositories.`,
+        recommendation: 'Assign the intended resources or remove unused cost centers to keep billing ownership clear.',
+        affectedResources: emptyCenters.map(costCenter => costCenter.name),
+      });
+    }
+
+    if (costCenterInventoryKnown && input.budgets) {
+      const activeNames = new Set(
+        activeCenters.map(costCenter => costCenter.name.toLowerCase())
+      );
+      const unmatchedCostCenterBudgets = input.budgets.filter(
+        budget => (
+          budget.scope === 'cost_center' || budget.scope === 'multi_user_cost_center'
+        )
+          && budget.entityName !== null
+          && !activeNames.has(budget.entityName.toLowerCase())
+      );
+      if (unmatchedCostCenterBudgets.length > 0) {
+        findings.push({
+          ruleKey: 'billing-budget-cost-center-not-found',
+          domain: 'billing',
+          severity: 'medium',
+          title: 'Budgets reference unavailable active cost centers',
+          summary: `${unmatchedCostCenterBudgets.length} cost-center ${unmatchedCostCenterBudgets.length === 1 ? 'budget does' : 'budgets do'} not match the active cost-center inventory.`,
+          recommendation: 'Confirm that each budget points to the intended active cost center and remove stale billing controls.',
+          affectedResources: unmatchedCostCenterBudgets.map(formatBudgetResource),
+        });
+      }
+    }
   }
 
   const healthScore = Math.max(
@@ -2922,8 +3421,8 @@ export function evaluateAssessmentBaseline(input: {
     assessedDomainCount: 2
       + (input.securityDefaults || input.repositorySecurity ? 1 : 0)
       + (input.actionsPolicy || input.actionsEvidence ? 1 : 0)
-      + (input.copilotSeats ? 1 : 0)
-      + (input.budgets ? 1 : 0),
+      + (input.copilotSeats || input.copilotEvidence ? 1 : 0)
+      + (input.budgets || input.billingEvidence ? 1 : 0),
     findings,
     metrics: {
       activeRepositories: activeRepositories.length,
@@ -2991,12 +3490,33 @@ export function evaluateAssessmentBaseline(input: {
         inactiveCopilotSeats,
         pendingCopilotSeatCancellations,
       } : {}),
+      ...(input.copilotEvidence ? {
+        copilotContentExclusionRules,
+        copilotOrganizationsAllowingPublicCode,
+        copilotOrganizationsAssigningAllSeats,
+        copilotOrganizationsMeasured,
+        copilotOrganizationsWithBroadCodingAgentAccess,
+        copilotOrganizationsWithSeats,
+      } : {}),
       ...(input.budgets ? {
         alertingBudgets,
         budgets: input.budgets.length,
         budgetsWithoutUsagePrevention: input.budgets.length - enforcingBudgets,
         enforcingBudgets,
         userLevelBudgets,
+      } : {}),
+      ...(input.billingEvidence ? {
+        activeCostCenters,
+        billingNetAmount,
+        billingUsageItems,
+        costCenterResources,
+        costCenterUserMemberships,
+        effectiveUserBudgets,
+        emptyActiveCostCenters,
+        multiUserBudgetStates,
+        perUserCostCenterBudgets,
+        sharedCostCenterBudgets,
+        usersWithoutEffectiveBudgets,
       } : {}),
     },
   };
@@ -3135,14 +3655,29 @@ function normalizeCopilotSeat(value: unknown): AssessmentCopilotSeat {
     record.pending_cancellation_date,
     'Copilot seat cancellation'
   );
+  const organization = readAssessmentObject(record.organization);
+  const assigningTeam = readAssessmentObject(record.assigning_team);
   return {
     login: ((assignee as Record<string, unknown>).login as string),
     planType: record.plan_type,
     createdAt: record.created_at,
     lastAuthenticatedAt,
     lastActivityAt,
+    lastActivityEditor:
+      typeof record.last_activity_editor === 'string' ? record.last_activity_editor : null,
     pendingCancellationDate,
     assignmentCount: 1,
+    assignmentSources: [{
+      organization: organization && typeof organization.login === 'string'
+        ? organization.login
+        : null,
+      team: assigningTeam && typeof assigningTeam.slug === 'string'
+        ? assigningTeam.slug
+        : null,
+      teamType: assigningTeam && typeof assigningTeam.type === 'string'
+        ? assigningTeam.type
+        : null,
+    }],
   };
 }
 
@@ -3185,9 +3720,307 @@ function normalizeBudget(value: unknown): AssessmentBudget {
     preventsFurtherUsage: record.prevent_further_usage,
     alertingEnabled: (alerting as Record<string, unknown>).will_alert as boolean,
     alertRecipientCount: ((alerting as Record<string, unknown>).alert_recipients as unknown[]).length,
+    alertRecipients: ((alerting as Record<string, unknown>).alert_recipients as unknown[]).map(
+      recipient => {
+        if (typeof recipient !== 'string') {
+          throw new Error('GitHub returned an invalid enterprise budget alert recipient');
+        }
+        return recipient;
+      }
+    ),
     entityName: typeof record.budget_entity_name === 'string' ? record.budget_entity_name : null,
     user: typeof record.user === 'string' ? record.user : null,
     expiresAt: typeof expiresAt === 'string' ? expiresAt : null,
+  };
+}
+
+function normalizeCopilotOrganization(
+  value: unknown
+): Omit<AssessmentCopilotOrganization, 'organizationLogin' | 'codingAgentRepositoryScope'> {
+  const settings = readAssessmentObject(value);
+  const seats = settings ? readAssessmentObject(settings.seat_breakdown) : null;
+  if (
+    !settings
+    || !seats
+    || !Number.isInteger(seats.total)
+    || !Number.isInteger(seats.added_this_cycle)
+    || !Number.isInteger(seats.pending_cancellation)
+    || !Number.isInteger(seats.pending_invitation)
+    || !Number.isInteger(seats.active_this_cycle)
+    || !Number.isInteger(seats.inactive_this_cycle)
+    || typeof settings.plan_type !== 'string'
+    || typeof settings.seat_management_setting !== 'string'
+    || typeof settings.public_code_suggestions !== 'string'
+    || typeof settings.ide_chat !== 'string'
+    || typeof settings.platform_chat !== 'string'
+    || typeof settings.cli !== 'string'
+  ) {
+    throw new Error('GitHub returned invalid organization Copilot settings');
+  }
+  return {
+    seatTotal: seats.total as number,
+    seatsAddedThisCycle: seats.added_this_cycle as number,
+    seatsPendingCancellation: seats.pending_cancellation as number,
+    seatsPendingInvitation: seats.pending_invitation as number,
+    activeSeatsThisCycle: seats.active_this_cycle as number,
+    inactiveSeatsThisCycle: seats.inactive_this_cycle as number,
+    planType: settings.plan_type,
+    seatManagementSetting: settings.seat_management_setting,
+    publicCodeSuggestions: settings.public_code_suggestions,
+    ideChat: settings.ide_chat,
+    platformChat: settings.platform_chat,
+    cli: settings.cli,
+  };
+}
+
+function countCopilotContentExclusionRules(value: unknown): number {
+  if (Array.isArray(value)) return value.length;
+  const rules = readAssessmentObject(value);
+  if (!rules) {
+    throw new Error('GitHub returned invalid enterprise Copilot content exclusion rules');
+  }
+  return Object.keys(rules).length;
+}
+
+async function collectCostCenterDetails(
+  requests: AssessmentBillingRequests,
+  costCenterId: string
+): Promise<AssessmentCostCenter> {
+  let page = 1;
+  let costCenter: AssessmentCostCenter | null = null;
+  const resources: AssessmentCostCenterResource[] = [];
+
+  while (true) {
+    const response = await requests.getCostCenter(costCenterId, page, REST_PAGE_SIZE);
+    if (response.status !== 200) {
+      throw new Error(describeRestFailure('billing cost center details', response));
+    }
+    const value = normalizeCostCenter(response.data, []);
+    if (value.id !== costCenterId) {
+      throw new Error(`GitHub returned the wrong billing cost center ${value.id}`);
+    }
+    if (costCenter && (
+      costCenter.name !== value.name
+      || costCenter.state !== value.state
+      || costCenter.aiCreditPoolEnabled !== value.aiCreditPoolEnabled
+    )) {
+      throw new Error(`GitHub returned inconsistent billing cost center ${value.name}`);
+    }
+    costCenter = value;
+    resources.push(...(value.resources ?? []));
+    const record = readAssessmentObject(response.data);
+    if (!record || typeof record.has_next_page !== 'boolean') {
+      throw new Error('GitHub returned incomplete billing cost center pagination');
+    }
+    if (!record.has_next_page) break;
+    page += 1;
+  }
+
+  if (!costCenter) {
+    throw new Error(`GitHub returned no details for billing cost center ${costCenterId}`);
+  }
+  return {
+    ...costCenter,
+    resources: deduplicateCostCenterResources(resources),
+  };
+}
+
+function normalizeCostCenter(
+  value: unknown,
+  unavailableResources: AssessmentCostCenterResource[] | null
+): AssessmentCostCenter {
+  const center = readAssessmentObject(value);
+  if (
+    !center
+    || typeof center.id !== 'string'
+    || typeof center.name !== 'string'
+    || typeof center.state !== 'string'
+    || typeof center.ai_credit_pool_enabled !== 'boolean'
+  ) {
+    throw new Error('GitHub returned an invalid billing cost center');
+  }
+  const rawResources = center.resources;
+  let resources = unavailableResources;
+  if (Array.isArray(rawResources)) {
+    resources = rawResources.map(resourceValue => {
+      const resource = readAssessmentObject(resourceValue);
+      if (!resource || typeof resource.type !== 'string' || typeof resource.name !== 'string') {
+        throw new Error(`GitHub returned an invalid resource for cost center ${center.name}`);
+      }
+      return { type: resource.type, name: resource.name };
+    });
+  }
+  const poolState = readAssessmentObject(center.ai_credit_pool_state);
+  return {
+    id: center.id,
+    name: center.name,
+    state: center.state,
+    azureSubscription:
+      typeof center.azure_subscription === 'string' ? center.azure_subscription : null,
+    aiCreditPoolEnabled: center.ai_credit_pool_enabled,
+    aiCreditPoolTargetAmount: readOptionalNumber(
+      poolState?.target_amount,
+      'cost center AI credit target'
+    ),
+    aiCreditPoolCurrentAmount: readOptionalNumber(
+      poolState?.current_amount,
+      'cost center AI credit current amount'
+    ),
+    resources,
+  };
+}
+
+async function collectEffectiveBudget(
+  requests: AssessmentBillingRequests,
+  requestedUser: string
+): Promise<AssessmentEffectiveBudget> {
+  let page = 1;
+  let user = requestedUser;
+  let effectiveBudget: Omit<AssessmentEffectiveBudget, 'user' | 'applicableBudgetIds'> | null = null;
+  const applicableBudgetIds = new Set<string>();
+
+  while (true) {
+    const response = await requests.getEffectiveBudget(requestedUser, page, REST_PAGE_SIZE);
+    if (response.status !== 200) {
+      throw new Error(describeRestFailure('effective user budget', response));
+    }
+    const result = readAssessmentObject(response.data);
+    if (!result || !Array.isArray(result.budgets) || typeof result.has_next_page !== 'boolean') {
+      throw new Error('GitHub returned an invalid effective user budget response');
+    }
+    if (typeof result.user === 'string') user = result.user;
+    for (const budgetValue of result.budgets) {
+      const budget = readAssessmentObject(budgetValue);
+      if (!budget || typeof budget.id !== 'string') {
+        throw new Error('GitHub returned an invalid applicable user budget');
+      }
+      applicableBudgetIds.add(budget.id);
+    }
+    const normalizedEffectiveBudget = normalizeEffectiveBudget(result.effective_budget);
+    if (
+      effectiveBudget
+      && normalizedEffectiveBudget
+      && effectiveBudget.budgetId !== normalizedEffectiveBudget.budgetId
+    ) {
+      throw new Error(`GitHub returned inconsistent effective budgets for ${requestedUser}`);
+    }
+    effectiveBudget ??= normalizedEffectiveBudget;
+    if (!result.has_next_page) break;
+    page += 1;
+  }
+
+  return {
+    user,
+    budgetId: effectiveBudget?.budgetId ?? null,
+    amount: effectiveBudget?.amount ?? null,
+    consumedAmount: effectiveBudget?.consumedAmount ?? null,
+    applicableBudgetIds: [...applicableBudgetIds].sort(),
+  };
+}
+
+function normalizeEffectiveBudget(
+  value: unknown
+): Omit<AssessmentEffectiveBudget, 'user' | 'applicableBudgetIds'> | null {
+  if (value === undefined || value === null) return null;
+  const budget = readAssessmentObject(value);
+  if (
+    !budget
+    || typeof budget.id !== 'string'
+    || typeof budget.budget_amount !== 'number'
+    || typeof budget.consumed_amount !== 'number'
+  ) {
+    throw new Error('GitHub returned an invalid effective budget');
+  }
+  return {
+    budgetId: budget.id,
+    amount: budget.budget_amount,
+    consumedAmount: budget.consumed_amount,
+  };
+}
+
+async function collectBudgetUserStates(
+  requests: AssessmentBillingRequests,
+  budgetId: string
+): Promise<AssessmentBudgetUserState[]> {
+  let page = 1;
+  const states = new Map<string, AssessmentBudgetUserState>();
+  while (true) {
+    const response = await requests.getBudgetUserStates(budgetId, page, REST_PAGE_SIZE);
+    if (response.status !== 200) {
+      throw new Error(describeRestFailure('multi-user budget states', response));
+    }
+    const result = readAssessmentObject(response.data);
+    if (!result || !Array.isArray(result.user_states) || typeof result.has_next_page !== 'boolean') {
+      throw new Error('GitHub returned an invalid multi-user budget states response');
+    }
+    for (const value of result.user_states) {
+      const state = normalizeBudgetUserState(value, budgetId);
+      if (states.has(state.user.toLowerCase())) {
+        throw new Error(`GitHub returned duplicate budget state for ${state.user}`);
+      }
+      states.set(state.user.toLowerCase(), state);
+    }
+    if (!result.has_next_page) break;
+    page += 1;
+  }
+  return [...states.values()];
+}
+
+function normalizeBudgetUserState(value: unknown, budgetId: string): AssessmentBudgetUserState {
+  const state = readAssessmentObject(value);
+  if (
+    !state
+    || typeof state.user !== 'string'
+    || typeof state.consumed_amount !== 'number'
+    || typeof state.target_amount !== 'number'
+  ) {
+    throw new Error('GitHub returned an invalid multi-user budget state');
+  }
+  return {
+    budgetId,
+    user: state.user,
+    consumedAmount: state.consumed_amount,
+    targetAmount: state.target_amount,
+    overrideBudgetId: typeof state.override_budget_id === 'string'
+      ? state.override_budget_id
+      : null,
+  };
+}
+
+function normalizeBillingUsage(value: unknown): AssessmentBillingUsage {
+  const usage = readAssessmentObject(value);
+  const timePeriod = usage ? readAssessmentObject(usage.timePeriod) : null;
+  if (!usage || !timePeriod || !Number.isInteger(timePeriod.year) || !Array.isArray(usage.usageItems)) {
+    throw new Error('GitHub returned an invalid enterprise billing usage summary');
+  }
+  return {
+    year: timePeriod.year as number,
+    month: readOptionalInteger(timePeriod.month, 'billing usage month'),
+    day: readOptionalInteger(timePeriod.day, 'billing usage day'),
+    items: usage.usageItems.map(normalizeBillingUsageItem),
+  };
+}
+
+function normalizeBillingUsageItem(value: unknown): AssessmentBillingUsageItem {
+  const item = readAssessmentObject(value);
+  if (
+    !item
+    || typeof item.product !== 'string'
+    || typeof item.sku !== 'string'
+    || typeof item.unitType !== 'string'
+  ) {
+    throw new Error('GitHub returned an invalid enterprise billing usage item');
+  }
+  return {
+    product: item.product,
+    sku: item.sku,
+    unitType: item.unitType,
+    grossQuantity: readRequiredNumber(item.grossQuantity, 'gross usage quantity'),
+    grossAmount: readRequiredNumber(item.grossAmount, 'gross usage amount'),
+    discountQuantity: readRequiredNumber(item.discountQuantity, 'discount usage quantity'),
+    discountAmount: readRequiredNumber(item.discountAmount, 'discount usage amount'),
+    netQuantity: readRequiredNumber(item.netQuantity, 'net usage quantity'),
+    netAmount: readRequiredNumber(item.netAmount, 'net usage amount'),
   };
 }
 
@@ -3210,6 +4043,12 @@ function earlierTimestamp(left: string, right: string): string {
   return new Date(left).getTime() <= new Date(right).getTime() ? left : right;
 }
 
+function isLaterTimestamp(candidate: string | null, current: string | null): boolean {
+  if (!candidate) return false;
+  if (!current) return true;
+  return new Date(candidate).getTime() > new Date(current).getTime();
+}
+
 function earlierNullableTimestamp(left: string | null, right: string | null): string | null {
   if (!left) return right;
   if (!right) return left;
@@ -3220,6 +4059,60 @@ function laterNullableTimestamp(left: string | null, right: string | null): stri
   if (!left) return right;
   if (!right) return left;
   return new Date(left).getTime() >= new Date(right).getTime() ? left : right;
+}
+
+function mergeCopilotAssignmentSources(
+  left: AssessmentCopilotAssignmentSource[],
+  right: AssessmentCopilotAssignmentSource[]
+): AssessmentCopilotAssignmentSource[] {
+  const sources = new Map<string, AssessmentCopilotAssignmentSource>();
+  for (const source of [...left, ...right]) {
+    const key = [source.organization, source.team, source.teamType].join('\u0000');
+    sources.set(key, source);
+  }
+  return [...sources.values()].sort((first, second) => (
+    `${first.organization ?? ''}/${first.team ?? ''}`.localeCompare(
+      `${second.organization ?? ''}/${second.team ?? ''}`
+    )
+  ));
+}
+
+function deduplicateCostCenterResources(
+  resources: AssessmentCostCenterResource[]
+): AssessmentCostCenterResource[] {
+  const uniqueResources = new Map<string, AssessmentCostCenterResource>();
+  for (const resource of resources) {
+    uniqueResources.set(`${resource.type.toLowerCase()}\u0000${resource.name.toLowerCase()}`, resource);
+  }
+  return [...uniqueResources.values()].sort((left, right) => (
+    `${left.type}/${left.name}`.localeCompare(`${right.type}/${right.name}`)
+  ));
+}
+
+function uniqueSortedStrings(values: string[]): string[] {
+  const uniqueValues = new Map<string, string>();
+  for (const value of values) uniqueValues.set(value.toLowerCase(), value);
+  return [...uniqueValues.values()].sort((left, right) => left.localeCompare(right));
+}
+
+function readRequiredNumber(value: unknown, label: string): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    throw new Error(`GitHub returned an invalid ${label}`);
+  }
+  return value;
+}
+
+function readOptionalNumber(value: unknown, label: string): number | null {
+  if (value === undefined || value === null) return null;
+  return readRequiredNumber(value, label);
+}
+
+function readOptionalInteger(value: unknown, label: string): number | null {
+  if (value === undefined || value === null) return null;
+  if (!Number.isInteger(value)) {
+    throw new Error(`GitHub returned an invalid ${label}`);
+  }
+  return value as number;
 }
 
 function formatRulesetBypassResource({

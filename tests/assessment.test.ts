@@ -3,6 +3,8 @@ import test from 'node:test';
 import {
   collectEnterpriseActionsEvidence,
   collectEnterpriseActionsPolicy,
+  collectBillingGovernance,
+  collectCopilotGovernance,
   collectEnterpriseBudgets,
   collectEnterpriseCopilotSeats,
   collectEnterpriseIdentity,
@@ -916,6 +918,9 @@ test('collects and deduplicates paginated enterprise Copilot seats', async () =>
     plan_type: 'business',
     last_authenticated_at: null,
     last_activity_at: index === 0 ? '2026-08-01T00:00:00Z' : null,
+    last_activity_editor: index === 0 ? 'vscode' : null,
+    organization: { login: 'org-one' },
+    assigning_team: null,
   }));
 
   const inventory = await collectEnterpriseCopilotSeats(async page => {
@@ -929,6 +934,9 @@ test('collects and deduplicates paginated enterprise Copilot seats', async () =>
             created_at: '2026-02-01T00:00:00Z',
             last_authenticated_at: '2026-09-01T00:00:00Z',
             last_activity_at: '2026-09-02T00:00:00Z',
+            last_activity_editor: 'jetbrains',
+            organization: { login: 'org-two' },
+            assigning_team: { slug: 'platform', type: 'organization' },
           }],
     };
   });
@@ -943,8 +951,13 @@ test('collects and deduplicates paginated enterprise Copilot seats', async () =>
     createdAt: '2026-01-01T00:00:00Z',
     lastAuthenticatedAt: '2026-09-01T00:00:00Z',
     lastActivityAt: '2026-09-02T00:00:00Z',
+    lastActivityEditor: 'jetbrains',
     pendingCancellationDate: null,
     assignmentCount: 2,
+    assignmentSources: [
+      { organization: 'org-one', team: null, teamType: null },
+      { organization: 'org-two', team: 'platform', teamType: 'organization' },
+    ],
   });
 });
 
@@ -984,6 +997,7 @@ test('collects paginated enterprise budgets', async () => {
       preventsFurtherUsage: true,
       alertingEnabled: true,
       alertRecipientCount: 1,
+      alertRecipients: ['owner'],
       entityName: 'acme',
       user: null,
       expiresAt: null,
@@ -998,11 +1012,192 @@ test('collects paginated enterprise budgets', async () => {
       preventsFurtherUsage: true,
       alertingEnabled: false,
       alertRecipientCount: 0,
+      alertRecipients: [],
       entityName: 'octocat',
       user: null,
       expiresAt: null,
     },
   ]);
+});
+
+test('collects organization Copilot policy with granular failures', async () => {
+  const evidence = await collectCopilotGovernance({
+    getContentExclusion: async () => ({ status: 200, data: {} }),
+    getOrganizationSettings: async organizationLogin => (
+      organizationLogin === 'org-two'
+        ? { status: 403, data: { message: 'Forbidden' } }
+        : {
+            status: 200,
+            data: {
+              seat_breakdown: {
+                total: 4,
+                added_this_cycle: 1,
+                pending_cancellation: 0,
+                pending_invitation: 0,
+                active_this_cycle: 3,
+                inactive_this_cycle: 1,
+              },
+              plan_type: 'enterprise',
+              seat_management_setting: 'assign_selected',
+              public_code_suggestions: 'block',
+              ide_chat: 'enabled',
+              platform_chat: 'enabled',
+              cli: 'disabled',
+            },
+          }
+    ),
+    getCodingAgentPermissions: async organizationLogin => ({
+      status: 200,
+      data: { enabled_repositories: organizationLogin === 'org-one' ? 'selected' : 'none' },
+    }),
+  }, ['org-one', 'org-two']);
+
+  assert.equal(evidence.contentExclusionRuleCount, 0);
+  assert.deepEqual(evidence.organizations[0], {
+    organizationLogin: 'org-one',
+    seatTotal: 4,
+    seatsAddedThisCycle: 1,
+    seatsPendingCancellation: 0,
+    seatsPendingInvitation: 0,
+    activeSeatsThisCycle: 3,
+    inactiveSeatsThisCycle: 1,
+    planType: 'enterprise',
+    seatManagementSetting: 'assign_selected',
+    publicCodeSuggestions: 'block',
+    ideChat: 'enabled',
+    platformChat: 'enabled',
+    cli: 'disabled',
+    codingAgentRepositoryScope: 'selected',
+  });
+  assert.equal(evidence.organizations[1].seatTotal, null);
+  assert.equal(evidence.organizations[1].codingAgentRepositoryScope, 'none');
+  assert.deepEqual(evidence.failures, [{
+    scope: 'org-two',
+    check: 'organization-settings',
+    error: 'GitHub returned 403 for organization Copilot settings: Forbidden',
+  }]);
+});
+
+test('collects cost centers, effective budgets, user states, and usage independently', async () => {
+  const costCenterPages: number[] = [];
+  const evidence = await collectBillingGovernance({
+    getCostCenters: async () => ({
+      status: 200,
+      data: {
+        costCenters: [
+          {
+            id: 'center-1',
+            name: 'Engineering',
+            state: 'active',
+            azure_subscription: null,
+            ai_credit_pool_enabled: false,
+            resources: [],
+          },
+          {
+            id: 'center-2',
+            name: 'Research',
+            state: 'active',
+            azure_subscription: null,
+            ai_credit_pool_enabled: false,
+            resources: [],
+          },
+        ],
+      },
+    }),
+    getCostCenter: async (costCenterId, page) => {
+      if (costCenterId === 'center-2') {
+        return { status: 403, data: { message: 'Forbidden' } };
+      }
+      costCenterPages.push(page);
+      return {
+        status: 200,
+        data: {
+          id: 'center-1',
+          name: 'Engineering',
+          state: 'active',
+          azure_subscription: null,
+          ai_credit_pool_enabled: false,
+          resources: page === 1
+            ? [{ type: 'User', name: 'octocat' }]
+            : [{ type: 'Team', name: 'platform' }],
+          has_next_page: page === 1,
+        },
+      };
+    },
+    getEffectiveBudget: async user => ({
+      status: 200,
+      data: {
+        user,
+        budgets: [{ id: 'enterprise-budget' }],
+        effective_budget: user === 'octocat'
+          ? { id: 'user-budget', budget_amount: 100, consumed_amount: 12.5 }
+          : null,
+        has_next_page: false,
+      },
+    }),
+    getBudgetUserStates: async (_budgetId, page) => ({
+      status: 200,
+      data: {
+        user_states: page === 1
+          ? [{
+              user: 'octocat',
+              consumed_amount: 12.5,
+              target_amount: 100,
+              override_budget_id: 'user-budget',
+            }]
+          : [],
+        has_next_page: false,
+      },
+    }),
+    getUsageSummary: async () => ({
+      status: 200,
+      data: {
+        timePeriod: { year: 2026, month: 9 },
+        usageItems: [{
+          product: 'Copilot',
+          sku: 'copilot_ai_unit',
+          unitType: 'ai-units',
+          grossQuantity: 3,
+          grossAmount: 3,
+          discountQuantity: 1,
+          discountAmount: 1,
+          netQuantity: 2,
+          netAmount: 2,
+        }],
+      },
+    }),
+  }, [{
+    id: 'multi-budget',
+    budgetType: 'ProductPricing',
+    productSku: 'ai_credits',
+    scope: 'multi_user_customer',
+    amount: 100,
+    consumedAmount: null,
+    preventsFurtherUsage: true,
+    alertingEnabled: false,
+    alertRecipientCount: 0,
+    alertRecipients: [],
+    entityName: 'acme',
+    user: null,
+    expiresAt: null,
+  }], ['octocat', 'hubot']);
+
+  assert.deepEqual(costCenterPages, [1, 2]);
+  assert.deepEqual(evidence.costCenters[0].resources, [
+    { type: 'Team', name: 'platform' },
+    { type: 'User', name: 'octocat' },
+  ]);
+  assert.equal(evidence.costCenters[1].resources, null);
+  assert.equal(evidence.effectiveBudgets[0].user, 'hubot');
+  assert.equal(evidence.effectiveBudgets[0].budgetId, null);
+  assert.equal(evidence.effectiveBudgets[1].budgetId, 'user-budget');
+  assert.equal(evidence.multiUserBudgetStates[0].overrideBudgetId, 'user-budget');
+  assert.equal(evidence.usage?.items[0].netAmount, 2);
+  assert.deepEqual(evidence.failures, [{
+    scope: 'Research',
+    check: 'cost-center-resources',
+    error: 'GitHub returned 403 for billing cost center details: Forbidden',
+  }]);
 });
 
 test('rejects malformed Copilot seat and budget responses', async () => {
@@ -1561,8 +1756,10 @@ test('evaluates Copilot seat utilization and enterprise budget controls', () => 
           createdAt: '2026-01-01T00:00:00Z',
           lastAuthenticatedAt: '2026-09-09T00:00:00Z',
           lastActivityAt: '2026-09-09T00:00:00Z',
+          lastActivityEditor: 'vscode',
           pendingCancellationDate: null,
           assignmentCount: 2,
+          assignmentSources: [{ organization: 'org-one', team: null, teamType: null }],
         },
         {
           login: 'inactive-user',
@@ -1570,8 +1767,10 @@ test('evaluates Copilot seat utilization and enterprise budget controls', () => 
           createdAt: '2026-01-01T00:00:00Z',
           lastAuthenticatedAt: null,
           lastActivityAt: null,
+          lastActivityEditor: null,
           pendingCancellationDate: null,
           assignmentCount: 1,
+          assignmentSources: [{ organization: 'org-one', team: null, teamType: null }],
         },
         {
           login: 'new-user',
@@ -1579,8 +1778,10 @@ test('evaluates Copilot seat utilization and enterprise budget controls', () => 
           createdAt: '2026-09-01T00:00:00Z',
           lastAuthenticatedAt: null,
           lastActivityAt: null,
+          lastActivityEditor: null,
           pendingCancellationDate: null,
           assignmentCount: 1,
+          assignmentSources: [{ organization: 'org-one', team: null, teamType: null }],
         },
         {
           login: 'departing-user',
@@ -1588,8 +1789,10 @@ test('evaluates Copilot seat utilization and enterprise budget controls', () => 
           createdAt: '2026-01-01T00:00:00Z',
           lastAuthenticatedAt: null,
           lastActivityAt: null,
+          lastActivityEditor: null,
           pendingCancellationDate: '2026-09-30',
           assignmentCount: 1,
+          assignmentSources: [{ organization: 'org-one', team: null, teamType: null }],
         },
       ],
     },
@@ -1604,6 +1807,7 @@ test('evaluates Copilot seat utilization and enterprise budget controls', () => 
         preventsFurtherUsage: true,
         alertingEnabled: true,
         alertRecipientCount: 1,
+        alertRecipients: ['owner-one'],
         entityName: 'acme',
         user: null,
         expiresAt: null,
@@ -1618,6 +1822,7 @@ test('evaluates Copilot seat utilization and enterprise budget controls', () => 
         preventsFurtherUsage: false,
         alertingEnabled: true,
         alertRecipientCount: 1,
+        alertRecipients: ['owner-one'],
         entityName: 'research',
         user: null,
         expiresAt: null,
@@ -1632,6 +1837,7 @@ test('evaluates Copilot seat utilization and enterprise budget controls', () => 
         preventsFurtherUsage: true,
         alertingEnabled: false,
         alertRecipientCount: 0,
+        alertRecipients: [],
         entityName: 'acme',
         user: null,
         expiresAt: null,
@@ -1646,6 +1852,7 @@ test('evaluates Copilot seat utilization and enterprise budget controls', () => 
         preventsFurtherUsage: true,
         alertingEnabled: false,
         alertRecipientCount: 0,
+        alertRecipients: [],
         entityName: 'octocat',
         user: 'octocat',
         expiresAt: null,
@@ -1672,4 +1879,135 @@ test('evaluates Copilot seat utilization and enterprise budget controls', () => 
   assert.equal(evaluation.metrics.enforcingBudgets, 3);
   assert.equal(evaluation.metrics.alertingBudgets, 2);
   assert.equal(evaluation.metrics.userLevelBudgets, 2);
+});
+
+test('evaluates Copilot policy and billing ownership depth conservatively', () => {
+  const evaluation = evaluateAssessmentBaseline({
+    organizations: [],
+    members: [
+      { login: 'owner-one', name: null, isOwner: true },
+      { login: 'owner-two', name: null, isOwner: true },
+    ],
+    ownerCount: 2,
+    repositories: [],
+    teams: [],
+    copilotEvidence: {
+      contentExclusionRuleCount: 0,
+      organizations: [
+        {
+          organizationLogin: 'licensed-org',
+          seatTotal: 4,
+          seatsAddedThisCycle: 0,
+          seatsPendingCancellation: 0,
+          seatsPendingInvitation: 0,
+          activeSeatsThisCycle: 3,
+          inactiveSeatsThisCycle: 1,
+          planType: 'enterprise',
+          seatManagementSetting: 'assign_all',
+          publicCodeSuggestions: 'allow',
+          ideChat: 'enabled',
+          platformChat: 'enabled',
+          cli: 'enabled',
+          codingAgentRepositoryScope: 'all',
+        },
+        {
+          organizationLogin: 'unlicensed-org',
+          seatTotal: 0,
+          seatsAddedThisCycle: 0,
+          seatsPendingCancellation: 0,
+          seatsPendingInvitation: 0,
+          activeSeatsThisCycle: 0,
+          inactiveSeatsThisCycle: 0,
+          planType: 'enterprise',
+          seatManagementSetting: 'unconfigured',
+          publicCodeSuggestions: 'allow',
+          ideChat: 'enabled',
+          platformChat: 'enabled',
+          cli: 'enabled',
+          codingAgentRepositoryScope: 'all',
+        },
+      ],
+      failures: [],
+    },
+    budgets: [{
+      id: 'orphan-budget',
+      budgetType: 'ProductPricing',
+      productSku: 'ai_credits',
+      scope: 'cost_center',
+      amount: 500,
+      consumedAmount: null,
+      preventsFurtherUsage: true,
+      alertingEnabled: true,
+      alertRecipientCount: 1,
+      alertRecipients: ['owner-one'],
+      entityName: 'Missing',
+      user: null,
+      expiresAt: null,
+    }],
+    billingEvidence: {
+      costCenters: [{
+        id: 'empty-center',
+        name: 'Empty',
+        state: 'active',
+        azureSubscription: null,
+        aiCreditPoolEnabled: false,
+        aiCreditPoolTargetAmount: null,
+        aiCreditPoolCurrentAmount: null,
+        resources: [],
+      }],
+      effectiveBudgets: [
+        {
+          user: 'owner-one',
+          budgetId: null,
+          amount: null,
+          consumedAmount: null,
+          applicableBudgetIds: ['orphan-budget'],
+        },
+        {
+          user: 'owner-two',
+          budgetId: 'user-budget',
+          amount: 100,
+          consumedAmount: 10,
+          applicableBudgetIds: ['user-budget'],
+        },
+      ],
+      multiUserBudgetStates: [],
+      usage: {
+        year: 2026,
+        month: 9,
+        day: null,
+        items: [{
+          product: 'Copilot',
+          sku: 'copilot_for_business',
+          unitType: 'user-months',
+          grossQuantity: 2,
+          grossAmount: 38,
+          discountQuantity: 0,
+          discountAmount: 0,
+          netQuantity: 2,
+          netAmount: 38,
+        }],
+      },
+      failures: [],
+    },
+    now: new Date('2026-09-10T00:00:00Z'),
+  });
+
+  assert.equal(evaluation.assessedDomainCount, 4);
+  assert.equal(evaluation.healthScore, 65);
+  assert.deepEqual(evaluation.findings.map(finding => finding.ruleKey), [
+    'copilot-assign-all-seat-management',
+    'copilot-public-code-suggestions-review',
+    'copilot-coding-agent-all-repositories',
+    'billing-empty-active-cost-centers',
+    'billing-budget-cost-center-not-found',
+  ]);
+  assert.equal(evaluation.metrics.copilotOrganizationsWithSeats, 1);
+  assert.equal(evaluation.metrics.copilotOrganizationsAllowingPublicCode, 1);
+  assert.equal(evaluation.metrics.copilotOrganizationsWithBroadCodingAgentAccess, 1);
+  assert.equal(evaluation.metrics.activeCostCenters, 1);
+  assert.equal(evaluation.metrics.emptyActiveCostCenters, 1);
+  assert.equal(evaluation.metrics.effectiveUserBudgets, 1);
+  assert.equal(evaluation.metrics.usersWithoutEffectiveBudgets, 1);
+  assert.equal(evaluation.metrics.billingNetAmount, 38);
 });
