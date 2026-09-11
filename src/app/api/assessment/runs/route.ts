@@ -11,6 +11,7 @@ import {
   collectEnterpriseSecurityDefaults,
   collectOrganizationRepositories,
   collectOrganizationTeams,
+  collectRepositoryRules,
   collectRepositorySecurity,
   evaluateAssessmentBaseline,
   type AssessmentRestResponse,
@@ -66,6 +67,7 @@ export async function POST(request: Request) {
   const teamCollectorId = uuidv4();
   const securityCollectorId = uuidv4();
   const repositorySecurityCollectorId = uuidv4();
+  const repositoryRulesCollectorId = uuidv4();
   const actionsCollectorId = uuidv4();
   const actionsDepthCollectorId = uuidv4();
   const copilotCollectorId = uuidv4();
@@ -146,6 +148,36 @@ export async function POST(request: Request) {
     }, repositoryResult.items);
     const repositorySecurityDurationMs = Math.round(
       performance.now() - repositorySecurityStartedAt
+    );
+    const repositoryRulesStartedAt = performance.now();
+    const repositoryRulesResult = await collectRepositoryRules({
+      getEffectiveRules: (owner, repo, branch, page, perPage) => requestWithStatus(
+        () => octokit.request(
+          'GET /repos/{owner}/{repo}/rules/branches/{branch}',
+          {
+            owner,
+            repo,
+            branch,
+            page,
+            per_page: perPage,
+            headers: { 'X-GitHub-Api-Version': '2026-03-10' },
+          }
+        )
+      ),
+      getClassicProtection: (owner, repo, branch) => requestWithStatus(
+        () => octokit.request(
+          'GET /repos/{owner}/{repo}/branches/{branch}/protection',
+          {
+            owner,
+            repo,
+            branch,
+            headers: { 'X-GitHub-Api-Version': '2026-03-10' },
+          }
+        )
+      ),
+    }, repositorySecurityResult.items);
+    const repositoryRulesDurationMs = Math.round(
+      performance.now() - repositoryRulesStartedAt
     );
     const securityResult = await collectOptionalEvidence(() => (
       collectEnterpriseSecurityDefaults(async () => (
@@ -253,6 +285,7 @@ export async function POST(request: Request) {
       teams: teamResult.items,
       securityDefaults: securityResult.value,
       repositorySecurity: repositorySecurityResult.items,
+      repositoryRules: repositoryRulesResult.items,
       actionsPolicy: actionsResult.value,
       actionsEvidence: actionsDepthResult.value,
       copilotSeats: copilotResult.value,
@@ -282,6 +315,10 @@ export async function POST(request: Request) {
         id: repositorySecurityCollectorId,
         durationMs: repositorySecurityDurationMs,
       },
+      repositoryRulesCollector: {
+        id: repositoryRulesCollectorId,
+        durationMs: repositoryRulesDurationMs,
+      },
       actionsCollector: {
         id: actionsCollectorId,
         durationMs: actionsResult.durationMs,
@@ -305,6 +342,8 @@ export async function POST(request: Request) {
       securityDefaults: securityResult.value,
       repositorySecurity: repositorySecurityResult.items,
       repositorySecurityFailures: repositorySecurityResult.failures,
+      repositoryRules: repositoryRulesResult.items,
+      repositoryRulesFailures: repositoryRulesResult.failures,
       actionsPolicy: actionsResult.value,
       actionsEvidence: actionsDepthResult.value,
       copilotSeats: copilotResult.value,

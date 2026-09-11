@@ -9,6 +9,8 @@ import type {
   AssessmentBudget,
   AssessmentCopilotSeatInventory,
   AssessmentEvaluation,
+  AssessmentRepositoryRules,
+  AssessmentRepositoryRulesFailure,
   AssessmentRepositorySecurity,
   AssessmentRepositorySecurityFailure,
   AssessmentSecurityDefault,
@@ -242,6 +244,7 @@ function initSchema(db: Database.Database) {
       visibility TEXT NOT NULL,
       is_archived INTEGER NOT NULL DEFAULT 0,
       is_fork INTEGER NOT NULL DEFAULT 0,
+      default_branch TEXT,
       code_security TEXT,
       code_scanning_default_setup TEXT,
       secret_scanning TEXT,
@@ -253,6 +256,36 @@ function initSchema(db: Database.Database) {
       configuration_name TEXT,
       configuration_enforcement TEXT,
       PRIMARY KEY(run_id, name_with_owner)
+    );
+
+    CREATE TABLE IF NOT EXISTS assessment_repository_rules (
+      run_id TEXT NOT NULL REFERENCES assessment_runs(id) ON DELETE CASCADE,
+      name_with_owner TEXT NOT NULL,
+      visibility TEXT NOT NULL,
+      is_archived INTEGER NOT NULL DEFAULT 0,
+      is_fork INTEGER NOT NULL DEFAULT 0,
+      default_branch TEXT,
+      branch_exists INTEGER,
+      classic_protection INTEGER,
+      has_protection INTEGER,
+      active_ruleset_ids TEXT,
+      active_ruleset_sources TEXT,
+      rule_types TEXT,
+      requires_pull_request INTEGER,
+      required_approving_review_count INTEGER,
+      requires_status_checks INTEGER,
+      blocks_force_pushes INTEGER,
+      blocks_deletions INTEGER,
+      enforces_admins INTEGER,
+      PRIMARY KEY(run_id, name_with_owner)
+    );
+
+    CREATE TABLE IF NOT EXISTS assessment_repository_rules_failures (
+      run_id TEXT NOT NULL REFERENCES assessment_runs(id) ON DELETE CASCADE,
+      name_with_owner TEXT NOT NULL,
+      check_key TEXT NOT NULL,
+      error TEXT NOT NULL,
+      PRIMARY KEY(run_id, name_with_owner, check_key)
     );
 
     CREATE TABLE IF NOT EXISTS assessment_actions_policies (
@@ -338,6 +371,13 @@ function initSchema(db: Database.Database) {
       PRIMARY KEY(run_id, budget_id)
     );
   `);
+
+  const repositorySecurityColumns = db.prepare(
+    'PRAGMA table_info(assessment_repository_security)'
+  ).all() as Array<{ name: string }>;
+  if (!repositorySecurityColumns.some(column => column.name === 'default_branch')) {
+    db.exec('ALTER TABLE assessment_repository_security ADD COLUMN default_branch TEXT');
+  }
 }
 
 // === Encryption Helpers ===
@@ -792,6 +832,11 @@ function nullableBooleanToInteger(value: boolean | null | undefined): number | n
   return value ? 1 : 0;
 }
 
+function nullableIntegerToBoolean(value: number | null): boolean | null {
+  if (value === null) return null;
+  return value === 1;
+}
+
 export function completeAssessment(input: {
   runId: string;
   durationMs: number;
@@ -801,6 +846,7 @@ export function completeAssessment(input: {
   teamCollector: { id: string; durationMs: number };
   securityCollector: { id: string; durationMs: number; error: string | null };
   repositorySecurityCollector: { id: string; durationMs: number };
+  repositoryRulesCollector: { id: string; durationMs: number };
   actionsCollector: { id: string; durationMs: number; error: string | null };
   actionsDepthCollector: { id: string; durationMs: number; error: string | null };
   copilotCollector: { id: string; durationMs: number; error: string | null };
@@ -840,6 +886,8 @@ export function completeAssessment(input: {
   securityDefaults: AssessmentSecurityDefault[] | null;
   repositorySecurity: AssessmentRepositorySecurity[];
   repositorySecurityFailures: AssessmentRepositorySecurityFailure[];
+  repositoryRules: AssessmentRepositoryRules[];
+  repositoryRulesFailures: AssessmentRepositoryRulesFailure[];
   actionsPolicy: AssessmentActionsPolicy | null;
   actionsEvidence: AssessmentActionsEvidence | null;
   copilotSeats: AssessmentCopilotSeatInventory | null;
@@ -879,11 +927,25 @@ export function completeAssessment(input: {
   `);
   const insertRepositorySecurity = db.prepare(`
     INSERT INTO assessment_repository_security
-      (run_id, name_with_owner, visibility, is_archived, is_fork, code_security,
+      (run_id, name_with_owner, visibility, is_archived, is_fork, default_branch, code_security,
        code_scanning_default_setup, secret_scanning, secret_scanning_push_protection, dependabot_alerts,
        dependabot_security_updates, configuration_status, configuration_id,
        configuration_name, configuration_enforcement)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  const insertRepositoryRules = db.prepare(`
+    INSERT INTO assessment_repository_rules
+      (run_id, name_with_owner, visibility, is_archived, is_fork, default_branch,
+       branch_exists, classic_protection, has_protection, active_ruleset_ids,
+       active_ruleset_sources, rule_types, requires_pull_request,
+       required_approving_review_count, requires_status_checks, blocks_force_pushes,
+       blocks_deletions, enforces_admins)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  const insertRepositoryRulesFailure = db.prepare(`
+    INSERT INTO assessment_repository_rules_failures
+      (run_id, name_with_owner, check_key, error)
+    VALUES (?, ?, ?, ?)
   `);
   const insertActionsDetails = db.prepare(`
     INSERT INTO assessment_actions_details
@@ -1010,6 +1072,7 @@ export function completeAssessment(input: {
         repositorySecurity.visibility,
         repositorySecurity.isArchived ? 1 : 0,
         repositorySecurity.isFork ? 1 : 0,
+        repositorySecurity.defaultBranch,
         repositorySecurity.codeSecurity,
         repositorySecurity.codeScanningDefaultSetup,
         repositorySecurity.secretScanning,
@@ -1020,6 +1083,40 @@ export function completeAssessment(input: {
         repositorySecurity.configurationId,
         repositorySecurity.configurationName,
         repositorySecurity.configurationEnforcement
+      );
+    }
+    for (const repositoryRules of input.repositoryRules) {
+      insertRepositoryRules.run(
+        input.runId,
+        repositoryRules.nameWithOwner,
+        repositoryRules.visibility,
+        repositoryRules.isArchived ? 1 : 0,
+        repositoryRules.isFork ? 1 : 0,
+        repositoryRules.defaultBranch,
+        nullableBooleanToInteger(repositoryRules.branchExists),
+        nullableBooleanToInteger(repositoryRules.classicProtection),
+        nullableBooleanToInteger(repositoryRules.hasProtection),
+        repositoryRules.activeRulesetIds === null
+          ? null
+          : JSON.stringify(repositoryRules.activeRulesetIds),
+        repositoryRules.activeRulesetSources === null
+          ? null
+          : JSON.stringify(repositoryRules.activeRulesetSources),
+        repositoryRules.ruleTypes === null ? null : JSON.stringify(repositoryRules.ruleTypes),
+        nullableBooleanToInteger(repositoryRules.requiresPullRequest),
+        repositoryRules.requiredApprovingReviewCount,
+        nullableBooleanToInteger(repositoryRules.requiresStatusChecks),
+        nullableBooleanToInteger(repositoryRules.blocksForcePushes),
+        nullableBooleanToInteger(repositoryRules.blocksDeletions),
+        nullableBooleanToInteger(repositoryRules.enforcesAdmins)
+      );
+    }
+    for (const failure of input.repositoryRulesFailures) {
+      insertRepositoryRulesFailure.run(
+        input.runId,
+        failure.nameWithOwner,
+        failure.check,
+        failure.error
       );
     }
     if (input.actionsPolicy) {
@@ -1184,6 +1281,18 @@ export function completeAssessment(input: {
     db.prepare(`
       INSERT INTO assessment_collector_results
         (id, run_id, collector_key, status, item_count, duration_ms, error)
+      VALUES (?, ?, 'repositoryRules', ?, ?, ?, ?)
+    `).run(
+      input.repositoryRulesCollector.id,
+      input.runId,
+      input.repositoryRulesFailures.length > 0 ? 'partial' : 'completed',
+      input.repositoryRules.length,
+      input.repositoryRulesCollector.durationMs,
+      formatRepositoryRulesFailures(input.repositoryRulesFailures)
+    );
+    db.prepare(`
+      INSERT INTO assessment_collector_results
+        (id, run_id, collector_key, status, item_count, duration_ms, error)
       VALUES (?, ?, 'actions', ?, ?, ?, ?)
     `).run(
       input.actionsCollector.id,
@@ -1301,6 +1410,17 @@ function formatRepositorySecurityFailures(
     .join('\n');
 }
 
+function formatRepositoryRulesFailures(
+  failures: AssessmentRepositoryRulesFailure[]
+): string | null {
+  if (failures.length === 0) return null;
+  return failures
+    .map(failure => (
+      `${failure.nameWithOwner} [${failure.check}]: ${failure.error.replace(/\s+/g, ' ').trim()}`
+    ))
+    .join('\n');
+}
+
 function formatActionsFailures(
   failures: AssessmentActionsEvidence['failures']
 ): string | null {
@@ -1347,7 +1467,7 @@ function getAssessmentSnapshot(run: AssessmentRunRow) {
     affected_resources: string;
   }>;
   const repositorySecurity = getDb().prepare(`
-    SELECT name_with_owner, visibility, is_archived, is_fork, code_security,
+    SELECT name_with_owner, visibility, is_archived, is_fork, default_branch, code_security,
       code_scanning_default_setup, secret_scanning, secret_scanning_push_protection, dependabot_alerts,
       dependabot_security_updates, configuration_status, configuration_id,
       configuration_name, configuration_enforcement
@@ -1359,6 +1479,7 @@ function getAssessmentSnapshot(run: AssessmentRunRow) {
     visibility: string;
     is_archived: number;
     is_fork: number;
+    default_branch: string | null;
     code_security: string | null;
     code_scanning_default_setup: string | null;
     secret_scanning: string | null;
@@ -1369,6 +1490,34 @@ function getAssessmentSnapshot(run: AssessmentRunRow) {
     configuration_id: number | null;
     configuration_name: string | null;
     configuration_enforcement: string | null;
+  }>;
+  const repositoryRules = getDb().prepare(`
+    SELECT name_with_owner, visibility, is_archived, is_fork, default_branch,
+      branch_exists, classic_protection, has_protection, active_ruleset_ids,
+      active_ruleset_sources, rule_types, requires_pull_request,
+      required_approving_review_count, requires_status_checks, blocks_force_pushes,
+      blocks_deletions, enforces_admins
+    FROM assessment_repository_rules
+    WHERE run_id = ?
+    ORDER BY name_with_owner
+  `).all(run.id) as Array<{
+    name_with_owner: string;
+    visibility: string;
+    is_archived: number;
+    is_fork: number;
+    default_branch: string | null;
+    branch_exists: number | null;
+    classic_protection: number | null;
+    has_protection: number | null;
+    active_ruleset_ids: string | null;
+    active_ruleset_sources: string | null;
+    rule_types: string | null;
+    requires_pull_request: number | null;
+    required_approving_review_count: number | null;
+    requires_status_checks: number | null;
+    blocks_force_pushes: number | null;
+    blocks_deletions: number | null;
+    enforces_admins: number | null;
   }>;
   const actionsDetails = getDb().prepare(`
     SELECT github_owned_allowed, verified_allowed, patterns_allowed,
@@ -1447,6 +1596,7 @@ function getAssessmentSnapshot(run: AssessmentRunRow) {
       visibility: repository.visibility,
       isArchived: repository.is_archived === 1,
       isFork: repository.is_fork === 1,
+      defaultBranch: repository.default_branch,
       codeSecurity: repository.code_security,
       codeScanningDefaultSetup: repository.code_scanning_default_setup,
       secretScanning: repository.secret_scanning,
@@ -1457,6 +1607,31 @@ function getAssessmentSnapshot(run: AssessmentRunRow) {
       configurationId: repository.configuration_id,
       configurationName: repository.configuration_name,
       configurationEnforcement: repository.configuration_enforcement,
+    })),
+    repositoryRules: repositoryRules.map(repository => ({
+      nameWithOwner: repository.name_with_owner,
+      visibility: repository.visibility,
+      isArchived: repository.is_archived === 1,
+      isFork: repository.is_fork === 1,
+      defaultBranch: repository.default_branch,
+      branchExists: nullableIntegerToBoolean(repository.branch_exists),
+      classicProtection: nullableIntegerToBoolean(repository.classic_protection),
+      hasProtection: nullableIntegerToBoolean(repository.has_protection),
+      activeRulesetIds: repository.active_ruleset_ids === null
+        ? null
+        : JSON.parse(repository.active_ruleset_ids) as number[],
+      activeRulesetSources: repository.active_ruleset_sources === null
+        ? null
+        : JSON.parse(repository.active_ruleset_sources) as string[],
+      ruleTypes: repository.rule_types === null
+        ? null
+        : JSON.parse(repository.rule_types) as string[],
+      requiresPullRequest: nullableIntegerToBoolean(repository.requires_pull_request),
+      requiredApprovingReviewCount: repository.required_approving_review_count,
+      requiresStatusChecks: nullableIntegerToBoolean(repository.requires_status_checks),
+      blocksForcePushes: nullableIntegerToBoolean(repository.blocks_force_pushes),
+      blocksDeletions: nullableIntegerToBoolean(repository.blocks_deletions),
+      enforcesAdmins: nullableIntegerToBoolean(repository.enforces_admins),
     })),
     actionsEvidence: actionsDetails ? {
       selectedActions:

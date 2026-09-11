@@ -10,6 +10,7 @@ import {
   collectEnterpriseSecurityDefaults,
   collectOrganizationRepositories,
   collectOrganizationTeams,
+  collectRepositoryRules,
   collectRepositorySecurity,
   evaluateAssessmentBaseline,
 } from '../src/lib/assessment';
@@ -460,6 +461,7 @@ test('collects repository-level security features, Dependabot alerts, and config
     visibility: 'PRIVATE',
     isArchived: false,
     isFork: false,
+    defaultBranch: null,
     codeSecurity: 'enabled',
     codeScanningDefaultSetup: 'configured',
     secretScanning: 'enabled',
@@ -512,6 +514,153 @@ test('retains repository security evidence when individual checks are unavailabl
   assert.match(result.failures[0].error, /403.*SAML/);
   assert.match(result.failures[1].error, /503.*Service unavailable/);
   assert.match(result.failures[2].error, /404.*Not Found/);
+});
+
+test('collects paginated effective rules and combines them with classic branch protection', async () => {
+  const requestedPages: number[] = [];
+  const repository = {
+    nameWithOwner: 'acme/protected',
+    visibility: 'PRIVATE',
+    isArchived: false,
+    isFork: false,
+    defaultBranch: 'main',
+    codeSecurity: null,
+    codeScanningDefaultSetup: null,
+    secretScanning: null,
+    secretScanningPushProtection: null,
+    dependabotAlerts: null,
+    dependabotSecurityUpdates: null,
+    configurationStatus: null,
+    configurationId: null,
+    configurationName: null,
+    configurationEnforcement: null,
+  };
+  const result = await collectRepositoryRules({
+    getEffectiveRules: async (_owner, _repo, _branch, page) => {
+      requestedPages.push(page);
+      return page === 1
+        ? {
+            status: 200,
+            data: Array.from({ length: 100 }, () => ({
+              type: 'required_status_checks',
+              ruleset_id: 23,
+              ruleset_source_type: 'Organization',
+              ruleset_source: 'acme',
+            })),
+          }
+        : {
+            status: 200,
+            data: [
+              {
+                type: 'pull_request',
+                ruleset_id: 23,
+                ruleset_source_type: 'Organization',
+                ruleset_source: 'acme',
+                parameters: { required_approving_review_count: 2 },
+              },
+              { type: 'non_fast_forward', ruleset_id: 23 },
+              { type: 'deletion', ruleset_id: 23 },
+            ],
+          };
+    },
+    getClassicProtection: async () => ({
+      status: 200,
+      data: {
+        required_pull_request_reviews: { required_approving_review_count: 1 },
+        required_status_checks: null,
+        allow_force_pushes: { enabled: true },
+        allow_deletions: { enabled: true },
+        enforce_admins: { enabled: true },
+      },
+    }),
+  }, [repository]);
+
+  assert.deepEqual(requestedPages, [1, 2]);
+  assert.deepEqual(result.failures, []);
+  assert.deepEqual(result.items[0], {
+    nameWithOwner: 'acme/protected',
+    visibility: 'PRIVATE',
+    isArchived: false,
+    isFork: false,
+    defaultBranch: 'main',
+    branchExists: true,
+    classicProtection: true,
+    hasProtection: true,
+    activeRulesetIds: [23],
+    activeRulesetSources: ['Organization: acme'],
+    ruleTypes: ['deletion', 'non_fast_forward', 'pull_request', 'required_status_checks'],
+    requiresPullRequest: true,
+    requiredApprovingReviewCount: 2,
+    requiresStatusChecks: true,
+    blocksForcePushes: true,
+    blocksDeletions: true,
+    enforcesAdmins: true,
+  });
+});
+
+test('distinguishes unprotected, nonexistent, and partially available default branches', async () => {
+  const repository = (name: string) => ({
+    nameWithOwner: `acme/${name}`,
+    visibility: 'PRIVATE',
+    isArchived: false,
+    isFork: false,
+    defaultBranch: 'main',
+    codeSecurity: null,
+    codeScanningDefaultSetup: null,
+    secretScanning: null,
+    secretScanningPushProtection: null,
+    dependabotAlerts: null,
+    dependabotSecurityUpdates: null,
+    configurationStatus: null,
+    configurationId: null,
+    configurationName: null,
+    configurationEnforcement: null,
+  });
+  const result = await collectRepositoryRules({
+    getEffectiveRules: async (_owner, repo) => repo === 'partial'
+      ? { status: 403, data: { message: 'Resource protected by SAML' } }
+      : { status: 200, data: [] },
+    getClassicProtection: async (_owner, repo) => {
+      if (repo === 'unprotected') {
+        return { status: 404, data: { message: 'Branch not protected' } };
+      }
+      if (repo === 'branchless') {
+        return { status: 404, data: { message: 'Branch not found' } };
+      }
+      return {
+        status: 200,
+        data: {
+          required_pull_request_reviews: { required_approving_review_count: 1 },
+          required_status_checks: {},
+          allow_force_pushes: { enabled: false },
+          allow_deletions: { enabled: false },
+          enforce_admins: { enabled: true },
+        },
+      };
+    },
+  }, [
+    repository('unprotected'),
+    repository('branchless'),
+    repository('partial'),
+  ]);
+
+  assert.deepEqual(result.items.map(item => ({
+    name: item.nameWithOwner,
+    branchExists: item.branchExists,
+    hasProtection: item.hasProtection,
+  })), [
+    { name: 'acme/unprotected', branchExists: true, hasProtection: false },
+    { name: 'acme/branchless', branchExists: false, hasProtection: null },
+    { name: 'acme/partial', branchExists: true, hasProtection: true },
+  ]);
+  assert.equal(result.items[2].requiresPullRequest, true);
+  assert.equal(result.items[2].requiredApprovingReviewCount, 1);
+  assert.equal(result.items[2].requiresStatusChecks, true);
+  assert.deepEqual(result.failures, [{
+    nameWithOwner: 'acme/partial',
+    check: 'effective-rules',
+    error: 'GitHub returned 403 for effective branch rules: Resource protected by SAML',
+  }]);
 });
 
 test('collects and deduplicates paginated enterprise Copilot seats', async () => {
@@ -843,6 +992,7 @@ test('evaluates measured repository security coverage without treating unknown s
         visibility: 'PRIVATE',
         isArchived: false,
         isFork: false,
+        defaultBranch: 'main',
         codeSecurity: 'disabled',
         codeScanningDefaultSetup: 'unavailable',
         secretScanning: 'disabled',
@@ -859,6 +1009,7 @@ test('evaluates measured repository security coverage without treating unknown s
         visibility: 'INTERNAL',
         isArchived: false,
         isFork: false,
+        defaultBranch: 'main',
         codeSecurity: null,
         codeScanningDefaultSetup: null,
         secretScanning: null,
@@ -875,6 +1026,7 @@ test('evaluates measured repository security coverage without treating unknown s
         visibility: 'PRIVATE',
         isArchived: true,
         isFork: false,
+        defaultBranch: 'main',
         codeSecurity: 'disabled',
         codeScanningDefaultSetup: 'unavailable',
         secretScanning: 'disabled',
@@ -904,6 +1056,105 @@ test('evaluates measured repository security coverage without treating unknown s
   assert.equal(evaluation.metrics.codeSecurityEnabledRepositories, 0);
   assert.equal(evaluation.metrics.codeScanningDefaultSetupRepositories, 0);
   assert.equal(evaluation.metrics.securityConfigurationAppliedRepositories, 0);
+});
+
+test('evaluates default branch controls without treating unknown or nonexistent branches as gaps', () => {
+  const repositoryRules = [
+    {
+      nameWithOwner: 'acme/unprotected',
+      branchExists: true,
+      classicProtection: false,
+      hasProtection: false,
+      requiresPullRequest: false,
+      requiredApprovingReviewCount: null,
+      requiresStatusChecks: false,
+      blocksForcePushes: false,
+      blocksDeletions: false,
+      enforcesAdmins: false,
+    },
+    {
+      nameWithOwner: 'acme/incomplete',
+      branchExists: true,
+      classicProtection: true,
+      hasProtection: true,
+      requiresPullRequest: false,
+      requiredApprovingReviewCount: 0,
+      requiresStatusChecks: false,
+      blocksForcePushes: false,
+      blocksDeletions: false,
+      enforcesAdmins: true,
+    },
+    {
+      nameWithOwner: 'acme/unknown',
+      branchExists: null,
+      classicProtection: null,
+      hasProtection: null,
+      requiresPullRequest: null,
+      requiredApprovingReviewCount: null,
+      requiresStatusChecks: null,
+      blocksForcePushes: null,
+      blocksDeletions: null,
+      enforcesAdmins: null,
+    },
+    {
+      nameWithOwner: 'acme/branchless',
+      branchExists: false,
+      classicProtection: false,
+      hasProtection: null,
+      requiresPullRequest: null,
+      requiredApprovingReviewCount: null,
+      requiresStatusChecks: null,
+      blocksForcePushes: null,
+      blocksDeletions: null,
+      enforcesAdmins: null,
+    },
+  ].map(repository => ({
+    visibility: 'PRIVATE',
+    isArchived: false,
+    isFork: false,
+    defaultBranch: 'main',
+    activeRulesetIds: [],
+    activeRulesetSources: [],
+    ruleTypes: [],
+    ...repository,
+  }));
+  const evaluation = evaluateAssessmentBaseline({
+    organizations: [],
+    members: [
+      { login: 'owner-one', name: null, isOwner: true },
+      { login: 'owner-two', name: null, isOwner: true },
+    ],
+    ownerCount: 2,
+    repositories: [],
+    teams: [],
+    repositoryRules,
+    now: new Date('2026-09-10T00:00:00Z'),
+  });
+
+  assert.equal(evaluation.healthScore, 55);
+  assert.deepEqual(evaluation.findings.map(finding => finding.ruleKey), [
+    'default-branch-protection-missing',
+    'default-branch-review-controls-incomplete',
+    'default-branch-status-checks-missing',
+    'default-branch-history-controls-incomplete',
+  ]);
+  assert.deepEqual(evaluation.metrics, {
+    activeRepositories: 0,
+    archivedRepositories: 0,
+    forkRepositories: 0,
+    internalRepositories: 0,
+    privateRepositories: 0,
+    publicRepositories: 0,
+    staleActiveRepositories: 0,
+    classicProtectedDefaultBranches: 1,
+    defaultBranchProtectionUnknownRepositories: 1,
+    defaultBranchRepositories: 2,
+    defaultBranchesRequiringPullRequests: 0,
+    defaultBranchesRequiringStatusChecks: 0,
+    protectedDefaultBranches: 1,
+    repositoriesWithoutDefaultBranches: 1,
+    rulesetProtectedDefaultBranches: 0,
+  });
 });
 
 test('evaluates Copilot seat utilization and enterprise budget controls', () => {

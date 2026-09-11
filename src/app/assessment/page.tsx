@@ -3,7 +3,10 @@
 import { useCallback, useEffect, useState } from 'react';
 import { TopBar } from '@/components/TopBar';
 import { useApp } from '@/components/AppContext';
-import type { AssessmentActionsEvidence } from '@/lib/assessment';
+import type {
+  AssessmentActionsEvidence,
+  AssessmentRepositoryRules,
+} from '@/lib/assessment';
 
 const INVENTORY_METRICS = [
   { key: 'organizations', label: 'Organizations', description: 'Enterprise organizations' },
@@ -62,6 +65,7 @@ interface AssessmentSnapshot {
   metrics: Record<string, number>;
   collectors: AssessmentCollectorResult[];
   repositorySecurity: AssessmentRepositorySecurity[];
+  repositoryRules: AssessmentRepositoryRules[];
   actionsEvidence: AssessmentActionsEvidence | null;
   findings: AssessmentFinding[];
 }
@@ -145,6 +149,9 @@ export default function AssessmentPage() {
   const repositorySecurityCollector = snapshot?.collectors.find(
     collector => collector.collector_key === 'repositorySecurity'
   );
+  const repositoryRulesCollector = snapshot?.collectors.find(
+    collector => collector.collector_key === 'repositoryRules'
+  );
   const actionsCollector = snapshot?.collectors.find(collector => collector.collector_key === 'actions');
   const actionsDepthCollector = snapshot?.collectors.find(
     collector => collector.collector_key === 'actionsDepth'
@@ -152,6 +159,7 @@ export default function AssessmentPage() {
   const copilotCollector = snapshot?.collectors.find(collector => collector.collector_key === 'copilot');
   const billingCollector = snapshot?.collectors.find(collector => collector.collector_key === 'billing');
   const repositorySecurity = snapshot?.repositorySecurity || [];
+  const repositoryRules = snapshot?.repositoryRules || [];
   const eligibleRepositorySecurity = repositorySecurity.filter(
     repository => !repository.isArchived && !repository.isFork
   );
@@ -164,7 +172,11 @@ export default function AssessmentPage() {
   const domainStatuses: Record<AssessmentDomainKey, string> = {
     identity: baselineEvaluated ? 'Baseline' : 'Not assessed',
     repositories: baselineEvaluated
-      ? repositoryCollector?.status === 'partial' ? 'Partial baseline' : 'Baseline'
+      ? repositoryRulesCollector?.status === 'completed'
+        ? 'Branch depth'
+        : repositoryRulesCollector?.status === 'partial'
+          ? 'Partial branch depth'
+          : repositoryCollector?.status === 'partial' ? 'Partial baseline' : 'Baseline'
       : 'Not assessed',
     security: baselineEvaluated
       ? repositorySecurityCollector?.status === 'completed'
@@ -257,7 +269,10 @@ export default function AssessmentPage() {
                 <div className="mt-2 space-y-3">
                   {incompleteCollectors.map(collector => {
                     const failures = splitCollectorFailures(collector.error);
-                    const failureSubject = collector.collector_key === 'repositorySecurity'
+                    const failureSubject = (
+                      collector.collector_key === 'repositorySecurity'
+                      || collector.collector_key === 'repositoryRules'
+                    )
                       ? `${failures.length} incomplete repository ${failures.length === 1 ? 'check' : 'checks'}`
                       : collector.collector_key === 'actionsDepth'
                         ? `${failures.length} incomplete Actions ${failures.length === 1 ? 'check' : 'checks'}`
@@ -376,6 +391,129 @@ export default function AssessmentPage() {
                 );
               })}
             </div>
+          </section>
+
+          <section aria-labelledby="branch-governance-heading" className="border border-border bg-panel rounded-lg overflow-hidden">
+            <div className="px-4 py-3 border-b border-border flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
+              <div>
+                <h2 id="branch-governance-heading" className="text-sm font-semibold text-text-primary">
+                  Default branch safeguards
+                </h2>
+                <p className="text-xs text-text-muted mt-0.5">
+                  Effective active rulesets and classic protection on existing default branches.
+                </p>
+              </div>
+              <span className="text-xs text-text-muted">
+                {baselineEvaluated
+                  ? `${snapshot?.metrics.protectedDefaultBranches ?? 0} of ${snapshot?.metrics.defaultBranchRepositories ?? 0} protected`
+                  : 'Awaiting assessment'}
+              </span>
+            </div>
+            <div className="grid sm:grid-cols-2 lg:grid-cols-6 divide-y sm:divide-y-0 sm:divide-x divide-border">
+              <BranchCoverageMetric
+                label="Protected"
+                value={snapshot?.metrics.protectedDefaultBranches}
+                total={snapshot?.metrics.defaultBranchRepositories}
+              />
+              <BranchCoverageMetric
+                label="Pull requests"
+                value={snapshot?.metrics.defaultBranchesRequiringPullRequests}
+                total={snapshot?.metrics.defaultBranchRepositories}
+              />
+              <BranchCoverageMetric
+                label="Status checks"
+                value={snapshot?.metrics.defaultBranchesRequiringStatusChecks}
+                total={snapshot?.metrics.defaultBranchRepositories}
+              />
+              <BranchCoverageMetric
+                label="Active rulesets"
+                value={snapshot?.metrics.rulesetProtectedDefaultBranches}
+                total={snapshot?.metrics.defaultBranchRepositories}
+              />
+              <BranchCoverageMetric
+                label="Classic protection"
+                value={snapshot?.metrics.classicProtectedDefaultBranches}
+                total={snapshot?.metrics.defaultBranchRepositories}
+              />
+              <BranchCoverageMetric
+                label="Unknown"
+                value={snapshot?.metrics.defaultBranchProtectionUnknownRepositories}
+                suffix="repositories"
+              />
+            </div>
+            {repositoryRules.length > 0 ? (
+              <details className="border-t border-border">
+                <summary className="px-4 py-3 text-xs font-medium text-accent cursor-pointer">
+                  Review default branch evidence ({snapshot?.metrics.defaultBranchRepositories ?? 0} existing)
+                </summary>
+                <div className="overflow-x-auto border-t border-border">
+                  <table className="w-full min-w-[1080px] text-left">
+                    <thead className="bg-surface">
+                      <tr className="text-[10px] uppercase tracking-wide text-text-muted">
+                        <th className="px-4 py-2 font-medium">Repository</th>
+                        <th className="px-3 py-2 font-medium">Default branch</th>
+                        <th className="px-3 py-2 font-medium">Protection source</th>
+                        <th className="px-3 py-2 font-medium">Pull requests</th>
+                        <th className="px-3 py-2 font-medium">Status checks</th>
+                        <th className="px-3 py-2 font-medium">Force pushes</th>
+                        <th className="px-3 py-2 font-medium">Deletion</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-border">
+                      {repositoryRules.map(repository => (
+                        <tr key={repository.nameWithOwner} className="text-xs">
+                          <td className="px-4 py-2.5">
+                            <span className="font-mono text-text-primary">{repository.nameWithOwner}</span>
+                            {(repository.isArchived || repository.isFork) && (
+                              <span className="ml-2 text-[10px] text-text-muted">
+                                ({repository.isArchived ? 'Archived' : 'Fork'})
+                              </span>
+                            )}
+                          </td>
+                          <td className="px-3 py-2.5 font-mono text-text-secondary">
+                            {repository.branchExists === false
+                              ? '— No branch'
+                              : repository.defaultBranch ?? '? Unknown'}
+                          </td>
+                          <td className="px-3 py-2.5">
+                            <ProtectionSource repository={repository} />
+                          </td>
+                          <td className="px-3 py-2.5">
+                            <PullRequestProtection repository={repository} />
+                          </td>
+                          <td className="px-3 py-2.5">
+                            <BranchControlState
+                              value={repository.requiresStatusChecks}
+                              notApplicable={repository.branchExists === false || repository.isArchived || repository.isFork}
+                            />
+                          </td>
+                          <td className="px-3 py-2.5">
+                            <BranchControlState
+                              value={repository.blocksForcePushes}
+                              enabledLabel="Blocked"
+                              disabledLabel="Allowed"
+                              notApplicable={repository.branchExists === false || repository.isArchived || repository.isFork}
+                            />
+                          </td>
+                          <td className="px-3 py-2.5">
+                            <BranchControlState
+                              value={repository.blocksDeletions}
+                              enabledLabel="Blocked"
+                              disabledLabel="Allowed"
+                              notApplicable={repository.branchExists === false || repository.isArchived || repository.isFork}
+                            />
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </details>
+            ) : (
+              <p className="border-t border-border px-4 py-4 text-xs text-text-muted">
+                Run the assessment to collect default branch governance evidence.
+              </p>
+            )}
           </section>
 
           <section aria-labelledby="repository-security-heading" className="border border-border bg-panel rounded-lg overflow-hidden">
@@ -797,6 +935,92 @@ function SecurityCoverageMetric({
       </p>
     </div>
   );
+}
+
+function BranchCoverageMetric({
+  label,
+  value,
+  total,
+  suffix,
+}: {
+  label: string;
+  value?: number;
+  total?: number;
+  suffix?: string;
+}) {
+  return (
+    <div className="px-4 py-3">
+      <p className="text-[10px] uppercase tracking-wide text-text-muted">{label}</p>
+      <p className="text-lg font-semibold text-text-primary tabular-nums">
+        {value === undefined ? '—' : total === undefined ? value : `${value}/${total}`}
+      </p>
+      {suffix && <p className="text-[10px] text-text-muted">{suffix}</p>}
+    </div>
+  );
+}
+
+function ProtectionSource({ repository }: { repository: AssessmentRepositoryRules }) {
+  if (repository.isArchived || repository.isFork || repository.branchExists === false) {
+    return <span className="text-text-muted">— Not applicable</span>;
+  }
+  if (repository.hasProtection === false) {
+    return <span className="text-warning">! None</span>;
+  }
+  if (repository.hasProtection === null) {
+    return <span className="text-text-muted">? Unknown</span>;
+  }
+
+  const hasRuleset = (repository.activeRulesetIds?.length ?? 0) > 0;
+  const source = hasRuleset && repository.classicProtection
+    ? 'Ruleset + classic'
+    : hasRuleset
+      ? 'Active ruleset'
+      : repository.classicProtection
+        ? 'Classic'
+        : 'Protected';
+  return <span className="text-success">✔ {source}</span>;
+}
+
+function PullRequestProtection({ repository }: { repository: AssessmentRepositoryRules }) {
+  if (repository.isArchived || repository.isFork || repository.branchExists === false) {
+    return <span className="text-text-muted">— Not applicable</span>;
+  }
+  if (repository.requiresPullRequest === null) {
+    return <span className="text-text-muted">? Unknown</span>;
+  }
+  if (!repository.requiresPullRequest) {
+    return <span className="text-warning">! Not required</span>;
+  }
+  if (repository.requiredApprovingReviewCount === null) {
+    return <span className="text-success">✔ Required</span>;
+  }
+  if (repository.requiredApprovingReviewCount === 0) {
+    return <span className="text-warning">! No approvals</span>;
+  }
+  return (
+    <span className="text-success">
+      ✔ {repository.requiredApprovingReviewCount}{' '}
+      {repository.requiredApprovingReviewCount === 1 ? 'approval' : 'approvals'}
+    </span>
+  );
+}
+
+function BranchControlState({
+  value,
+  enabledLabel = 'Required',
+  disabledLabel = 'Not required',
+  notApplicable = false,
+}: {
+  value: boolean | null;
+  enabledLabel?: string;
+  disabledLabel?: string;
+  notApplicable?: boolean;
+}) {
+  if (notApplicable) return <span className="text-text-muted">— Not applicable</span>;
+  if (value === null) return <span className="text-text-muted">? Unknown</span>;
+  return value
+    ? <span className="text-success">✔ {enabledLabel}</span>
+    : <span className="text-warning">! {disabledLabel}</span>;
 }
 
 function SecurityState({ value }: { value: string | null }) {

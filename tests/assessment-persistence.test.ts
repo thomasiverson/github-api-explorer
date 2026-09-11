@@ -34,6 +34,7 @@ test('persists and reloads repository security and Actions evidence', async () =
       teamCollector: { id: 'collector-teams', durationMs: 1 },
       securityCollector: { id: 'collector-security', durationMs: 1, error: null },
       repositorySecurityCollector: { id: 'collector-repository-security', durationMs: 1 },
+      repositoryRulesCollector: { id: 'collector-repository-rules', durationMs: 1 },
       actionsCollector: { id: 'collector-actions', durationMs: 1, error: null },
       actionsDepthCollector: { id: 'collector-actions-depth', durationMs: 1, error: null },
       copilotCollector: { id: 'collector-copilot', durationMs: 1, error: null },
@@ -51,6 +52,7 @@ test('persists and reloads repository security and Actions evidence', async () =
         visibility: 'PRIVATE',
         isArchived: false,
         isFork: false,
+        defaultBranch: 'main',
         codeSecurity: 'enabled',
         codeScanningDefaultSetup: 'configured',
         secretScanning: 'enabled',
@@ -63,6 +65,30 @@ test('persists and reloads repository security and Actions evidence', async () =
         configurationEnforcement: 'enforced',
       }],
       repositorySecurityFailures: [],
+      repositoryRules: [{
+        nameWithOwner: 'acme/repository',
+        visibility: 'PRIVATE',
+        isArchived: false,
+        isFork: false,
+        defaultBranch: 'main',
+        branchExists: true,
+        classicProtection: false,
+        hasProtection: true,
+        activeRulesetIds: [23],
+        activeRulesetSources: ['Organization: acme'],
+        ruleTypes: ['deletion', 'non_fast_forward', 'pull_request', 'required_status_checks'],
+        requiresPullRequest: true,
+        requiredApprovingReviewCount: 2,
+        requiresStatusChecks: true,
+        blocksForcePushes: true,
+        blocksDeletions: true,
+        enforcesAdmins: null,
+      }],
+      repositoryRulesFailures: [{
+        nameWithOwner: 'acme/repository',
+        check: 'classic-protection',
+        error: 'Classic protection returned HTTP 403',
+      }],
       actionsPolicy: null,
       actionsEvidence: {
         selectedActions: null,
@@ -126,6 +152,7 @@ test('persists and reloads repository security and Actions evidence', async () =
       visibility: 'PRIVATE',
       isArchived: false,
       isFork: false,
+      defaultBranch: 'main',
       codeSecurity: 'enabled',
       codeScanningDefaultSetup: 'configured',
       secretScanning: 'enabled',
@@ -136,6 +163,25 @@ test('persists and reloads repository security and Actions evidence', async () =
       configurationId: 17,
       configurationName: 'Enterprise baseline',
       configurationEnforcement: 'enforced',
+    }]);
+    assert.deepEqual(snapshot.repositoryRules, [{
+      nameWithOwner: 'acme/repository',
+      visibility: 'PRIVATE',
+      isArchived: false,
+      isFork: false,
+      defaultBranch: 'main',
+      branchExists: true,
+      classicProtection: false,
+      hasProtection: true,
+      activeRulesetIds: [23],
+      activeRulesetSources: ['Organization: acme'],
+      ruleTypes: ['deletion', 'non_fast_forward', 'pull_request', 'required_status_checks'],
+      requiresPullRequest: true,
+      requiredApprovingReviewCount: 2,
+      requiresStatusChecks: true,
+      blocksForcePushes: true,
+      blocksDeletions: true,
+      enforcesAdmins: null,
     }]);
     assert.equal(snapshot.metrics.codeScanningDefaultSetupRepositories, 1);
     assert.deepEqual(snapshot.actionsEvidence, {
@@ -195,6 +241,15 @@ test('persists and reloads repository security and Actions evidence', async () =
       item_count: 5,
       duration_ms: 1,
       error: 'selected-actions: Selected Actions policy returned HTTP 403',
+    });
+    assert.deepEqual(snapshot.collectors.find(
+      collector => collector.collector_key === 'repositoryRules'
+    ), {
+      collector_key: 'repositoryRules',
+      status: 'partial',
+      item_count: 1,
+      duration_ms: 1,
+      error: 'acme/repository [classic-protection]: Classic protection returned HTTP 403',
     });
   } finally {
     closeDatabase?.();

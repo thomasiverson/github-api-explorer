@@ -70,6 +70,7 @@ export interface AssessmentRepositorySecurity {
   visibility: string;
   isArchived: boolean;
   isFork: boolean;
+  defaultBranch: string | null;
   codeSecurity: string | null;
   codeScanningDefaultSetup: string | null;
   secretScanning: string | null;
@@ -91,6 +92,57 @@ export interface AssessmentRepositorySecurityFailure {
 export interface AssessmentRepositorySecurityCollection {
   items: AssessmentRepositorySecurity[];
   failures: AssessmentRepositorySecurityFailure[];
+}
+
+export type AssessmentRepositoryRulesCheck =
+  | 'default-branch'
+  | 'effective-rules'
+  | 'classic-protection';
+
+export interface AssessmentRepositoryRules {
+  nameWithOwner: string;
+  visibility: string;
+  isArchived: boolean;
+  isFork: boolean;
+  defaultBranch: string | null;
+  branchExists: boolean | null;
+  classicProtection: boolean | null;
+  hasProtection: boolean | null;
+  activeRulesetIds: number[] | null;
+  activeRulesetSources: string[] | null;
+  ruleTypes: string[] | null;
+  requiresPullRequest: boolean | null;
+  requiredApprovingReviewCount: number | null;
+  requiresStatusChecks: boolean | null;
+  blocksForcePushes: boolean | null;
+  blocksDeletions: boolean | null;
+  enforcesAdmins: boolean | null;
+}
+
+export interface AssessmentRepositoryRulesFailure {
+  nameWithOwner: string;
+  check: AssessmentRepositoryRulesCheck;
+  error: string;
+}
+
+export interface AssessmentRepositoryRulesCollection {
+  items: AssessmentRepositoryRules[];
+  failures: AssessmentRepositoryRulesFailure[];
+}
+
+export interface AssessmentRepositoryRulesRequests {
+  getEffectiveRules: (
+    owner: string,
+    repo: string,
+    branch: string,
+    page: number,
+    perPage: number
+  ) => Promise<AssessmentRestResponse>;
+  getClassicProtection: (
+    owner: string,
+    repo: string,
+    branch: string
+  ) => Promise<AssessmentRestResponse>;
 }
 
 export interface AssessmentActionsPolicy {
@@ -825,6 +877,7 @@ export async function collectRepositorySecurity(
       visibility: repository.visibility,
       isArchived: repository.isArchived,
       isFork: repository.isFork,
+      defaultBranch: null,
       codeSecurity: null,
       codeScanningDefaultSetup: null,
       secretScanning: null,
@@ -842,6 +895,10 @@ export async function collectRepositorySecurity(
       if (response.status !== 200) {
         throw new Error(describeRestFailure('repository security features', response));
       }
+      const details = readAssessmentObject(response.data);
+      item.defaultBranch = typeof details?.default_branch === 'string'
+        ? details.default_branch
+        : null;
       Object.assign(item, normalizeRepositorySecurityFeatures(response.data));
     } catch (error) {
       failures.push({
@@ -914,6 +971,293 @@ export async function collectRepositorySecurity(
   }
 
   return { items, failures };
+}
+
+interface NormalizedClassicProtection {
+  requiresPullRequest: boolean;
+  requiredApprovingReviewCount: number | null;
+  requiresStatusChecks: boolean;
+  blocksForcePushes: boolean | null;
+  blocksDeletions: boolean | null;
+  enforcesAdmins: boolean | null;
+}
+
+interface NormalizedEffectiveRule {
+  type: string;
+  rulesetId: number | null;
+  rulesetSource: string | null;
+  requiredApprovingReviewCount: number | null;
+}
+
+export async function collectRepositoryRules(
+  requests: AssessmentRepositoryRulesRequests,
+  repositories: AssessmentRepositorySecurity[]
+): Promise<AssessmentRepositoryRulesCollection> {
+  const items: AssessmentRepositoryRules[] = [];
+  const failures: AssessmentRepositoryRulesFailure[] = [];
+
+  for (const repository of repositories) {
+    const [owner, repo] = repository.nameWithOwner.split('/');
+    if (!owner || !repo) {
+      throw new Error(`Invalid repository name: ${repository.nameWithOwner}`);
+    }
+
+    const item: AssessmentRepositoryRules = {
+      nameWithOwner: repository.nameWithOwner,
+      visibility: repository.visibility,
+      isArchived: repository.isArchived,
+      isFork: repository.isFork,
+      defaultBranch: repository.defaultBranch,
+      branchExists: null,
+      classicProtection: null,
+      hasProtection: null,
+      activeRulesetIds: null,
+      activeRulesetSources: null,
+      ruleTypes: null,
+      requiresPullRequest: null,
+      requiredApprovingReviewCount: null,
+      requiresStatusChecks: null,
+      blocksForcePushes: null,
+      blocksDeletions: null,
+      enforcesAdmins: null,
+    };
+    items.push(item);
+
+    if (repository.isArchived || repository.isFork) continue;
+    if (!repository.defaultBranch) {
+      failures.push({
+        nameWithOwner: repository.nameWithOwner,
+        check: 'default-branch',
+        error: 'GitHub did not return a default branch',
+      });
+      continue;
+    }
+
+    let effectiveRules: NormalizedEffectiveRule[] | null = null;
+    try {
+      effectiveRules = await collectEffectiveBranchRules(
+        requests,
+        owner,
+        repo,
+        repository.defaultBranch
+      );
+      item.ruleTypes = [...new Set(effectiveRules.map(rule => rule.type))].sort();
+      item.activeRulesetIds = [...new Set(
+        effectiveRules
+          .map(rule => rule.rulesetId)
+          .filter((rulesetId): rulesetId is number => rulesetId !== null)
+      )].sort((left, right) => left - right);
+      item.activeRulesetSources = [...new Set(
+        effectiveRules
+          .map(rule => rule.rulesetSource)
+          .filter((source): source is string => source !== null)
+      )].sort();
+    } catch (error) {
+      failures.push({
+        nameWithOwner: repository.nameWithOwner,
+        check: 'effective-rules',
+        error: normalizeAssessmentError(error),
+      });
+    }
+
+    let classic: NormalizedClassicProtection | null = null;
+    try {
+      const response = await requests.getClassicProtection(
+        owner,
+        repo,
+        repository.defaultBranch
+      );
+      if (response.status === 200) {
+        item.branchExists = true;
+        item.classicProtection = true;
+        classic = normalizeClassicProtection(response.data);
+      } else if (response.status === 404) {
+        const message = readRestMessage(response.data).toLowerCase();
+        if (message.includes('branch not protected')) {
+          item.branchExists = true;
+          item.classicProtection = false;
+          classic = {
+            requiresPullRequest: false,
+            requiredApprovingReviewCount: null,
+            requiresStatusChecks: false,
+            blocksForcePushes: false,
+            blocksDeletions: false,
+            enforcesAdmins: false,
+          };
+        } else if (message.includes('branch not found')) {
+          item.branchExists = false;
+          item.classicProtection = false;
+        } else {
+          throw new Error(describeRestFailure('classic branch protection', response));
+        }
+      } else {
+        throw new Error(describeRestFailure('classic branch protection', response));
+      }
+    } catch (error) {
+      failures.push({
+        nameWithOwner: repository.nameWithOwner,
+        check: 'classic-protection',
+        error: normalizeAssessmentError(error),
+      });
+    }
+
+    if (item.branchExists === false) continue;
+    const rulesKnown = effectiveRules !== null;
+    const classicKnown = item.classicProtection !== null;
+    const ruleTypes = item.ruleTypes ?? [];
+    const rulesetProtection = rulesKnown && ruleTypes.length > 0;
+
+    if (rulesetProtection || item.classicProtection === true) {
+      item.hasProtection = true;
+    } else if (rulesKnown && classicKnown) {
+      item.hasProtection = false;
+    }
+
+    if (item.hasProtection === false) {
+      item.requiresPullRequest = false;
+      item.requiresStatusChecks = false;
+      item.blocksForcePushes = false;
+      item.blocksDeletions = false;
+      item.enforcesAdmins = false;
+      continue;
+    }
+    if (item.hasProtection !== true) continue;
+
+    item.requiresPullRequest = combineProtectionControl(
+      rulesKnown,
+      ruleTypes.includes('pull_request'),
+      classic?.requiresPullRequest ?? null
+    );
+    item.requiresStatusChecks = combineProtectionControl(
+      rulesKnown,
+      ruleTypes.includes('required_status_checks'),
+      classic?.requiresStatusChecks ?? null
+    );
+    item.blocksForcePushes = combineProtectionControl(
+      rulesKnown,
+      ruleTypes.includes('non_fast_forward'),
+      classic?.blocksForcePushes ?? null
+    );
+    item.blocksDeletions = combineProtectionControl(
+      rulesKnown,
+      ruleTypes.includes('deletion'),
+      classic?.blocksDeletions ?? null
+    );
+    item.enforcesAdmins = classic?.enforcesAdmins ?? null;
+
+    const reviewCounts = [
+      classic?.requiredApprovingReviewCount,
+      ...(effectiveRules ?? []).map(rule => rule.requiredApprovingReviewCount),
+    ].filter((count): count is number => count !== null && count !== undefined);
+    item.requiredApprovingReviewCount = reviewCounts.length > 0
+      ? Math.max(...reviewCounts)
+      : null;
+  }
+
+  return { items, failures };
+}
+
+async function collectEffectiveBranchRules(
+  requests: AssessmentRepositoryRulesRequests,
+  owner: string,
+  repo: string,
+  branch: string
+): Promise<NormalizedEffectiveRule[]> {
+  const rules: NormalizedEffectiveRule[] = [];
+  let page = 1;
+
+  while (true) {
+    const response = await requests.getEffectiveRules(
+      owner,
+      repo,
+      branch,
+      page,
+      REST_PAGE_SIZE
+    );
+    if (response.status !== 200) {
+      throw new Error(describeRestFailure('effective branch rules', response));
+    }
+    if (!Array.isArray(response.data)) {
+      throw new Error('GitHub returned an invalid effective branch rules response');
+    }
+    rules.push(...response.data.map(normalizeEffectiveBranchRule));
+    if (response.data.length < REST_PAGE_SIZE) break;
+    page += 1;
+  }
+
+  return rules;
+}
+
+function normalizeEffectiveBranchRule(value: unknown): NormalizedEffectiveRule {
+  const rule = readAssessmentObject(value);
+  if (!rule || typeof rule.type !== 'string') {
+    throw new Error('GitHub returned an invalid effective branch rule');
+  }
+  const parameters = readAssessmentObject(rule.parameters);
+  const requiredApprovingReviewCount = parameters?.required_approving_review_count;
+  if (
+    requiredApprovingReviewCount !== undefined
+    && (!Number.isInteger(requiredApprovingReviewCount) || (requiredApprovingReviewCount as number) < 0)
+  ) {
+    throw new Error('GitHub returned an invalid required approving review count');
+  }
+  const sourceType = typeof rule.ruleset_source_type === 'string'
+    ? rule.ruleset_source_type
+    : null;
+  const source = typeof rule.ruleset_source === 'string' ? rule.ruleset_source : null;
+  return {
+    type: rule.type,
+    rulesetId: Number.isInteger(rule.ruleset_id) ? rule.ruleset_id as number : null,
+    rulesetSource: sourceType && source ? `${sourceType}: ${source}` : source,
+    requiredApprovingReviewCount:
+      typeof requiredApprovingReviewCount === 'number'
+        ? requiredApprovingReviewCount
+        : null,
+  };
+}
+
+function normalizeClassicProtection(data: unknown): NormalizedClassicProtection {
+  const protection = readAssessmentObject(data);
+  if (!protection) {
+    throw new Error('GitHub returned an invalid classic branch protection response');
+  }
+  const reviews = readAssessmentObject(protection.required_pull_request_reviews);
+  const reviewCount = reviews?.required_approving_review_count;
+  if (reviewCount !== undefined && (!Number.isInteger(reviewCount) || (reviewCount as number) < 0)) {
+    throw new Error('GitHub returned an invalid classic required approving review count');
+  }
+  return {
+    requiresPullRequest: reviews !== null,
+    requiredApprovingReviewCount: typeof reviewCount === 'number' ? reviewCount : null,
+    requiresStatusChecks: readAssessmentObject(protection.required_status_checks) !== null,
+    blocksForcePushes: invertOptionalEnabled(protection.allow_force_pushes),
+    blocksDeletions: invertOptionalEnabled(protection.allow_deletions),
+    enforcesAdmins: readOptionalEnabled(protection.enforce_admins),
+  };
+}
+
+function readOptionalEnabled(value: unknown): boolean | null {
+  if (value === undefined || value === null) return null;
+  const setting = readAssessmentObject(value);
+  if (!setting || typeof setting.enabled !== 'boolean') {
+    throw new Error('GitHub returned an invalid branch protection setting');
+  }
+  return setting.enabled;
+}
+
+function invertOptionalEnabled(value: unknown): boolean | null {
+  const enabled = readOptionalEnabled(value);
+  return enabled === null ? null : !enabled;
+}
+
+function combineProtectionControl(
+  rulesKnown: boolean,
+  rulesetEnabled: boolean,
+  classicEnabled: boolean | null
+): boolean | null {
+  if (rulesetEnabled || classicEnabled === true) return true;
+  if (rulesKnown && classicEnabled === false) return false;
+  return null;
 }
 
 export async function collectEnterpriseCopilotSeats(
@@ -1012,6 +1356,7 @@ export function evaluateAssessmentBaseline(input: {
   teams: AssessmentTeam[];
   securityDefaults?: AssessmentSecurityDefault[] | null;
   repositorySecurity?: AssessmentRepositorySecurity[] | null;
+  repositoryRules?: AssessmentRepositoryRules[] | null;
   actionsPolicy?: AssessmentActionsPolicy | null;
   actionsEvidence?: AssessmentActionsEvidence | null;
   copilotSeats?: AssessmentCopilotSeatInventory | null;
@@ -1072,6 +1417,113 @@ export function evaluateAssessmentBaseline(input: {
       recommendation: 'Verify that each public repository has an active owner and is approved for public disclosure.',
       affectedResources: publicRepositories.map(repository => repository.nameWithOwner),
     });
+  }
+
+  let defaultBranchRepositories = 0;
+  let protectedDefaultBranches = 0;
+  let rulesetProtectedDefaultBranches = 0;
+  let classicProtectedDefaultBranches = 0;
+  let defaultBranchesRequiringPullRequests = 0;
+  let defaultBranchesRequiringStatusChecks = 0;
+  let defaultBranchProtectionUnknownRepositories = 0;
+  let repositoriesWithoutDefaultBranches = 0;
+  if (input.repositoryRules) {
+    const eligibleRepositories = input.repositoryRules.filter(
+      repository => !repository.isArchived && !repository.isFork
+    );
+    const repositoriesWithBranches = eligibleRepositories.filter(
+      repository => repository.branchExists === true
+    );
+    const unprotectedRepositories = repositoriesWithBranches.filter(
+      repository => repository.hasProtection === false
+    );
+    const reviewControlGaps = repositoriesWithBranches.filter(repository => (
+      repository.hasProtection === true
+      && (
+        repository.requiresPullRequest === false
+        || repository.requiredApprovingReviewCount === 0
+      )
+    ));
+    const statusCheckGaps = repositoriesWithBranches.filter(repository => (
+      repository.hasProtection === true
+      && repository.requiresStatusChecks === false
+    ));
+    const historyControlGaps = repositoriesWithBranches.filter(repository => (
+      repository.hasProtection === true
+      && (
+        repository.blocksForcePushes === false
+        || repository.blocksDeletions === false
+      )
+    ));
+
+    defaultBranchRepositories = repositoriesWithBranches.length;
+    protectedDefaultBranches = repositoriesWithBranches.filter(
+      repository => repository.hasProtection === true
+    ).length;
+    rulesetProtectedDefaultBranches = repositoriesWithBranches.filter(
+      repository => (repository.activeRulesetIds?.length ?? 0) > 0
+    ).length;
+    classicProtectedDefaultBranches = repositoriesWithBranches.filter(
+      repository => repository.classicProtection === true
+    ).length;
+    defaultBranchesRequiringPullRequests = repositoriesWithBranches.filter(
+      repository => repository.requiresPullRequest === true
+    ).length;
+    defaultBranchesRequiringStatusChecks = repositoriesWithBranches.filter(
+      repository => repository.requiresStatusChecks === true
+    ).length;
+    defaultBranchProtectionUnknownRepositories = eligibleRepositories.filter(repository => (
+      repository.branchExists === null
+      || (repository.branchExists === true && repository.hasProtection === null)
+    )).length;
+    repositoriesWithoutDefaultBranches = eligibleRepositories.filter(
+      repository => repository.branchExists === false
+    ).length;
+
+    if (unprotectedRepositories.length > 0) {
+      findings.push({
+        ruleKey: 'default-branch-protection-missing',
+        domain: 'repositories',
+        severity: 'high',
+        title: 'Default branches have no active protection',
+        summary: `${unprotectedRepositories.length} active, non-fork ${unprotectedRepositories.length === 1 ? 'repository has' : 'repositories have'} neither classic branch protection nor active ruleset rules on the default branch.`,
+        recommendation: 'Apply an enforced organization or enterprise ruleset that requires pull requests and blocks destructive history changes on default branches.',
+        affectedResources: unprotectedRepositories.map(repository => repository.nameWithOwner),
+      });
+    }
+    if (reviewControlGaps.length > 0) {
+      findings.push({
+        ruleKey: 'default-branch-review-controls-incomplete',
+        domain: 'repositories',
+        severity: 'medium',
+        title: 'Protected default branches have incomplete review gates',
+        summary: `${reviewControlGaps.length} protected default ${reviewControlGaps.length === 1 ? 'branch does' : 'branches do'} not require pull requests with at least one approving review.`,
+        recommendation: 'Require pull requests and at least one approving review for each affected default branch.',
+        affectedResources: reviewControlGaps.map(repository => repository.nameWithOwner),
+      });
+    }
+    if (statusCheckGaps.length > 0) {
+      findings.push({
+        ruleKey: 'default-branch-status-checks-missing',
+        domain: 'repositories',
+        severity: 'low',
+        title: 'Protected default branches do not require status checks',
+        summary: `${statusCheckGaps.length} protected default ${statusCheckGaps.length === 1 ? 'branch has' : 'branches have'} no required status-check rule.`,
+        recommendation: 'Require the minimum trusted build, test, and security checks that must pass before changes merge.',
+        affectedResources: statusCheckGaps.map(repository => repository.nameWithOwner),
+      });
+    }
+    if (historyControlGaps.length > 0) {
+      findings.push({
+        ruleKey: 'default-branch-history-controls-incomplete',
+        domain: 'repositories',
+        severity: 'medium',
+        title: 'Protected default branches allow destructive history changes',
+        summary: `${historyControlGaps.length} protected default ${historyControlGaps.length === 1 ? 'branch does' : 'branches do'} not block both force pushes and branch deletion.`,
+        recommendation: 'Block force pushes and branch deletion through classic protection or active ruleset controls.',
+        affectedResources: historyControlGaps.map(repository => repository.nameWithOwner),
+      });
+    }
   }
 
   if (input.securityDefaults) {
@@ -1497,6 +1949,16 @@ export function evaluateAssessmentBaseline(input: {
       privateRepositories: input.repositories.filter(repository => repository.visibility === 'PRIVATE').length,
       publicRepositories: publicRepositories.length,
       staleActiveRepositories: staleRepositories.length,
+      ...(input.repositoryRules ? {
+        classicProtectedDefaultBranches,
+        defaultBranchProtectionUnknownRepositories,
+        defaultBranchRepositories,
+        defaultBranchesRequiringPullRequests,
+        defaultBranchesRequiringStatusChecks,
+        protectedDefaultBranches,
+        repositoriesWithoutDefaultBranches,
+        rulesetProtectedDefaultBranches,
+      } : {}),
       ...(input.repositorySecurity ? {
         codeScanningDefaultSetupRepositories,
         codeSecurityEnabledRepositories,
