@@ -9,6 +9,7 @@ import {
   collectEnterpriseSecurityDefaults,
   collectOrganizationRepositories,
   collectOrganizationTeams,
+  collectRepositorySecurity,
   evaluateAssessmentBaseline,
 } from '../src/lib/assessment';
 
@@ -248,6 +249,127 @@ test('rejects malformed security and Actions policy responses', async () => {
   );
 });
 
+test('collects repository-level security features, Dependabot alerts, and configurations', async () => {
+  const repositories = [
+    {
+      githubId: 1,
+      nodeId: 'REPO_1',
+      organizationLogin: 'org-one',
+      nameWithOwner: 'org-one/protected',
+      visibility: 'PRIVATE',
+      isArchived: false,
+      isFork: false,
+      updatedAt: '2026-09-01T00:00:00Z',
+    },
+    {
+      githubId: 2,
+      nodeId: 'REPO_2',
+      organizationLogin: 'org-one',
+      nameWithOwner: 'org-one/unprotected',
+      visibility: 'INTERNAL',
+      isArchived: false,
+      isFork: false,
+      updatedAt: '2026-09-01T00:00:00Z',
+    },
+  ];
+  const result = await collectRepositorySecurity({
+    getRepository: async (_owner, repo) => ({
+      status: 200,
+      data: {
+        security_and_analysis: {
+          code_security: { status: repo === 'protected' ? 'enabled' : 'disabled' },
+          secret_scanning: { status: repo === 'protected' ? 'enabled' : 'disabled' },
+          secret_scanning_push_protection: {
+            status: repo === 'protected' ? 'enabled' : 'disabled',
+          },
+          dependabot_security_updates: { status: repo === 'protected' ? 'enabled' : 'disabled' },
+        },
+      },
+    }),
+    getCodeScanningDefaultSetup: async (_owner, repo) => repo === 'protected'
+      ? { status: 200, data: { state: 'configured' } }
+      : {
+          status: 403,
+          data: { message: 'Code Security must be enabled for this repository to use code scanning.' },
+        },
+    checkDependabotAlerts: async (_owner, repo) => repo === 'protected'
+      ? { status: 204, data: null }
+      : { status: 404, data: { message: 'Vulnerability alerts are disabled.' } },
+    getConfiguration: async (_owner, repo) => repo === 'protected'
+      ? {
+          status: 200,
+          data: {
+            status: 'enforced',
+            configuration: {
+              id: 17,
+              name: 'Enterprise baseline',
+              enforcement: 'enforced',
+            },
+          },
+        }
+      : { status: 204, data: null },
+  }, repositories);
+
+  assert.deepEqual(result.failures, []);
+  assert.deepEqual(result.items[0], {
+    nameWithOwner: 'org-one/protected',
+    visibility: 'PRIVATE',
+    isArchived: false,
+    isFork: false,
+    codeSecurity: 'enabled',
+    codeScanningDefaultSetup: 'configured',
+    secretScanning: 'enabled',
+    secretScanningPushProtection: 'enabled',
+    dependabotAlerts: 'enabled',
+    dependabotSecurityUpdates: 'enabled',
+    configurationStatus: 'enforced',
+    configurationId: 17,
+    configurationName: 'Enterprise baseline',
+    configurationEnforcement: 'enforced',
+  });
+  assert.equal(result.items[1].dependabotAlerts, 'disabled');
+  assert.equal(result.items[1].codeScanningDefaultSetup, 'unavailable');
+  assert.equal(result.items[1].configurationStatus, 'none');
+});
+
+test('retains repository security evidence when individual checks are unavailable', async () => {
+  const result = await collectRepositorySecurity({
+    getRepository: async () => ({ status: 403, data: { message: 'Resource protected by SAML' } }),
+    getCodeScanningDefaultSetup: async () => ({
+      status: 503,
+      data: { message: 'Service unavailable' },
+    }),
+    checkDependabotAlerts: async () => ({ status: 404, data: { message: 'Not Found' } }),
+    getConfiguration: async () => {
+      throw new Error('Configuration permission denied');
+    },
+  }, [{
+    githubId: 1,
+    nodeId: 'REPO_1',
+    organizationLogin: 'org-one',
+    nameWithOwner: 'org-one/partial',
+    visibility: 'PRIVATE',
+    isArchived: false,
+    isFork: false,
+    updatedAt: '2026-09-01T00:00:00Z',
+  }]);
+
+  assert.equal(result.items.length, 1);
+  assert.equal(result.items[0].codeSecurity, null);
+  assert.equal(result.items[0].codeScanningDefaultSetup, null);
+  assert.equal(result.items[0].dependabotAlerts, null);
+  assert.equal(result.items[0].configurationStatus, null);
+  assert.deepEqual(result.failures.map(failure => failure.check), [
+    'features',
+    'code-scanning-default-setup',
+    'dependabot-alerts',
+    'configuration',
+  ]);
+  assert.match(result.failures[0].error, /403.*SAML/);
+  assert.match(result.failures[1].error, /503.*Service unavailable/);
+  assert.match(result.failures[2].error, /404.*Not Found/);
+});
+
 test('collects and deduplicates paginated enterprise Copilot seats', async () => {
   const requestedPages: number[] = [];
   const firstPage = Array.from({ length: 100 }, (_, index) => ({
@@ -479,6 +601,85 @@ test('evaluates enterprise security defaults and Actions policy', () => {
       'actions-sha-pinning-not-required',
     ]
   );
+});
+
+test('evaluates measured repository security coverage without treating unknown states as disabled', () => {
+  const evaluation = evaluateAssessmentBaseline({
+    organizations: [],
+    members: [
+      { login: 'owner-one', name: null, isOwner: true },
+      { login: 'owner-two', name: null, isOwner: true },
+    ],
+    ownerCount: 2,
+    repositories: [],
+    teams: [],
+    repositorySecurity: [
+      {
+        nameWithOwner: 'org-one/unprotected',
+        visibility: 'PRIVATE',
+        isArchived: false,
+        isFork: false,
+        codeSecurity: 'disabled',
+        codeScanningDefaultSetup: 'unavailable',
+        secretScanning: 'disabled',
+        secretScanningPushProtection: 'disabled',
+        dependabotAlerts: 'disabled',
+        dependabotSecurityUpdates: 'disabled',
+        configurationStatus: 'none',
+        configurationId: null,
+        configurationName: null,
+        configurationEnforcement: null,
+      },
+      {
+        nameWithOwner: 'org-one/unknown',
+        visibility: 'INTERNAL',
+        isArchived: false,
+        isFork: false,
+        codeSecurity: null,
+        codeScanningDefaultSetup: null,
+        secretScanning: null,
+        secretScanningPushProtection: null,
+        dependabotAlerts: null,
+        dependabotSecurityUpdates: null,
+        configurationStatus: null,
+        configurationId: null,
+        configurationName: null,
+        configurationEnforcement: null,
+      },
+      {
+        nameWithOwner: 'org-one/archived',
+        visibility: 'PRIVATE',
+        isArchived: true,
+        isFork: false,
+        codeSecurity: 'disabled',
+        codeScanningDefaultSetup: 'unavailable',
+        secretScanning: 'disabled',
+        secretScanningPushProtection: 'disabled',
+        dependabotAlerts: 'disabled',
+        dependabotSecurityUpdates: 'disabled',
+        configurationStatus: 'none',
+        configurationId: null,
+        configurationName: null,
+        configurationEnforcement: null,
+      },
+    ],
+    now: new Date('2026-09-10T00:00:00Z'),
+  });
+
+  assert.equal(evaluation.assessedDomainCount, 3);
+  assert.equal(evaluation.healthScore, 85);
+  assert.deepEqual(evaluation.findings.map(finding => finding.ruleKey), [
+    'repository-security-core-features-disabled',
+    'repository-security-configuration-unassigned',
+  ]);
+  assert.deepEqual(evaluation.findings[0].affectedResources, ['org-one/unprotected']);
+  assert.deepEqual(evaluation.findings[1].affectedResources, ['org-one/unprotected']);
+  assert.equal(evaluation.metrics.eligibleSecurityRepositories, 2);
+  assert.equal(evaluation.metrics.repositorySecurityEvidence, 1);
+  assert.equal(evaluation.metrics.repositorySecurityUnknownRepositories, 1);
+  assert.equal(evaluation.metrics.codeSecurityEnabledRepositories, 0);
+  assert.equal(evaluation.metrics.codeScanningDefaultSetupRepositories, 0);
+  assert.equal(evaluation.metrics.securityConfigurationAppliedRepositories, 0);
 });
 
 test('evaluates Copilot seat utilization and enterprise budget controls', () => {

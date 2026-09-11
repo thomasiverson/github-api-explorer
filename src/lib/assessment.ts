@@ -59,6 +59,40 @@ export interface AssessmentSecurityDefault {
   enforcement: string;
 }
 
+export type AssessmentRepositorySecurityCheck =
+  | 'features'
+  | 'code-scanning-default-setup'
+  | 'dependabot-alerts'
+  | 'configuration';
+
+export interface AssessmentRepositorySecurity {
+  nameWithOwner: string;
+  visibility: string;
+  isArchived: boolean;
+  isFork: boolean;
+  codeSecurity: string | null;
+  codeScanningDefaultSetup: string | null;
+  secretScanning: string | null;
+  secretScanningPushProtection: string | null;
+  dependabotAlerts: string | null;
+  dependabotSecurityUpdates: string | null;
+  configurationStatus: string | null;
+  configurationId: number | null;
+  configurationName: string | null;
+  configurationEnforcement: string | null;
+}
+
+export interface AssessmentRepositorySecurityFailure {
+  nameWithOwner: string;
+  check: AssessmentRepositorySecurityCheck;
+  error: string;
+}
+
+export interface AssessmentRepositorySecurityCollection {
+  items: AssessmentRepositorySecurity[];
+  failures: AssessmentRepositorySecurityFailure[];
+}
+
 export interface AssessmentActionsPolicy {
   enabledOrganizations: string;
   allowedActions: string;
@@ -122,6 +156,17 @@ export type AssessmentGraphqlRequest = (
 
 export type AssessmentRestRequest = () => Promise<unknown>;
 export type AssessmentPagedRestRequest = (page: number, perPage: number) => Promise<unknown>;
+export interface AssessmentRestResponse {
+  status: number;
+  data: unknown;
+}
+
+export interface AssessmentRepositorySecurityRequests {
+  getRepository: (owner: string, repo: string) => Promise<AssessmentRestResponse>;
+  getCodeScanningDefaultSetup: (owner: string, repo: string) => Promise<AssessmentRestResponse>;
+  checkDependabotAlerts: (owner: string, repo: string) => Promise<AssessmentRestResponse>;
+  getConfiguration: (owner: string, repo: string) => Promise<AssessmentRestResponse>;
+}
 
 const STALE_REPOSITORY_DAYS = 365;
 const COPILOT_ACTIVITY_DAYS = 30;
@@ -367,6 +412,114 @@ export async function collectEnterpriseActionsPolicy(
   };
 }
 
+export async function collectRepositorySecurity(
+  requests: AssessmentRepositorySecurityRequests,
+  repositories: AssessmentRepository[]
+): Promise<AssessmentRepositorySecurityCollection> {
+  const items: AssessmentRepositorySecurity[] = [];
+  const failures: AssessmentRepositorySecurityFailure[] = [];
+
+  for (const repository of repositories) {
+    const [owner, repo] = repository.nameWithOwner.split('/');
+    if (!owner || !repo) {
+      throw new Error(`Invalid repository name: ${repository.nameWithOwner}`);
+    }
+    const item: AssessmentRepositorySecurity = {
+      nameWithOwner: repository.nameWithOwner,
+      visibility: repository.visibility,
+      isArchived: repository.isArchived,
+      isFork: repository.isFork,
+      codeSecurity: null,
+      codeScanningDefaultSetup: null,
+      secretScanning: null,
+      secretScanningPushProtection: null,
+      dependabotAlerts: null,
+      dependabotSecurityUpdates: null,
+      configurationStatus: null,
+      configurationId: null,
+      configurationName: null,
+      configurationEnforcement: null,
+    };
+
+    try {
+      const response = await requests.getRepository(owner, repo);
+      if (response.status !== 200) {
+        throw new Error(describeRestFailure('repository security features', response));
+      }
+      Object.assign(item, normalizeRepositorySecurityFeatures(response.data));
+    } catch (error) {
+      failures.push({
+        nameWithOwner: repository.nameWithOwner,
+        check: 'features',
+        error: error instanceof Error ? error.message : 'Repository security feature collection failed',
+      });
+    }
+
+    try {
+      const response = await requests.getCodeScanningDefaultSetup(owner, repo);
+      if (response.status === 200) {
+        item.codeScanningDefaultSetup = normalizeCodeScanningDefaultSetup(response.data);
+      } else if (
+        response.status === 403
+        && readRestMessage(response.data).toLowerCase().includes(
+          'code security must be enabled for this repository'
+        )
+      ) {
+        item.codeScanningDefaultSetup = 'unavailable';
+      } else {
+        throw new Error(describeRestFailure('code scanning default setup', response));
+      }
+    } catch (error) {
+      failures.push({
+        nameWithOwner: repository.nameWithOwner,
+        check: 'code-scanning-default-setup',
+        error: error instanceof Error ? error.message : 'Code scanning default setup collection failed',
+      });
+    }
+
+    try {
+      const response = await requests.checkDependabotAlerts(owner, repo);
+      if (response.status === 204) {
+        item.dependabotAlerts = 'enabled';
+      } else if (
+        response.status === 404
+        && readRestMessage(response.data).toLowerCase().includes('vulnerability alerts are disabled')
+      ) {
+        item.dependabotAlerts = 'disabled';
+      } else {
+        throw new Error(describeRestFailure('Dependabot alert status', response));
+      }
+    } catch (error) {
+      failures.push({
+        nameWithOwner: repository.nameWithOwner,
+        check: 'dependabot-alerts',
+        error: error instanceof Error ? error.message : 'Dependabot alert status collection failed',
+      });
+    }
+
+    try {
+      const response = await requests.getConfiguration(owner, repo);
+      if (response.status === 204) {
+        item.configurationStatus = 'none';
+      } else if (response.status === 200) {
+        Object.assign(item, normalizeRepositorySecurityConfiguration(response.data));
+      } else {
+        throw new Error(describeRestFailure('code security configuration', response));
+      }
+    } catch (error) {
+      failures.push({
+        nameWithOwner: repository.nameWithOwner,
+        check: 'configuration',
+        error: error instanceof Error ? error.message : 'Code security configuration collection failed',
+      });
+    }
+
+    items.push(item);
+  }
+
+  return { items, failures };
+}
+
 export async function collectEnterpriseCopilotSeats(
   request: AssessmentPagedRestRequest
 ): Promise<AssessmentCopilotSeatInventory> {
@@ -462,6 +615,7 @@ export function evaluateAssessmentBaseline(input: {
   repositories: AssessmentRepository[];
   teams: AssessmentTeam[];
   securityDefaults?: AssessmentSecurityDefault[] | null;
+  repositorySecurity?: AssessmentRepositorySecurity[] | null;
   actionsPolicy?: AssessmentActionsPolicy | null;
   copilotSeats?: AssessmentCopilotSeatInventory | null;
   budgets?: AssessmentBudget[] | null;
@@ -575,6 +729,94 @@ export function evaluateAssessmentBaseline(input: {
         summary: `${incompleteConfigurations.length} default ${incompleteConfigurations.length === 1 ? 'configuration does' : 'configurations do'} not enable dependency graph, Dependabot alerts, code scanning default setup, secret scanning, and push protection together.`,
         recommendation: 'Enable each core protection in the affected default security configurations, or document the approved exception.',
         affectedResources: incompleteConfigurations.map(configuration => configuration.configurationName),
+      });
+    }
+  }
+
+  let eligibleSecurityRepositories = 0;
+  let repositorySecurityEvidence = 0;
+  let codeSecurityEnabledRepositories = 0;
+  let codeScanningDefaultSetupRepositories = 0;
+  let secretScanningEnabledRepositories = 0;
+  let pushProtectionEnabledRepositories = 0;
+  let dependabotAlertsEnabledRepositories = 0;
+  let dependabotSecurityUpdatesEnabledRepositories = 0;
+  let securityConfigurationAppliedRepositories = 0;
+  let repositorySecurityUnknownRepositories = 0;
+  if (input.repositorySecurity) {
+    const eligibleRepositories = input.repositorySecurity.filter(
+      repository => !repository.isArchived && !repository.isFork
+    );
+    const repositoriesWithDisabledProtections = eligibleRepositories.filter(repository => (
+      repository.codeSecurity === 'disabled'
+      || repository.secretScanning === 'disabled'
+      || repository.secretScanningPushProtection === 'disabled'
+      || repository.dependabotAlerts === 'disabled'
+    ));
+    const repositoriesWithoutConfiguration = eligibleRepositories.filter(repository => (
+      repository.configurationStatus === 'none'
+      || repository.configurationStatus === 'detached'
+      || repository.configurationStatus === 'removed'
+      || repository.configurationStatus === 'removed_by_enterprise'
+      || repository.configurationStatus === 'failed'
+    ));
+
+    eligibleSecurityRepositories = eligibleRepositories.length;
+    repositorySecurityEvidence = eligibleRepositories.filter(repository => (
+      repository.codeSecurity !== null
+      || repository.secretScanning !== null
+      || repository.secretScanningPushProtection !== null
+      || repository.dependabotAlerts !== null
+    )).length;
+    codeSecurityEnabledRepositories = eligibleRepositories.filter(
+      repository => repository.codeSecurity === 'enabled'
+    ).length;
+    codeScanningDefaultSetupRepositories = eligibleRepositories.filter(
+      repository => repository.codeScanningDefaultSetup === 'configured'
+    ).length;
+    secretScanningEnabledRepositories = eligibleRepositories.filter(
+      repository => repository.secretScanning === 'enabled'
+    ).length;
+    pushProtectionEnabledRepositories = eligibleRepositories.filter(
+      repository => repository.secretScanningPushProtection === 'enabled'
+    ).length;
+    dependabotAlertsEnabledRepositories = eligibleRepositories.filter(
+      repository => repository.dependabotAlerts === 'enabled'
+    ).length;
+    dependabotSecurityUpdatesEnabledRepositories = eligibleRepositories.filter(
+      repository => repository.dependabotSecurityUpdates === 'enabled'
+    ).length;
+    securityConfigurationAppliedRepositories = eligibleRepositories.filter(repository => (
+      repository.configurationStatus === 'attached'
+      || repository.configurationStatus === 'enforced'
+    )).length;
+    repositorySecurityUnknownRepositories = eligibleRepositories.filter(repository => (
+      repository.codeSecurity === null
+      || repository.secretScanning === null
+      || repository.secretScanningPushProtection === null
+      || repository.dependabotAlerts === null
+    )).length;
+
+    if (repositoriesWithDisabledProtections.length > 0) {
+      findings.push({
+        ruleKey: 'repository-security-core-features-disabled',
+        domain: 'security',
+        severity: 'medium',
+        title: 'Repository security coverage is incomplete',
+        summary: `${repositoriesWithDisabledProtections.length} active, non-fork ${repositoriesWithDisabledProtections.length === 1 ? 'repository has' : 'repositories have'} at least one explicitly disabled core protection among code security, secret scanning, push protection, and Dependabot alerts.`,
+        recommendation: 'Review each affected repository, enable the applicable protections, and document approved exceptions for repositories where a control does not apply.',
+        affectedResources: repositoriesWithDisabledProtections.map(repository => repository.nameWithOwner),
+      });
+    }
+    if (repositoriesWithoutConfiguration.length > 0) {
+      findings.push({
+        ruleKey: 'repository-security-configuration-unassigned',
+        domain: 'security',
+        severity: 'low',
+        title: 'Repositories are not governed by a code security configuration',
+        summary: `${repositoriesWithoutConfiguration.length} active, non-fork ${repositoriesWithoutConfiguration.length === 1 ? 'repository is' : 'repositories are'} not currently attached to an enterprise or organization code security configuration.`,
+        recommendation: 'Attach an approved code security configuration to reduce repository-level drift, or document why manual security settings are required.',
+        affectedResources: repositoriesWithoutConfiguration.map(repository => repository.nameWithOwner),
       });
     }
   }
@@ -705,7 +947,7 @@ export function evaluateAssessmentBaseline(input: {
   return {
     healthScore,
     assessedDomainCount: 2
-      + (input.securityDefaults ? 1 : 0)
+      + (input.securityDefaults || input.repositorySecurity ? 1 : 0)
       + (input.actionsPolicy ? 1 : 0)
       + (input.copilotSeats ? 1 : 0)
       + (input.budgets ? 1 : 0),
@@ -718,6 +960,18 @@ export function evaluateAssessmentBaseline(input: {
       privateRepositories: input.repositories.filter(repository => repository.visibility === 'PRIVATE').length,
       publicRepositories: publicRepositories.length,
       staleActiveRepositories: staleRepositories.length,
+      ...(input.repositorySecurity ? {
+        codeScanningDefaultSetupRepositories,
+        codeSecurityEnabledRepositories,
+        dependabotAlertsEnabledRepositories,
+        dependabotSecurityUpdatesEnabledRepositories,
+        eligibleSecurityRepositories,
+        pushProtectionEnabledRepositories,
+        repositorySecurityEvidence,
+        repositorySecurityUnknownRepositories,
+        secretScanningEnabledRepositories,
+        securityConfigurationAppliedRepositories,
+      } : {}),
       ...(input.copilotSeats ? {
         activeCopilotSeats,
         copilotSeats: input.copilotSeats.totalSeats,
@@ -734,6 +988,113 @@ export function evaluateAssessmentBaseline(input: {
       } : {}),
     },
   };
+}
+
+function normalizeRepositorySecurityFeatures(data: unknown): Pick<
+  AssessmentRepositorySecurity,
+  | 'codeSecurity'
+  | 'secretScanning'
+  | 'secretScanningPushProtection'
+  | 'dependabotSecurityUpdates'
+> {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) {
+    throw new Error('GitHub returned an invalid repository details response');
+  }
+  const securityAndAnalysis = (data as Record<string, unknown>).security_and_analysis;
+  if (!securityAndAnalysis || typeof securityAndAnalysis !== 'object' || Array.isArray(securityAndAnalysis)) {
+    throw new Error('GitHub did not return repository security feature states');
+  }
+  const settings = securityAndAnalysis as Record<string, unknown>;
+  const codeSecurity = readFeatureStatus(settings, 'code_security')
+    ?? readFeatureStatus(settings, 'advanced_security');
+  const secretScanning = readFeatureStatus(settings, 'secret_scanning');
+  const secretScanningPushProtection = readFeatureStatus(
+    settings,
+    'secret_scanning_push_protection'
+  );
+  const dependabotSecurityUpdates = readFeatureStatus(settings, 'dependabot_security_updates');
+  if (
+    codeSecurity === null
+    && secretScanning === null
+    && secretScanningPushProtection === null
+    && dependabotSecurityUpdates === null
+  ) {
+    throw new Error('GitHub returned no recognized repository security feature states');
+  }
+  return {
+    codeSecurity,
+    secretScanning,
+    secretScanningPushProtection,
+    dependabotSecurityUpdates,
+  };
+}
+
+function normalizeRepositorySecurityConfiguration(data: unknown): Pick<
+  AssessmentRepositorySecurity,
+  'configurationStatus' | 'configurationId' | 'configurationName' | 'configurationEnforcement'
+> {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) {
+    throw new Error('GitHub returned an invalid repository security configuration response');
+  }
+  const record = data as Record<string, unknown>;
+  const configuration = record.configuration;
+  if (
+    typeof record.status !== 'string'
+    || !configuration
+    || typeof configuration !== 'object'
+    || Array.isArray(configuration)
+  ) {
+    throw new Error('GitHub returned an incomplete repository security configuration response');
+  }
+  const settings = configuration as Record<string, unknown>;
+  if (
+    typeof settings.id !== 'number'
+    || typeof settings.name !== 'string'
+    || typeof settings.enforcement !== 'string'
+  ) {
+    throw new Error('GitHub returned an incomplete repository security configuration');
+  }
+  return {
+    configurationStatus: record.status,
+    configurationId: settings.id,
+    configurationName: settings.name,
+    configurationEnforcement: settings.enforcement,
+  };
+}
+
+function normalizeCodeScanningDefaultSetup(data: unknown): string {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) {
+    throw new Error('GitHub returned an invalid code scanning default setup response');
+  }
+  const state = (data as Record<string, unknown>).state;
+  if (state !== 'configured' && state !== 'not-configured') {
+    throw new Error('GitHub returned an incomplete code scanning default setup response');
+  }
+  return state;
+}
+
+function readFeatureStatus(settings: Record<string, unknown>, key: string): string | null {
+  const value = settings[key];
+  if (value === undefined || value === null) return null;
+  if (
+    typeof value !== 'object'
+    || Array.isArray(value)
+    || typeof (value as Record<string, unknown>).status !== 'string'
+  ) {
+    throw new Error(`GitHub returned an invalid ${key} repository security state`);
+  }
+  return (value as Record<string, unknown>).status as string;
+}
+
+function readRestMessage(data: unknown): string {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return '';
+  const message = (data as Record<string, unknown>).message;
+  return typeof message === 'string' ? message : '';
+}
+
+function describeRestFailure(label: string, response: AssessmentRestResponse): string {
+  const message = readRestMessage(response.data);
+  return `GitHub returned ${response.status} for ${label}${message ? `: ${message}` : ''}`;
 }
 
 function normalizeCopilotSeat(value: unknown): AssessmentCopilotSeat {

@@ -10,7 +10,9 @@ import {
   collectEnterpriseSecurityDefaults,
   collectOrganizationRepositories,
   collectOrganizationTeams,
+  collectRepositorySecurity,
   evaluateAssessmentBaseline,
+  type AssessmentRestResponse,
 } from '@/lib/assessment';
 import {
   completeAssessment,
@@ -62,6 +64,7 @@ export async function POST(request: Request) {
   const repositoryCollectorId = uuidv4();
   const teamCollectorId = uuidv4();
   const securityCollectorId = uuidv4();
+  const repositorySecurityCollectorId = uuidv4();
   const actionsCollectorId = uuidv4();
   const copilotCollectorId = uuidv4();
   const billingCollectorId = uuidv4();
@@ -104,6 +107,44 @@ export async function POST(request: Request) {
       organizationLogins
     );
     const teamDurationMs = Math.round(performance.now() - teamStartedAt);
+    const repositorySecurityStartedAt = performance.now();
+    const repositorySecurityResult = await collectRepositorySecurity({
+      getRepository: (owner, repo) => requestWithStatus(() => octokit.request(
+        'GET /repos/{owner}/{repo}',
+        {
+          owner,
+          repo,
+          headers: { 'X-GitHub-Api-Version': '2026-03-10' },
+        }
+      )),
+      getCodeScanningDefaultSetup: (owner, repo) => requestWithStatus(() => octokit.request(
+        'GET /repos/{owner}/{repo}/code-scanning/default-setup',
+        {
+          owner,
+          repo,
+          headers: { 'X-GitHub-Api-Version': '2026-03-10' },
+        }
+      )),
+      checkDependabotAlerts: (owner, repo) => requestWithStatus(() => octokit.request(
+        'GET /repos/{owner}/{repo}/vulnerability-alerts',
+        {
+          owner,
+          repo,
+          headers: { 'X-GitHub-Api-Version': '2026-03-10' },
+        }
+      )),
+      getConfiguration: (owner, repo) => requestWithStatus(() => octokit.request(
+        'GET /repos/{owner}/{repo}/code-security-configuration',
+        {
+          owner,
+          repo,
+          headers: { 'X-GitHub-Api-Version': '2026-03-10' },
+        }
+      )),
+    }, repositoryResult.items);
+    const repositorySecurityDurationMs = Math.round(
+      performance.now() - repositorySecurityStartedAt
+    );
     const securityResult = await collectOptionalEvidence(() => (
       collectEnterpriseSecurityDefaults(async () => (
         await octokit.request(
@@ -159,6 +200,7 @@ export async function POST(request: Request) {
       repositories: repositoryResult.items,
       teams: teamResult.items,
       securityDefaults: securityResult.value,
+      repositorySecurity: repositorySecurityResult.items,
       actionsPolicy: actionsResult.value,
       copilotSeats: copilotResult.value,
       budgets: billingResult.value,
@@ -183,6 +225,10 @@ export async function POST(request: Request) {
         durationMs: securityResult.durationMs,
         error: securityResult.error,
       },
+      repositorySecurityCollector: {
+        id: repositorySecurityCollectorId,
+        durationMs: repositorySecurityDurationMs,
+      },
       actionsCollector: {
         id: actionsCollectorId,
         durationMs: actionsResult.durationMs,
@@ -199,6 +245,8 @@ export async function POST(request: Request) {
         error: billingResult.error,
       },
       securityDefaults: securityResult.value,
+      repositorySecurity: repositorySecurityResult.items,
+      repositorySecurityFailures: repositorySecurityResult.failures,
       actionsPolicy: actionsResult.value,
       copilotSeats: copilotResult.value,
       budgets: billingResult.value,
@@ -243,6 +291,29 @@ async function collectOptionalEvidence<T>(
       value: null,
       error: error instanceof Error ? error.message : 'Collector failed',
       durationMs: Math.round(performance.now() - startedAt),
+    };
+  }
+}
+
+async function requestWithStatus(
+  request: () => Promise<{ status: number; data: unknown }>
+): Promise<AssessmentRestResponse> {
+  try {
+    const response = await request();
+    return { status: response.status, data: response.data };
+  } catch (error) {
+    if (!error || typeof error !== 'object' || Array.isArray(error)) throw error;
+    const record = error as Record<string, unknown>;
+    if (typeof record.status !== 'number') throw error;
+    const response = record.response;
+    const data = response && typeof response === 'object' && !Array.isArray(response)
+      ? (response as Record<string, unknown>).data
+      : undefined;
+    return {
+      status: record.status,
+      data: data ?? {
+        message: typeof record.message === 'string' ? record.message : 'GitHub request failed',
+      },
     };
   }
 }

@@ -33,6 +33,23 @@ interface AssessmentCollectorResult {
   error: string | null;
 }
 
+interface AssessmentRepositorySecurity {
+  nameWithOwner: string;
+  visibility: string;
+  isArchived: boolean;
+  isFork: boolean;
+  codeSecurity: string | null;
+  codeScanningDefaultSetup: string | null;
+  secretScanning: string | null;
+  secretScanningPushProtection: string | null;
+  dependabotAlerts: string | null;
+  dependabotSecurityUpdates: string | null;
+  configurationStatus: string | null;
+  configurationId: number | null;
+  configurationName: string | null;
+  configurationEnforcement: string | null;
+}
+
 interface AssessmentSnapshot {
   id: string;
   environmentId: string;
@@ -43,6 +60,7 @@ interface AssessmentSnapshot {
   error: string | null;
   metrics: Record<string, number>;
   collectors: AssessmentCollectorResult[];
+  repositorySecurity: AssessmentRepositorySecurity[];
   findings: AssessmentFinding[];
 }
 
@@ -122,16 +140,27 @@ export default function AssessmentPage() {
   };
   const repositoryCollector = snapshot?.collectors.find(collector => collector.collector_key === 'repositories');
   const securityCollector = snapshot?.collectors.find(collector => collector.collector_key === 'security');
+  const repositorySecurityCollector = snapshot?.collectors.find(
+    collector => collector.collector_key === 'repositorySecurity'
+  );
   const actionsCollector = snapshot?.collectors.find(collector => collector.collector_key === 'actions');
   const copilotCollector = snapshot?.collectors.find(collector => collector.collector_key === 'copilot');
   const billingCollector = snapshot?.collectors.find(collector => collector.collector_key === 'billing');
+  const repositorySecurity = snapshot?.repositorySecurity || [];
+  const eligibleRepositorySecurity = repositorySecurity.filter(
+    repository => !repository.isArchived && !repository.isFork
+  );
   const domainStatuses: Record<AssessmentDomainKey, string> = {
     identity: baselineEvaluated ? 'Baseline' : 'Not assessed',
     repositories: baselineEvaluated
       ? repositoryCollector?.status === 'partial' ? 'Partial baseline' : 'Baseline'
       : 'Not assessed',
     security: baselineEvaluated
-      ? securityCollector?.status === 'completed' ? 'Baseline' : 'Unavailable'
+      ? repositorySecurityCollector?.status === 'completed'
+        ? 'Repository depth'
+        : repositorySecurityCollector?.status === 'partial'
+          ? 'Partial repository depth'
+          : securityCollector?.status === 'completed' ? 'Baseline' : 'Unavailable'
       : 'Not assessed',
     actions: baselineEvaluated
       ? actionsCollector?.status === 'completed' ? 'Baseline' : 'Unavailable'
@@ -213,12 +242,15 @@ export default function AssessmentPage() {
                 <div className="mt-2 space-y-3">
                   {incompleteCollectors.map(collector => {
                     const failures = splitCollectorFailures(collector.error);
+                    const failureSubject = collector.collector_key === 'repositorySecurity'
+                      ? `${failures.length} incomplete repository ${failures.length === 1 ? 'check' : 'checks'}`
+                      : `${failures.length} inaccessible ${failures.length === 1 ? 'organization' : 'organizations'}`;
                     return (
                       <div key={collector.collector_key}>
                         <p className="text-xs font-medium text-text-primary capitalize">
                           {collector.collector_key}: {collector.status === 'failed'
                             ? 'collector unavailable'
-                            : `${failures.length} inaccessible ${failures.length === 1 ? 'organization' : 'organizations'}`}
+                            : failureSubject}
                         </p>
                         <ul className="mt-1 space-y-1">
                           {failures.map((failure, index) => (
@@ -329,6 +361,106 @@ export default function AssessmentPage() {
             </div>
           </section>
 
+          <section aria-labelledby="repository-security-heading" className="border border-border bg-panel rounded-lg overflow-hidden">
+            <div className="px-4 py-3 border-b border-border flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
+              <div>
+                <h2 id="repository-security-heading" className="text-sm font-semibold text-text-primary">
+                  Repository security coverage
+                </h2>
+                <p className="text-xs text-text-muted mt-0.5">
+                  Actual feature states for active, non-fork repositories. Unknown values are excluded from findings.
+                </p>
+              </div>
+              <span className="text-xs text-text-muted">
+                {baselineEvaluated
+                  ? `${snapshot?.metrics.repositorySecurityEvidence || 0} of ${snapshot?.metrics.eligibleSecurityRepositories || 0} repositories measured`
+                  : 'Awaiting assessment'}
+              </span>
+            </div>
+            <div className="grid sm:grid-cols-2 lg:grid-cols-6 divide-y sm:divide-y-0 sm:divide-x divide-border">
+              <SecurityCoverageMetric
+                label="Code security"
+                enabled={snapshot?.metrics.codeSecurityEnabledRepositories}
+                total={snapshot?.metrics.eligibleSecurityRepositories}
+              />
+              <SecurityCoverageMetric
+                label="Code scanning setup"
+                enabled={snapshot?.metrics.codeScanningDefaultSetupRepositories}
+                total={snapshot?.metrics.eligibleSecurityRepositories}
+                stateLabel="configured"
+              />
+              <SecurityCoverageMetric
+                label="Secret scanning"
+                enabled={snapshot?.metrics.secretScanningEnabledRepositories}
+                total={snapshot?.metrics.eligibleSecurityRepositories}
+              />
+              <SecurityCoverageMetric
+                label="Push protection"
+                enabled={snapshot?.metrics.pushProtectionEnabledRepositories}
+                total={snapshot?.metrics.eligibleSecurityRepositories}
+              />
+              <SecurityCoverageMetric
+                label="Dependabot alerts"
+                enabled={snapshot?.metrics.dependabotAlertsEnabledRepositories}
+                total={snapshot?.metrics.eligibleSecurityRepositories}
+              />
+              <SecurityCoverageMetric
+                label="Configuration applied"
+                enabled={snapshot?.metrics.securityConfigurationAppliedRepositories}
+                total={snapshot?.metrics.eligibleSecurityRepositories}
+                stateLabel="applied"
+              />
+            </div>
+            {repositorySecurity.length > 0 ? (
+              <details className="border-t border-border">
+                <summary className="px-4 py-3 text-xs font-medium text-accent cursor-pointer">
+                  Review the repository evidence matrix ({eligibleRepositorySecurity.length} assessed)
+                </summary>
+                <div className="overflow-x-auto border-t border-border">
+                  <table className="w-full min-w-[1060px] text-left">
+                    <thead className="bg-surface">
+                      <tr className="text-[10px] uppercase tracking-wide text-text-muted">
+                        <th className="px-4 py-2 font-medium">Repository</th>
+                        <th className="px-3 py-2 font-medium">Code security</th>
+                        <th className="px-3 py-2 font-medium">Code scanning</th>
+                        <th className="px-3 py-2 font-medium">Secret scanning</th>
+                        <th className="px-3 py-2 font-medium">Push protection</th>
+                        <th className="px-3 py-2 font-medium">Dependabot alerts</th>
+                        <th className="px-3 py-2 font-medium">Configuration</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-border">
+                      {repositorySecurity.map(repository => (
+                        <tr key={repository.nameWithOwner} className="text-xs">
+                          <td className="px-4 py-2.5">
+                            <span className="font-mono text-text-primary">{repository.nameWithOwner}</span>
+                            {(repository.isArchived || repository.isFork) && (
+                              <span className="ml-2 text-[10px] text-text-muted">
+                                {repository.isArchived ? 'Archived' : 'Fork'}
+                              </span>
+                            )}
+                          </td>
+                          <td className="px-3 py-2.5"><SecurityState value={repository.codeSecurity} /></td>
+                          <td className="px-3 py-2.5"><SecurityState value={repository.codeScanningDefaultSetup} /></td>
+                          <td className="px-3 py-2.5"><SecurityState value={repository.secretScanning} /></td>
+                          <td className="px-3 py-2.5"><SecurityState value={repository.secretScanningPushProtection} /></td>
+                          <td className="px-3 py-2.5"><SecurityState value={repository.dependabotAlerts} /></td>
+                          <td className="px-3 py-2.5">
+                            <ConfigurationState repository={repository} />
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </details>
+            ) : (
+              <p className="border-t border-border px-4 py-4 text-xs text-text-muted">
+                Run the assessment to collect repository-level security evidence.
+              </p>
+            )}
+          </section>
+
           <section aria-labelledby="domains-heading" className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_360px]">
             <div className="border border-border bg-panel rounded-lg overflow-hidden">
               <div className="px-4 py-3 border-b border-border">
@@ -411,6 +543,52 @@ function StatusRow({ label, value }: { label: string; value: string }) {
       <span className="text-xs font-medium text-text-primary text-right">{value}</span>
     </div>
   );
+}
+
+function SecurityCoverageMetric({
+  label,
+  enabled,
+  total,
+  stateLabel = 'enabled',
+}: {
+  label: string;
+  enabled: number | undefined;
+  total: number | undefined;
+  stateLabel?: string;
+}) {
+  return (
+    <div className="px-4 py-3">
+      <p className="text-[11px] text-text-muted">{label}</p>
+      <p className="text-sm font-medium text-text-primary mt-1">
+        {enabled === undefined || total === undefined ? '--' : `${enabled} of ${total} ${stateLabel}`}
+      </p>
+    </div>
+  );
+}
+
+function SecurityState({ value }: { value: string | null }) {
+  if (value === 'enabled') return <span className="font-medium text-success">✔ Enabled</span>;
+  if (value === 'disabled') return <span className="font-medium text-warning">— Disabled</span>;
+  if (value === 'configured') return <span className="font-medium text-success">✔ Configured</span>;
+  if (value === 'not-configured') return <span className="font-medium text-warning">— Not configured</span>;
+  if (value === 'unavailable') return <span className="text-text-muted">— Unavailable</span>;
+  if (!value) return <span className="text-text-muted">? Unknown</span>;
+  return <span className="text-text-secondary">{value}</span>;
+}
+
+function ConfigurationState({ repository }: { repository: AssessmentRepositorySecurity }) {
+  if (repository.configurationStatus === 'attached' || repository.configurationStatus === 'enforced') {
+    return (
+      <span className="font-medium text-success" title={repository.configurationName || undefined}>
+        ✔ {repository.configurationStatus === 'enforced' ? 'Enforced' : 'Attached'}
+      </span>
+    );
+  }
+  if (repository.configurationStatus === 'none') {
+    return <span className="font-medium text-warning">— None</span>;
+  }
+  if (!repository.configurationStatus) return <span className="text-text-muted">? Unknown</span>;
+  return <span className="text-text-secondary">{repository.configurationStatus}</span>;
 }
 
 function formatAssessmentDate(value: string | null | undefined): string {
