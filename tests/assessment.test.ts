@@ -12,6 +12,7 @@ import {
   collectOrganizationTeams,
   collectRepositoryRules,
   collectRepositorySecurity,
+  collectRulesetDetails,
   evaluateAssessmentBaseline,
 } from '../src/lib/assessment';
 
@@ -588,6 +589,7 @@ test('collects paginated effective rules and combines them with classic branch p
     hasProtection: true,
     activeRulesetIds: [23],
     activeRulesetSources: ['Organization: acme'],
+    activeRulesets: [{ githubId: 23, sourceType: 'Organization', source: 'acme' }],
     ruleTypes: ['deletion', 'non_fast_forward', 'pull_request', 'required_status_checks'],
     requiresPullRequest: true,
     requiredApprovingReviewCount: 2,
@@ -660,6 +662,98 @@ test('distinguishes unprotected, nonexistent, and partially available default br
     nameWithOwner: 'acme/partial',
     check: 'effective-rules',
     error: 'GitHub returned 403 for effective branch rules: Resource protected by SAML',
+  }]);
+});
+
+test('deduplicates active rulesets and collects bypass actors from their declared source', async () => {
+  const rulesRepository = (
+    nameWithOwner: string,
+    reference: { githubId: number; sourceType: string; source: string }
+  ) => ({
+    nameWithOwner,
+    visibility: 'PRIVATE',
+    isArchived: false,
+    isFork: false,
+    defaultBranch: 'main',
+    branchExists: true,
+    classicProtection: false,
+    hasProtection: true,
+    activeRulesetIds: [reference.githubId],
+    activeRulesetSources: [`${reference.sourceType}: ${reference.source}`],
+    activeRulesets: [reference],
+    ruleTypes: ['pull_request'],
+    requiresPullRequest: true,
+    requiredApprovingReviewCount: 1,
+    requiresStatusChecks: false,
+    blocksForcePushes: false,
+    blocksDeletions: false,
+    enforcesAdmins: false,
+  });
+  const requestedIds: number[] = [];
+  const sharedReference = {
+    githubId: 23,
+    sourceType: 'Organization',
+    source: 'acme',
+  };
+  const result = await collectRulesetDetails(async reference => {
+    requestedIds.push(reference.githubId);
+    if (reference.githubId === 99) {
+      return { status: 403, data: { message: 'Resource protected by SAML' } };
+    }
+    return {
+      status: 200,
+      data: {
+        id: 23,
+        name: 'Default branch baseline',
+        target: 'branch',
+        source_type: 'Organization',
+        source: 'acme',
+        enforcement: 'active',
+        conditions: {
+          ref_name: { include: ['~DEFAULT_BRANCH'], exclude: ['refs/heads/generated'] },
+        },
+        rules: [{ type: 'pull_request' }, { type: 'required_status_checks' }],
+        bypass_actors: [
+          { actor_id: null, actor_type: 'OrganizationAdmin', bypass_mode: 'always' },
+          { actor_id: 42, actor_type: 'Team', bypass_mode: 'pull_request' },
+        ],
+      },
+    };
+  }, [
+    rulesRepository('acme/one', sharedReference),
+    rulesRepository('acme/two', sharedReference),
+    rulesRepository('acme/partial', {
+      githubId: 99,
+      sourceType: 'Repository',
+      source: 'acme/partial',
+    }),
+  ]);
+
+  assert.deepEqual(requestedIds, [23, 99]);
+  assert.deepEqual(result.items, [{
+    githubId: 23,
+    name: 'Default branch baseline',
+    target: 'branch',
+    sourceType: 'Organization',
+    source: 'acme',
+    enforcement: 'active',
+    conditions: [{
+      type: 'ref_name',
+      include: ['~DEFAULT_BRANCH'],
+      exclude: ['refs/heads/generated'],
+    }],
+    ruleTypes: ['pull_request', 'required_status_checks'],
+    appliedRepositories: ['acme/one', 'acme/two'],
+    bypassActors: [
+      { actorId: null, actorType: 'OrganizationAdmin', bypassMode: 'always' },
+      { actorId: 42, actorType: 'Team', bypassMode: 'pull_request' },
+    ],
+  }]);
+  assert.deepEqual(result.failures, [{
+    githubId: 99,
+    sourceType: 'Repository',
+    source: 'acme/partial',
+    error: 'GitHub returned 403 for ruleset details: Resource protected by SAML',
   }]);
 });
 
@@ -1115,6 +1209,7 @@ test('evaluates default branch controls without treating unknown or nonexistent 
     defaultBranch: 'main',
     activeRulesetIds: [],
     activeRulesetSources: [],
+    activeRulesets: [],
     ruleTypes: [],
     ...repository,
   }));
@@ -1155,6 +1250,63 @@ test('evaluates default branch controls without treating unknown or nonexistent 
     repositoriesWithoutDefaultBranches: 1,
     rulesetProtectedDefaultBranches: 0,
   });
+});
+
+test('flags unconditional ruleset bypass while excluding pull-request-only and disabled exceptions', () => {
+  const evaluation = evaluateAssessmentBaseline({
+    organizations: [],
+    members: [
+      { login: 'owner-one', name: null, isOwner: true },
+      { login: 'owner-two', name: null, isOwner: true },
+    ],
+    ownerCount: 2,
+    repositories: [],
+    teams: [],
+    rulesets: [
+      {
+        githubId: 1,
+        name: 'Organization baseline',
+        target: 'branch',
+        sourceType: 'Organization',
+        source: 'acme',
+        enforcement: 'active',
+        conditions: [],
+        ruleTypes: ['pull_request'],
+        appliedRepositories: ['acme/repository'],
+        bypassActors: [
+          { actorId: null, actorType: 'OrganizationAdmin', bypassMode: 'always' },
+          { actorId: 42, actorType: 'Team', bypassMode: 'always' },
+          { actorId: 7, actorType: 'Integration', bypassMode: 'pull_request' },
+        ],
+      },
+      {
+        githubId: 2,
+        name: 'Disabled enterprise policy',
+        target: 'branch',
+        sourceType: 'Enterprise',
+        source: 'acme-enterprise',
+        enforcement: 'disabled',
+        conditions: [],
+        ruleTypes: ['deletion'],
+        appliedRepositories: [],
+        bypassActors: [
+          { actorId: null, actorType: 'EnterpriseOwner', bypassMode: 'always' },
+        ],
+      },
+    ],
+    now: new Date('2026-09-10T00:00:00Z'),
+  });
+
+  assert.equal(evaluation.healthScore, 85);
+  assert.deepEqual(evaluation.findings.map(finding => finding.ruleKey), [
+    'ruleset-broad-unconditional-bypass',
+    'ruleset-scoped-unconditional-bypass-review',
+  ]);
+  assert.equal(evaluation.metrics.activeRulesetCount, 1);
+  assert.equal(evaluation.metrics.rulesetsWithBypassActors, 1);
+  assert.equal(evaluation.metrics.rulesetBypassActorCount, 3);
+  assert.equal(evaluation.metrics.unconditionalBypassActorCount, 2);
+  assert.equal(evaluation.metrics.pullRequestBypassActorCount, 1);
 });
 
 test('evaluates Copilot seat utilization and enterprise budget controls', () => {

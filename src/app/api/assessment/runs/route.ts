@@ -13,6 +13,7 @@ import {
   collectOrganizationTeams,
   collectRepositoryRules,
   collectRepositorySecurity,
+  collectRulesetDetails,
   evaluateAssessmentBaseline,
   type AssessmentRestResponse,
 } from '@/lib/assessment';
@@ -68,6 +69,7 @@ export async function POST(request: Request) {
   const securityCollectorId = uuidv4();
   const repositorySecurityCollectorId = uuidv4();
   const repositoryRulesCollectorId = uuidv4();
+  const rulesetDetailsCollectorId = uuidv4();
   const actionsCollectorId = uuidv4();
   const actionsDepthCollectorId = uuidv4();
   const copilotCollectorId = uuidv4();
@@ -179,6 +181,49 @@ export async function POST(request: Request) {
     const repositoryRulesDurationMs = Math.round(
       performance.now() - repositoryRulesStartedAt
     );
+    const rulesetDetailsStartedAt = performance.now();
+    const rulesetDetailsResult = await collectRulesetDetails(async reference => {
+      const requestHeaders = { 'X-GitHub-Api-Version': '2026-03-10' };
+      if (reference.sourceType === 'Repository') {
+        const [owner, repo] = reference.source.split('/');
+        if (!owner || !repo) {
+          throw new Error(`Invalid repository ruleset source: ${reference.source}`);
+        }
+        return requestWithStatus(() => octokit.request(
+          'GET /repos/{owner}/{repo}/rulesets/{ruleset_id}',
+          {
+            owner,
+            repo,
+            ruleset_id: reference.githubId,
+            headers: requestHeaders,
+          }
+        ));
+      }
+      if (reference.sourceType === 'Organization') {
+        return requestWithStatus(() => octokit.request(
+          'GET /orgs/{org}/rulesets/{ruleset_id}',
+          {
+            org: reference.source,
+            ruleset_id: reference.githubId,
+            headers: requestHeaders,
+          }
+        ));
+      }
+      if (reference.sourceType === 'Enterprise') {
+        return requestWithStatus(() => octokit.request(
+          'GET /enterprises/{enterprise}/rulesets/{ruleset_id}',
+          {
+            enterprise: reference.source,
+            ruleset_id: reference.githubId,
+            headers: requestHeaders,
+          }
+        ));
+      }
+      throw new Error(`Unsupported ruleset source type: ${reference.sourceType}`);
+    }, repositoryRulesResult.items);
+    const rulesetDetailsDurationMs = Math.round(
+      performance.now() - rulesetDetailsStartedAt
+    );
     const securityResult = await collectOptionalEvidence(() => (
       collectEnterpriseSecurityDefaults(async () => (
         await octokit.request(
@@ -286,6 +331,7 @@ export async function POST(request: Request) {
       securityDefaults: securityResult.value,
       repositorySecurity: repositorySecurityResult.items,
       repositoryRules: repositoryRulesResult.items,
+      rulesets: rulesetDetailsResult.items,
       actionsPolicy: actionsResult.value,
       actionsEvidence: actionsDepthResult.value,
       copilotSeats: copilotResult.value,
@@ -319,6 +365,10 @@ export async function POST(request: Request) {
         id: repositoryRulesCollectorId,
         durationMs: repositoryRulesDurationMs,
       },
+      rulesetDetailsCollector: {
+        id: rulesetDetailsCollectorId,
+        durationMs: rulesetDetailsDurationMs,
+      },
       actionsCollector: {
         id: actionsCollectorId,
         durationMs: actionsResult.durationMs,
@@ -344,6 +394,8 @@ export async function POST(request: Request) {
       repositorySecurityFailures: repositorySecurityResult.failures,
       repositoryRules: repositoryRulesResult.items,
       repositoryRulesFailures: repositoryRulesResult.failures,
+      rulesets: rulesetDetailsResult.items,
+      rulesetDetailFailures: rulesetDetailsResult.failures,
       actionsPolicy: actionsResult.value,
       actionsEvidence: actionsDepthResult.value,
       copilotSeats: copilotResult.value,

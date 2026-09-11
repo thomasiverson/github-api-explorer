@@ -35,6 +35,7 @@ test('persists and reloads repository security and Actions evidence', async () =
       securityCollector: { id: 'collector-security', durationMs: 1, error: null },
       repositorySecurityCollector: { id: 'collector-repository-security', durationMs: 1 },
       repositoryRulesCollector: { id: 'collector-repository-rules', durationMs: 1 },
+      rulesetDetailsCollector: { id: 'collector-ruleset-details', durationMs: 1 },
       actionsCollector: { id: 'collector-actions', durationMs: 1, error: null },
       actionsDepthCollector: { id: 'collector-actions-depth', durationMs: 1, error: null },
       copilotCollector: { id: 'collector-copilot', durationMs: 1, error: null },
@@ -76,6 +77,7 @@ test('persists and reloads repository security and Actions evidence', async () =
         hasProtection: true,
         activeRulesetIds: [23],
         activeRulesetSources: ['Organization: acme'],
+        activeRulesets: [{ githubId: 23, sourceType: 'Organization', source: 'acme' }],
         ruleTypes: ['deletion', 'non_fast_forward', 'pull_request', 'required_status_checks'],
         requiresPullRequest: true,
         requiredApprovingReviewCount: 2,
@@ -88,6 +90,31 @@ test('persists and reloads repository security and Actions evidence', async () =
         nameWithOwner: 'acme/repository',
         check: 'classic-protection',
         error: 'Classic protection returned HTTP 403',
+      }],
+      rulesets: [{
+        githubId: 23,
+        name: 'Default branch baseline',
+        target: 'branch',
+        sourceType: 'Organization',
+        source: 'acme',
+        enforcement: 'active',
+        conditions: [{
+          type: 'ref_name',
+          include: ['~DEFAULT_BRANCH'],
+          exclude: [],
+        }],
+        ruleTypes: ['pull_request', 'required_status_checks'],
+        appliedRepositories: ['acme/repository'],
+        bypassActors: [
+          { actorId: null, actorType: 'OrganizationAdmin', bypassMode: 'always' },
+          { actorId: 42, actorType: 'Team', bypassMode: 'pull_request' },
+        ],
+      }],
+      rulesetDetailFailures: [{
+        githubId: 99,
+        sourceType: 'Repository',
+        source: 'acme/partial',
+        error: 'Ruleset detail returned HTTP 403',
       }],
       actionsPolicy: null,
       actionsEvidence: {
@@ -175,6 +202,7 @@ test('persists and reloads repository security and Actions evidence', async () =
       hasProtection: true,
       activeRulesetIds: [23],
       activeRulesetSources: ['Organization: acme'],
+      activeRulesets: [{ githubId: 23, sourceType: 'Organization', source: 'acme' }],
       ruleTypes: ['deletion', 'non_fast_forward', 'pull_request', 'required_status_checks'],
       requiresPullRequest: true,
       requiredApprovingReviewCount: 2,
@@ -182,6 +210,25 @@ test('persists and reloads repository security and Actions evidence', async () =
       blocksForcePushes: true,
       blocksDeletions: true,
       enforcesAdmins: null,
+    }]);
+    assert.deepEqual(snapshot.rulesets, [{
+      githubId: 23,
+      name: 'Default branch baseline',
+      target: 'branch',
+      sourceType: 'Organization',
+      source: 'acme',
+      enforcement: 'active',
+      conditions: [{
+        type: 'ref_name',
+        include: ['~DEFAULT_BRANCH'],
+        exclude: [],
+      }],
+      ruleTypes: ['pull_request', 'required_status_checks'],
+      appliedRepositories: ['acme/repository'],
+      bypassActors: [
+        { actorId: null, actorType: 'OrganizationAdmin', bypassMode: 'always' },
+        { actorId: 42, actorType: 'Team', bypassMode: 'pull_request' },
+      ],
     }]);
     assert.equal(snapshot.metrics.codeScanningDefaultSetupRepositories, 1);
     assert.deepEqual(snapshot.actionsEvidence, {
@@ -250,6 +297,15 @@ test('persists and reloads repository security and Actions evidence', async () =
       item_count: 1,
       duration_ms: 1,
       error: 'acme/repository [classic-protection]: Classic protection returned HTTP 403',
+    });
+    assert.deepEqual(snapshot.collectors.find(
+      collector => collector.collector_key === 'rulesetDetails'
+    ), {
+      collector_key: 'rulesetDetails',
+      status: 'partial',
+      item_count: 1,
+      duration_ms: 1,
+      error: 'Repository acme/partial [99]: Ruleset detail returned HTTP 403',
     });
   } finally {
     closeDatabase?.();

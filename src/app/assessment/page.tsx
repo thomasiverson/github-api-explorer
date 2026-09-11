@@ -6,6 +6,7 @@ import { useApp } from '@/components/AppContext';
 import type {
   AssessmentActionsEvidence,
   AssessmentRepositoryRules,
+  AssessmentRulesetDetail,
 } from '@/lib/assessment';
 
 const INVENTORY_METRICS = [
@@ -66,6 +67,7 @@ interface AssessmentSnapshot {
   collectors: AssessmentCollectorResult[];
   repositorySecurity: AssessmentRepositorySecurity[];
   repositoryRules: AssessmentRepositoryRules[];
+  rulesets: AssessmentRulesetDetail[];
   actionsEvidence: AssessmentActionsEvidence | null;
   findings: AssessmentFinding[];
 }
@@ -152,6 +154,9 @@ export default function AssessmentPage() {
   const repositoryRulesCollector = snapshot?.collectors.find(
     collector => collector.collector_key === 'repositoryRules'
   );
+  const rulesetDetailsCollector = snapshot?.collectors.find(
+    collector => collector.collector_key === 'rulesetDetails'
+  );
   const actionsCollector = snapshot?.collectors.find(collector => collector.collector_key === 'actions');
   const actionsDepthCollector = snapshot?.collectors.find(
     collector => collector.collector_key === 'actionsDepth'
@@ -160,6 +165,7 @@ export default function AssessmentPage() {
   const billingCollector = snapshot?.collectors.find(collector => collector.collector_key === 'billing');
   const repositorySecurity = snapshot?.repositorySecurity || [];
   const repositoryRules = snapshot?.repositoryRules || [];
+  const rulesets = snapshot?.rulesets || [];
   const eligibleRepositorySecurity = repositorySecurity.filter(
     repository => !repository.isArchived && !repository.isFork
   );
@@ -173,9 +179,11 @@ export default function AssessmentPage() {
     identity: baselineEvaluated ? 'Baseline' : 'Not assessed',
     repositories: baselineEvaluated
       ? repositoryRulesCollector?.status === 'completed'
-        ? 'Branch depth'
+        && rulesetDetailsCollector?.status === 'completed'
+        ? 'Ruleset depth'
         : repositoryRulesCollector?.status === 'partial'
-          ? 'Partial branch depth'
+          || rulesetDetailsCollector?.status === 'partial'
+          ? 'Partial ruleset depth'
           : repositoryCollector?.status === 'partial' ? 'Partial baseline' : 'Baseline'
       : 'Not assessed',
     security: baselineEvaluated
@@ -272,6 +280,7 @@ export default function AssessmentPage() {
                     const failureSubject = (
                       collector.collector_key === 'repositorySecurity'
                       || collector.collector_key === 'repositoryRules'
+                      || collector.collector_key === 'rulesetDetails'
                     )
                       ? `${failures.length} incomplete repository ${failures.length === 1 ? 'check' : 'checks'}`
                       : collector.collector_key === 'actionsDepth'
@@ -409,7 +418,7 @@ export default function AssessmentPage() {
                   : 'Awaiting assessment'}
               </span>
             </div>
-            <div className="grid sm:grid-cols-2 lg:grid-cols-6 divide-y sm:divide-y-0 sm:divide-x divide-border">
+            <div className="grid sm:grid-cols-2 lg:grid-cols-7 divide-y sm:divide-y-0 sm:divide-x divide-border">
               <BranchCoverageMetric
                 label="Protected"
                 value={snapshot?.metrics.protectedDefaultBranches}
@@ -426,7 +435,7 @@ export default function AssessmentPage() {
                 total={snapshot?.metrics.defaultBranchRepositories}
               />
               <BranchCoverageMetric
-                label="Active rulesets"
+                label="Ruleset coverage"
                 value={snapshot?.metrics.rulesetProtectedDefaultBranches}
                 total={snapshot?.metrics.defaultBranchRepositories}
               />
@@ -440,7 +449,70 @@ export default function AssessmentPage() {
                 value={snapshot?.metrics.defaultBranchProtectionUnknownRepositories}
                 suffix="repositories"
               />
+              <BranchCoverageMetric
+                label="Always bypass"
+                value={snapshot?.metrics.unconditionalBypassActorCount}
+                suffix="actors"
+              />
             </div>
+            {rulesets.length > 0 && (
+              <details className="border-t border-border">
+                <summary className="px-4 py-3 text-xs font-medium text-accent cursor-pointer">
+                  Review active rulesets and bypass paths ({rulesets.length})
+                </summary>
+                <div className="overflow-x-auto border-t border-border">
+                  <table className="w-full min-w-[1180px] text-left">
+                    <thead className="bg-surface">
+                      <tr className="text-[10px] uppercase tracking-wide text-text-muted">
+                        <th className="px-4 py-2 font-medium">Ruleset</th>
+                        <th className="px-3 py-2 font-medium">Source</th>
+                        <th className="px-3 py-2 font-medium">Enforcement</th>
+                        <th className="px-3 py-2 font-medium">Conditions</th>
+                        <th className="px-3 py-2 font-medium">Rules</th>
+                        <th className="px-3 py-2 font-medium">Applies to</th>
+                        <th className="px-3 py-2 font-medium">Bypass paths</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-border">
+                      {rulesets.map(ruleset => (
+                        <tr key={ruleset.githubId} className="text-xs align-top">
+                          <td className="px-4 py-2.5">
+                            <span className="font-medium text-text-primary">{ruleset.name}</span>
+                            <span className="block font-mono text-[10px] text-text-muted">
+                              ID {ruleset.githubId}
+                            </span>
+                          </td>
+                          <td className="px-3 py-2.5 text-text-secondary">
+                            {ruleset.sourceType}
+                            <span className="block font-mono text-[10px] text-text-muted">
+                              {ruleset.source}
+                            </span>
+                          </td>
+                          <td className="px-3 py-2.5">
+                            {ruleset.enforcement === 'active'
+                              ? <span className="text-success">✔ Active</span>
+                              : <span className="text-warning">! {ruleset.enforcement}</span>}
+                          </td>
+                          <td className="px-3 py-2.5 text-text-secondary">
+                            <RulesetConditions ruleset={ruleset} />
+                          </td>
+                          <td className="px-3 py-2.5 text-text-secondary">
+                            {ruleset.ruleTypes.join(', ') || '— None'}
+                          </td>
+                          <td className="px-3 py-2.5 text-text-secondary">
+                            {ruleset.appliedRepositories.length}{' '}
+                            {ruleset.appliedRepositories.length === 1 ? 'repository' : 'repositories'}
+                          </td>
+                          <td className="px-3 py-2.5">
+                            <RulesetBypassPaths ruleset={ruleset} />
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </details>
+            )}
             {repositoryRules.length > 0 ? (
               <details className="border-t border-border">
                 <summary className="px-4 py-3 text-xs font-medium text-accent cursor-pointer">
@@ -956,6 +1028,44 @@ function BranchCoverageMetric({
       </p>
       {suffix && <p className="text-[10px] text-text-muted">{suffix}</p>}
     </div>
+  );
+}
+
+function RulesetConditions({ ruleset }: { ruleset: AssessmentRulesetDetail }) {
+  if (ruleset.conditions.length === 0) {
+    return <span className="text-text-muted">— None reported</span>;
+  }
+  return (
+    <span>
+      {ruleset.conditions.map(condition => (
+        <span key={condition.type} className="block">
+          {condition.type}: {condition.include.join(', ') || 'all'}
+          {condition.exclude.length > 0 && `; except ${condition.exclude.join(', ')}`}
+        </span>
+      ))}
+    </span>
+  );
+}
+
+function RulesetBypassPaths({ ruleset }: { ruleset: AssessmentRulesetDetail }) {
+  if (ruleset.bypassActors.length === 0) {
+    return <span className="text-success">✔ None</span>;
+  }
+  return (
+    <span className="space-y-1">
+      {ruleset.bypassActors.map((actor, index) => {
+        const unconditional = actor.bypassMode === 'always' || actor.bypassMode === 'exempt';
+        return (
+          <span
+            key={`${actor.actorType}-${actor.actorId ?? 'all'}-${actor.bypassMode}-${index}`}
+            className={`block ${unconditional ? 'text-warning' : 'text-text-secondary'}`}
+          >
+            {unconditional ? '!' : '↳'} {actor.actorType}
+            {actor.actorId === null ? '' : ` ${actor.actorId}`} · {actor.bypassMode}
+          </span>
+        );
+      })}
+    </span>
   );
 }
 

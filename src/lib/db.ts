@@ -13,6 +13,8 @@ import type {
   AssessmentRepositoryRulesFailure,
   AssessmentRepositorySecurity,
   AssessmentRepositorySecurityFailure,
+  AssessmentRulesetDetail,
+  AssessmentRulesetDetailFailure,
   AssessmentSecurityDefault,
 } from './assessment';
 
@@ -270,6 +272,7 @@ function initSchema(db: Database.Database) {
       has_protection INTEGER,
       active_ruleset_ids TEXT,
       active_ruleset_sources TEXT,
+      active_rulesets TEXT,
       rule_types TEXT,
       requires_pull_request INTEGER,
       required_approving_review_count INTEGER,
@@ -286,6 +289,41 @@ function initSchema(db: Database.Database) {
       check_key TEXT NOT NULL,
       error TEXT NOT NULL,
       PRIMARY KEY(run_id, name_with_owner, check_key)
+    );
+
+    CREATE TABLE IF NOT EXISTS assessment_rulesets (
+      run_id TEXT NOT NULL REFERENCES assessment_runs(id) ON DELETE CASCADE,
+      github_id INTEGER NOT NULL,
+      name TEXT NOT NULL,
+      target TEXT NOT NULL,
+      source_type TEXT NOT NULL,
+      source TEXT NOT NULL,
+      enforcement TEXT NOT NULL,
+      conditions TEXT NOT NULL,
+      rule_types TEXT NOT NULL,
+      applied_repositories TEXT NOT NULL,
+      PRIMARY KEY(run_id, github_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS assessment_ruleset_bypass_actors (
+      run_id TEXT NOT NULL,
+      ruleset_id INTEGER NOT NULL,
+      ordinal INTEGER NOT NULL,
+      actor_id INTEGER,
+      actor_type TEXT NOT NULL,
+      bypass_mode TEXT NOT NULL,
+      PRIMARY KEY(run_id, ruleset_id, ordinal),
+      FOREIGN KEY(run_id, ruleset_id)
+        REFERENCES assessment_rulesets(run_id, github_id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS assessment_ruleset_failures (
+      run_id TEXT NOT NULL REFERENCES assessment_runs(id) ON DELETE CASCADE,
+      ruleset_id INTEGER NOT NULL,
+      source_type TEXT NOT NULL,
+      source TEXT NOT NULL,
+      error TEXT NOT NULL,
+      PRIMARY KEY(run_id, ruleset_id, source_type, source)
     );
 
     CREATE TABLE IF NOT EXISTS assessment_actions_policies (
@@ -377,6 +415,12 @@ function initSchema(db: Database.Database) {
   ).all() as Array<{ name: string }>;
   if (!repositorySecurityColumns.some(column => column.name === 'default_branch')) {
     db.exec('ALTER TABLE assessment_repository_security ADD COLUMN default_branch TEXT');
+  }
+  const repositoryRulesColumns = db.prepare(
+    'PRAGMA table_info(assessment_repository_rules)'
+  ).all() as Array<{ name: string }>;
+  if (!repositoryRulesColumns.some(column => column.name === 'active_rulesets')) {
+    db.exec('ALTER TABLE assessment_repository_rules ADD COLUMN active_rulesets TEXT');
   }
 }
 
@@ -847,6 +891,7 @@ export function completeAssessment(input: {
   securityCollector: { id: string; durationMs: number; error: string | null };
   repositorySecurityCollector: { id: string; durationMs: number };
   repositoryRulesCollector: { id: string; durationMs: number };
+  rulesetDetailsCollector: { id: string; durationMs: number };
   actionsCollector: { id: string; durationMs: number; error: string | null };
   actionsDepthCollector: { id: string; durationMs: number; error: string | null };
   copilotCollector: { id: string; durationMs: number; error: string | null };
@@ -888,6 +933,8 @@ export function completeAssessment(input: {
   repositorySecurityFailures: AssessmentRepositorySecurityFailure[];
   repositoryRules: AssessmentRepositoryRules[];
   repositoryRulesFailures: AssessmentRepositoryRulesFailure[];
+  rulesets: AssessmentRulesetDetail[];
+  rulesetDetailFailures: AssessmentRulesetDetailFailure[];
   actionsPolicy: AssessmentActionsPolicy | null;
   actionsEvidence: AssessmentActionsEvidence | null;
   copilotSeats: AssessmentCopilotSeatInventory | null;
@@ -937,15 +984,31 @@ export function completeAssessment(input: {
     INSERT INTO assessment_repository_rules
       (run_id, name_with_owner, visibility, is_archived, is_fork, default_branch,
        branch_exists, classic_protection, has_protection, active_ruleset_ids,
-       active_ruleset_sources, rule_types, requires_pull_request,
+        active_ruleset_sources, active_rulesets, rule_types, requires_pull_request,
        required_approving_review_count, requires_status_checks, blocks_force_pushes,
        blocks_deletions, enforces_admins)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   const insertRepositoryRulesFailure = db.prepare(`
     INSERT INTO assessment_repository_rules_failures
       (run_id, name_with_owner, check_key, error)
     VALUES (?, ?, ?, ?)
+  `);
+  const insertRuleset = db.prepare(`
+    INSERT INTO assessment_rulesets
+      (run_id, github_id, name, target, source_type, source, enforcement,
+       conditions, rule_types, applied_repositories)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  const insertRulesetBypassActor = db.prepare(`
+    INSERT INTO assessment_ruleset_bypass_actors
+      (run_id, ruleset_id, ordinal, actor_id, actor_type, bypass_mode)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `);
+  const insertRulesetFailure = db.prepare(`
+    INSERT INTO assessment_ruleset_failures
+      (run_id, ruleset_id, source_type, source, error)
+    VALUES (?, ?, ?, ?, ?)
   `);
   const insertActionsDetails = db.prepare(`
     INSERT INTO assessment_actions_details
@@ -1102,6 +1165,9 @@ export function completeAssessment(input: {
         repositoryRules.activeRulesetSources === null
           ? null
           : JSON.stringify(repositoryRules.activeRulesetSources),
+        repositoryRules.activeRulesets === null
+          ? null
+          : JSON.stringify(repositoryRules.activeRulesets),
         repositoryRules.ruleTypes === null ? null : JSON.stringify(repositoryRules.ruleTypes),
         nullableBooleanToInteger(repositoryRules.requiresPullRequest),
         repositoryRules.requiredApprovingReviewCount,
@@ -1116,6 +1182,39 @@ export function completeAssessment(input: {
         input.runId,
         failure.nameWithOwner,
         failure.check,
+        failure.error
+      );
+    }
+    for (const ruleset of input.rulesets) {
+      insertRuleset.run(
+        input.runId,
+        ruleset.githubId,
+        ruleset.name,
+        ruleset.target,
+        ruleset.sourceType,
+        ruleset.source,
+        ruleset.enforcement,
+        JSON.stringify(ruleset.conditions),
+        JSON.stringify(ruleset.ruleTypes),
+        JSON.stringify(ruleset.appliedRepositories)
+      );
+      ruleset.bypassActors.forEach((actor, index) => {
+        insertRulesetBypassActor.run(
+          input.runId,
+          ruleset.githubId,
+          index,
+          actor.actorId,
+          actor.actorType,
+          actor.bypassMode
+        );
+      });
+    }
+    for (const failure of input.rulesetDetailFailures) {
+      insertRulesetFailure.run(
+        input.runId,
+        failure.githubId,
+        failure.sourceType,
+        failure.source,
         failure.error
       );
     }
@@ -1293,6 +1392,18 @@ export function completeAssessment(input: {
     db.prepare(`
       INSERT INTO assessment_collector_results
         (id, run_id, collector_key, status, item_count, duration_ms, error)
+      VALUES (?, ?, 'rulesetDetails', ?, ?, ?, ?)
+    `).run(
+      input.rulesetDetailsCollector.id,
+      input.runId,
+      input.rulesetDetailFailures.length > 0 ? 'partial' : 'completed',
+      input.rulesets.length,
+      input.rulesetDetailsCollector.durationMs,
+      formatRulesetDetailFailures(input.rulesetDetailFailures)
+    );
+    db.prepare(`
+      INSERT INTO assessment_collector_results
+        (id, run_id, collector_key, status, item_count, duration_ms, error)
       VALUES (?, ?, 'actions', ?, ?, ?, ?)
     `).run(
       input.actionsCollector.id,
@@ -1421,6 +1532,17 @@ function formatRepositoryRulesFailures(
     .join('\n');
 }
 
+function formatRulesetDetailFailures(
+  failures: AssessmentRulesetDetailFailure[]
+): string | null {
+  if (failures.length === 0) return null;
+  return failures
+    .map(failure => (
+      `${failure.sourceType} ${failure.source} [${failure.githubId}]: ${failure.error.replace(/\s+/g, ' ').trim()}`
+    ))
+    .join('\n');
+}
+
 function formatActionsFailures(
   failures: AssessmentActionsEvidence['failures']
 ): string | null {
@@ -1494,7 +1616,7 @@ function getAssessmentSnapshot(run: AssessmentRunRow) {
   const repositoryRules = getDb().prepare(`
     SELECT name_with_owner, visibility, is_archived, is_fork, default_branch,
       branch_exists, classic_protection, has_protection, active_ruleset_ids,
-      active_ruleset_sources, rule_types, requires_pull_request,
+      active_ruleset_sources, active_rulesets, rule_types, requires_pull_request,
       required_approving_review_count, requires_status_checks, blocks_force_pushes,
       blocks_deletions, enforces_admins
     FROM assessment_repository_rules
@@ -1511,6 +1633,7 @@ function getAssessmentSnapshot(run: AssessmentRunRow) {
     has_protection: number | null;
     active_ruleset_ids: string | null;
     active_ruleset_sources: string | null;
+    active_rulesets: string | null;
     rule_types: string | null;
     requires_pull_request: number | null;
     required_approving_review_count: number | null;
@@ -1518,6 +1641,34 @@ function getAssessmentSnapshot(run: AssessmentRunRow) {
     blocks_force_pushes: number | null;
     blocks_deletions: number | null;
     enforces_admins: number | null;
+  }>;
+  const rulesets = getDb().prepare(`
+    SELECT github_id, name, target, source_type, source, enforcement,
+      conditions, rule_types, applied_repositories
+    FROM assessment_rulesets
+    WHERE run_id = ?
+    ORDER BY name, github_id
+  `).all(run.id) as Array<{
+    github_id: number;
+    name: string;
+    target: string;
+    source_type: string;
+    source: string;
+    enforcement: string;
+    conditions: string;
+    rule_types: string;
+    applied_repositories: string;
+  }>;
+  const rulesetBypassActors = getDb().prepare(`
+    SELECT ruleset_id, actor_id, actor_type, bypass_mode
+    FROM assessment_ruleset_bypass_actors
+    WHERE run_id = ?
+    ORDER BY ruleset_id, ordinal
+  `).all(run.id) as Array<{
+    ruleset_id: number;
+    actor_id: number | null;
+    actor_type: string;
+    bypass_mode: string;
   }>;
   const actionsDetails = getDb().prepare(`
     SELECT github_owned_allowed, verified_allowed, patterns_allowed,
@@ -1579,6 +1730,16 @@ function getAssessmentSnapshot(run: AssessmentRunRow) {
     check_key: AssessmentActionsEvidence['failures'][number]['check'];
     error: string;
   }>;
+  const bypassActorsByRuleset = new Map<number, AssessmentRulesetDetail['bypassActors']>();
+  for (const actor of rulesetBypassActors) {
+    const actors = bypassActorsByRuleset.get(actor.ruleset_id) ?? [];
+    actors.push({
+      actorId: actor.actor_id,
+      actorType: actor.actor_type,
+      bypassMode: actor.bypass_mode,
+    });
+    bypassActorsByRuleset.set(actor.ruleset_id, actors);
+  }
   const failedActionsChecks = new Set(actionsFailures.map(failure => failure.check_key));
 
   return {
@@ -1623,6 +1784,9 @@ function getAssessmentSnapshot(run: AssessmentRunRow) {
       activeRulesetSources: repository.active_ruleset_sources === null
         ? null
         : JSON.parse(repository.active_ruleset_sources) as string[],
+      activeRulesets: repository.active_rulesets === null
+        ? null
+        : JSON.parse(repository.active_rulesets) as AssessmentRepositoryRules['activeRulesets'],
       ruleTypes: repository.rule_types === null
         ? null
         : JSON.parse(repository.rule_types) as string[],
@@ -1632,6 +1796,18 @@ function getAssessmentSnapshot(run: AssessmentRunRow) {
       blocksForcePushes: nullableIntegerToBoolean(repository.blocks_force_pushes),
       blocksDeletions: nullableIntegerToBoolean(repository.blocks_deletions),
       enforcesAdmins: nullableIntegerToBoolean(repository.enforces_admins),
+    })),
+    rulesets: rulesets.map(ruleset => ({
+      githubId: ruleset.github_id,
+      name: ruleset.name,
+      target: ruleset.target,
+      sourceType: ruleset.source_type,
+      source: ruleset.source,
+      enforcement: ruleset.enforcement,
+      conditions: JSON.parse(ruleset.conditions) as AssessmentRulesetDetail['conditions'],
+      ruleTypes: JSON.parse(ruleset.rule_types) as string[],
+      appliedRepositories: JSON.parse(ruleset.applied_repositories) as string[],
+      bypassActors: bypassActorsByRuleset.get(ruleset.github_id) ?? [],
     })),
     actionsEvidence: actionsDetails ? {
       selectedActions:

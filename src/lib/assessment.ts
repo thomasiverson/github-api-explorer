@@ -110,6 +110,7 @@ export interface AssessmentRepositoryRules {
   hasProtection: boolean | null;
   activeRulesetIds: number[] | null;
   activeRulesetSources: string[] | null;
+  activeRulesets: AssessmentRulesetReference[] | null;
   ruleTypes: string[] | null;
   requiresPullRequest: boolean | null;
   requiredApprovingReviewCount: number | null;
@@ -144,6 +145,50 @@ export interface AssessmentRepositoryRulesRequests {
     branch: string
   ) => Promise<AssessmentRestResponse>;
 }
+
+export interface AssessmentRulesetReference {
+  githubId: number;
+  sourceType: string;
+  source: string;
+}
+
+export interface AssessmentRulesetCondition {
+  type: string;
+  include: string[];
+  exclude: string[];
+}
+
+export interface AssessmentRulesetBypassActor {
+  actorId: number | null;
+  actorType: string;
+  bypassMode: string;
+}
+
+export interface AssessmentRulesetDetail {
+  githubId: number;
+  name: string;
+  target: string;
+  sourceType: string;
+  source: string;
+  enforcement: string;
+  conditions: AssessmentRulesetCondition[];
+  ruleTypes: string[];
+  appliedRepositories: string[];
+  bypassActors: AssessmentRulesetBypassActor[];
+}
+
+export interface AssessmentRulesetDetailFailure extends AssessmentRulesetReference {
+  error: string;
+}
+
+export interface AssessmentRulesetDetailCollection {
+  items: AssessmentRulesetDetail[];
+  failures: AssessmentRulesetDetailFailure[];
+}
+
+export type AssessmentRulesetDetailRequest = (
+  reference: AssessmentRulesetReference
+) => Promise<AssessmentRestResponse>;
 
 export interface AssessmentActionsPolicy {
   enabledOrganizations: string;
@@ -985,6 +1030,8 @@ interface NormalizedClassicProtection {
 interface NormalizedEffectiveRule {
   type: string;
   rulesetId: number | null;
+  rulesetSourceType: string | null;
+  rulesetSourceName: string | null;
   rulesetSource: string | null;
   requiredApprovingReviewCount: number | null;
 }
@@ -1013,6 +1060,7 @@ export async function collectRepositoryRules(
       hasProtection: null,
       activeRulesetIds: null,
       activeRulesetSources: null,
+      activeRulesets: null,
       ruleTypes: null,
       requiresPullRequest: null,
       requiredApprovingReviewCount: null,
@@ -1052,6 +1100,7 @@ export async function collectRepositoryRules(
           .map(rule => rule.rulesetSource)
           .filter((source): source is string => source !== null)
       )].sort();
+      item.activeRulesets = uniqueRulesetReferences(effectiveRules);
     } catch (error) {
       failures.push({
         nameWithOwner: repository.nameWithOwner,
@@ -1208,11 +1257,231 @@ function normalizeEffectiveBranchRule(value: unknown): NormalizedEffectiveRule {
   return {
     type: rule.type,
     rulesetId: Number.isInteger(rule.ruleset_id) ? rule.ruleset_id as number : null,
+    rulesetSourceType: sourceType,
+    rulesetSourceName: source,
     rulesetSource: sourceType && source ? `${sourceType}: ${source}` : source,
     requiredApprovingReviewCount:
       typeof requiredApprovingReviewCount === 'number'
         ? requiredApprovingReviewCount
         : null,
+  };
+}
+
+function uniqueRulesetReferences(rules: NormalizedEffectiveRule[]): AssessmentRulesetReference[] {
+  const references = new Map<number, AssessmentRulesetReference>();
+  for (const rule of rules) {
+    if (
+      rule.rulesetId === null
+      || rule.rulesetSourceType === null
+      || rule.rulesetSourceName === null
+    ) {
+      continue;
+    }
+    const existing = references.get(rule.rulesetId);
+    const reference = {
+      githubId: rule.rulesetId,
+      sourceType: rule.rulesetSourceType,
+      source: rule.rulesetSourceName,
+    };
+    if (
+      existing
+      && (existing.sourceType !== reference.sourceType || existing.source !== reference.source)
+    ) {
+      throw new Error(`GitHub returned conflicting sources for ruleset ${rule.rulesetId}`);
+    }
+    references.set(rule.rulesetId, reference);
+  }
+  return [...references.values()].sort((left, right) => left.githubId - right.githubId);
+}
+
+export async function collectRulesetDetails(
+  request: AssessmentRulesetDetailRequest,
+  repositories: AssessmentRepositoryRules[]
+): Promise<AssessmentRulesetDetailCollection> {
+  const references = new Map<number, {
+    reference: AssessmentRulesetReference;
+    repositories: Set<string>;
+  }>();
+  const failures: AssessmentRulesetDetailFailure[] = [];
+  const missingReferences = new Set<number>();
+  const conflictingReferences = new Set<number>();
+
+  for (const repository of repositories) {
+    if (
+      (repository.ruleTypes?.length ?? 0) > 0
+      && (repository.activeRulesetIds?.length ?? 0) === 0
+    ) {
+      failures.push({
+        githubId: 0,
+        sourceType: 'Unknown',
+        source: repository.nameWithOwner,
+        error: 'Effective rules did not include a ruleset identifier',
+      });
+    }
+    for (const rulesetId of repository.activeRulesetIds ?? []) {
+      if (conflictingReferences.has(rulesetId)) continue;
+      const reference = repository.activeRulesets?.find(
+        candidate => candidate.githubId === rulesetId
+      );
+      if (!reference) {
+        if (!missingReferences.has(rulesetId)) {
+          failures.push({
+            githubId: rulesetId,
+            sourceType: 'Unknown',
+            source: repository.nameWithOwner,
+            error: 'Effective rule evidence did not include the ruleset source',
+          });
+          missingReferences.add(rulesetId);
+        }
+        continue;
+      }
+
+      const existing = references.get(rulesetId);
+      if (
+        existing
+        && (
+          existing.reference.sourceType !== reference.sourceType
+          || existing.reference.source !== reference.source
+        )
+      ) {
+        failures.push({
+          ...reference,
+          error: `Ruleset ${rulesetId} was returned with conflicting sources`,
+        });
+        references.delete(rulesetId);
+        conflictingReferences.add(rulesetId);
+        continue;
+      }
+      if (existing) {
+        existing.repositories.add(repository.nameWithOwner);
+      } else {
+        references.set(rulesetId, {
+          reference,
+          repositories: new Set([repository.nameWithOwner]),
+        });
+      }
+    }
+  }
+
+  const items: AssessmentRulesetDetail[] = [];
+  for (const { reference, repositories: appliedRepositories } of references.values()) {
+    try {
+      const response = await request(reference);
+      if (response.status !== 200) {
+        throw new Error(describeRestFailure('ruleset details', response));
+      }
+      items.push(normalizeRulesetDetail(
+        response.data,
+        reference,
+        [...appliedRepositories].sort()
+      ));
+    } catch (error) {
+      failures.push({
+        ...reference,
+        error: normalizeAssessmentError(error),
+      });
+    }
+  }
+
+  return {
+    items: items.sort((left, right) => left.name.localeCompare(right.name)),
+    failures,
+  };
+}
+
+function normalizeRulesetDetail(
+  value: unknown,
+  reference: AssessmentRulesetReference,
+  appliedRepositories: string[]
+): AssessmentRulesetDetail {
+  const ruleset = readAssessmentObject(value);
+  if (
+    !ruleset
+    || !Number.isInteger(ruleset.id)
+    || typeof ruleset.name !== 'string'
+    || typeof ruleset.target !== 'string'
+    || typeof ruleset.source_type !== 'string'
+    || typeof ruleset.source !== 'string'
+    || typeof ruleset.enforcement !== 'string'
+    || !Array.isArray(ruleset.rules)
+    || !Array.isArray(ruleset.bypass_actors)
+  ) {
+    throw new Error('GitHub returned an invalid ruleset detail response');
+  }
+  if (ruleset.id !== reference.githubId) {
+    throw new Error(`GitHub returned ruleset ${ruleset.id} instead of ${reference.githubId}`);
+  }
+  if (
+    ruleset.source_type !== reference.sourceType
+    || ruleset.source !== reference.source
+  ) {
+    throw new Error(`GitHub returned a conflicting source for ruleset ${reference.githubId}`);
+  }
+
+  return {
+    githubId: ruleset.id as number,
+    name: ruleset.name,
+    target: ruleset.target,
+    sourceType: ruleset.source_type,
+    source: ruleset.source,
+    enforcement: ruleset.enforcement,
+    conditions: normalizeRulesetConditions(ruleset.conditions),
+    ruleTypes: ruleset.rules.map(ruleValue => {
+      const rule = readAssessmentObject(ruleValue);
+      if (!rule || typeof rule.type !== 'string') {
+        throw new Error('GitHub returned an invalid rule in ruleset details');
+      }
+      return rule.type;
+    }),
+    appliedRepositories,
+    bypassActors: ruleset.bypass_actors.map(normalizeRulesetBypassActor),
+  };
+}
+
+function normalizeRulesetConditions(value: unknown): AssessmentRulesetCondition[] {
+  if (value === undefined || value === null) return [];
+  const conditions = readAssessmentObject(value);
+  if (!conditions) {
+    throw new Error('GitHub returned invalid ruleset conditions');
+  }
+
+  return Object.entries(conditions).map(([type, conditionValue]) => {
+    const condition = readAssessmentObject(conditionValue);
+    if (!condition || !Array.isArray(condition.include) || !Array.isArray(condition.exclude)) {
+      throw new Error(`GitHub returned invalid ${type} ruleset conditions`);
+    }
+    if (
+      condition.include.some(entry => typeof entry !== 'string')
+      || condition.exclude.some(entry => typeof entry !== 'string')
+    ) {
+      throw new Error(`GitHub returned non-string ${type} ruleset conditions`);
+    }
+    return {
+      type,
+      include: condition.include as string[],
+      exclude: condition.exclude as string[],
+    };
+  });
+}
+
+function normalizeRulesetBypassActor(value: unknown): AssessmentRulesetBypassActor {
+  const actor = readAssessmentObject(value);
+  if (
+    !actor
+    || (
+      actor.actor_id !== null
+      && actor.actor_id !== undefined
+      && !Number.isInteger(actor.actor_id)
+    )
+    || typeof actor.actor_type !== 'string'
+    || typeof actor.bypass_mode !== 'string'
+  ) {
+    throw new Error('GitHub returned an invalid ruleset bypass actor');
+  }
+  return {
+    actorId: typeof actor.actor_id === 'number' ? actor.actor_id : null,
+    actorType: actor.actor_type,
+    bypassMode: actor.bypass_mode,
   };
 }
 
@@ -1357,6 +1626,7 @@ export function evaluateAssessmentBaseline(input: {
   securityDefaults?: AssessmentSecurityDefault[] | null;
   repositorySecurity?: AssessmentRepositorySecurity[] | null;
   repositoryRules?: AssessmentRepositoryRules[] | null;
+  rulesets?: AssessmentRulesetDetail[] | null;
   actionsPolicy?: AssessmentActionsPolicy | null;
   actionsEvidence?: AssessmentActionsEvidence | null;
   copilotSeats?: AssessmentCopilotSeatInventory | null;
@@ -1522,6 +1792,65 @@ export function evaluateAssessmentBaseline(input: {
         summary: `${historyControlGaps.length} protected default ${historyControlGaps.length === 1 ? 'branch does' : 'branches do'} not block both force pushes and branch deletion.`,
         recommendation: 'Block force pushes and branch deletion through classic protection or active ruleset controls.',
         affectedResources: historyControlGaps.map(repository => repository.nameWithOwner),
+      });
+    }
+  }
+
+  let activeRulesetCount = 0;
+  let rulesetsWithBypassActors = 0;
+  let rulesetBypassActorCount = 0;
+  let unconditionalBypassActorCount = 0;
+  let pullRequestBypassActorCount = 0;
+  if (input.rulesets) {
+    const activeRulesets = input.rulesets.filter(ruleset => ruleset.enforcement === 'active');
+    const bypassActors = activeRulesets.flatMap(ruleset => (
+      ruleset.bypassActors.map(actor => ({ ruleset, actor }))
+    ));
+    const unconditionalActors = bypassActors.filter(
+      ({ actor }) => actor.bypassMode === 'always' || actor.bypassMode === 'exempt'
+    );
+    const broadActorTypes = new Set([
+      'EnterpriseOwner',
+      'OrganizationAdmin',
+      'RepositoryRole',
+    ]);
+    const broadUnconditionalActors = unconditionalActors.filter(
+      ({ actor }) => broadActorTypes.has(actor.actorType)
+    );
+    const scopedUnconditionalActors = unconditionalActors.filter(
+      ({ actor }) => !broadActorTypes.has(actor.actorType)
+    );
+
+    activeRulesetCount = activeRulesets.length;
+    rulesetsWithBypassActors = activeRulesets.filter(
+      ruleset => ruleset.bypassActors.length > 0
+    ).length;
+    rulesetBypassActorCount = bypassActors.length;
+    unconditionalBypassActorCount = unconditionalActors.length;
+    pullRequestBypassActorCount = bypassActors.filter(
+      ({ actor }) => actor.bypassMode === 'pull_request'
+    ).length;
+
+    if (broadUnconditionalActors.length > 0) {
+      findings.push({
+        ruleKey: 'ruleset-broad-unconditional-bypass',
+        domain: 'repositories',
+        severity: 'medium',
+        title: 'Active rulesets allow broad unconditional bypass',
+        summary: `${broadUnconditionalActors.length} broad ruleset ${broadUnconditionalActors.length === 1 ? 'actor can' : 'actors can'} bypass active protections outside the pull-request path.`,
+        recommendation: 'Remove broad bypass roles where possible or limit exceptions to pull requests that remain reviewable and auditable.',
+        affectedResources: broadUnconditionalActors.map(formatRulesetBypassResource),
+      });
+    }
+    if (scopedUnconditionalActors.length > 0) {
+      findings.push({
+        ruleKey: 'ruleset-scoped-unconditional-bypass-review',
+        domain: 'repositories',
+        severity: 'low',
+        title: 'Active rulesets include unconditional principal exceptions',
+        summary: `${scopedUnconditionalActors.length} scoped ruleset ${scopedUnconditionalActors.length === 1 ? 'principal has' : 'principals have'} an always or exempt bypass mode.`,
+        recommendation: 'Verify each team, user, integration, or deploy-key exception is still required and has a named owner.',
+        affectedResources: scopedUnconditionalActors.map(formatRulesetBypassResource),
       });
     }
   }
@@ -1959,6 +2288,13 @@ export function evaluateAssessmentBaseline(input: {
         repositoriesWithoutDefaultBranches,
         rulesetProtectedDefaultBranches,
       } : {}),
+      ...(input.rulesets ? {
+        activeRulesetCount,
+        pullRequestBypassActorCount,
+        rulesetBypassActorCount,
+        rulesetsWithBypassActors,
+        unconditionalBypassActorCount,
+      } : {}),
       ...(input.repositorySecurity ? {
         codeScanningDefaultSetupRepositories,
         codeSecurityEnabledRepositories,
@@ -2214,6 +2550,17 @@ function laterNullableTimestamp(left: string | null, right: string | null): stri
   if (!left) return right;
   if (!right) return left;
   return new Date(left).getTime() >= new Date(right).getTime() ? left : right;
+}
+
+function formatRulesetBypassResource({
+  ruleset,
+  actor,
+}: {
+  ruleset: AssessmentRulesetDetail;
+  actor: AssessmentRulesetBypassActor;
+}): string {
+  const actorId = actor.actorId === null ? '' : ` ${actor.actorId}`;
+  return `${ruleset.name} · ${actor.actorType}${actorId} · ${actor.bypassMode}`;
 }
 
 function formatBudgetResource(budget: AssessmentBudget): string {
