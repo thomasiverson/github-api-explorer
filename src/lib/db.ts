@@ -1,14 +1,21 @@
 import Database from 'better-sqlite3';
 import path from 'path';
 import crypto from 'crypto';
+import fs from 'fs';
 import type { ImportedEndpoint } from './openapi-import';
+import type {
+  AssessmentActionsPolicy,
+  AssessmentBudget,
+  AssessmentCopilotSeatInventory,
+  AssessmentEvaluation,
+  AssessmentSecurityDefault,
+} from './assessment';
 
 const DB_PATH = path.join(process.cwd(), 'data', 'harness.db');
 
 let _db: Database.Database | null = null;
 
 function ensureDataDir() {
-  const fs = require('fs');
   const dir = path.dirname(DB_PATH);
   if (!fs.existsSync(dir)) {
     fs.mkdirSync(dir, { recursive: true });
@@ -126,6 +133,141 @@ function initSchema(db: Database.Database) {
       operation_id TEXT PRIMARY KEY,
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
+
+    CREATE TABLE IF NOT EXISTS assessment_runs (
+      id TEXT PRIMARY KEY,
+      environment_id TEXT NOT NULL REFERENCES environments(id) ON DELETE CASCADE,
+      status TEXT NOT NULL,
+      started_at TEXT NOT NULL DEFAULT (datetime('now')),
+      completed_at TEXT,
+      duration_ms INTEGER,
+      error TEXT
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_assessment_runs_environment
+      ON assessment_runs(environment_id, started_at DESC);
+
+    CREATE TABLE IF NOT EXISTS assessment_collector_results (
+      id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL REFERENCES assessment_runs(id) ON DELETE CASCADE,
+      collector_key TEXT NOT NULL,
+      status TEXT NOT NULL,
+      item_count INTEGER NOT NULL DEFAULT 0,
+      duration_ms INTEGER NOT NULL DEFAULT 0,
+      error TEXT,
+      UNIQUE(run_id, collector_key)
+    );
+
+    CREATE TABLE IF NOT EXISTS assessment_metrics (
+      run_id TEXT NOT NULL REFERENCES assessment_runs(id) ON DELETE CASCADE,
+      metric_key TEXT NOT NULL,
+      value INTEGER NOT NULL,
+      PRIMARY KEY(run_id, metric_key)
+    );
+
+    CREATE TABLE IF NOT EXISTS assessment_organizations (
+      run_id TEXT NOT NULL REFERENCES assessment_runs(id) ON DELETE CASCADE,
+      github_id INTEGER NOT NULL,
+      node_id TEXT NOT NULL,
+      login TEXT NOT NULL,
+      description TEXT,
+      PRIMARY KEY(run_id, login)
+    );
+
+    CREATE TABLE IF NOT EXISTS assessment_members (
+      run_id TEXT NOT NULL REFERENCES assessment_runs(id) ON DELETE CASCADE,
+      login TEXT NOT NULL,
+      name TEXT,
+      is_owner INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY(run_id, login)
+    );
+
+    CREATE TABLE IF NOT EXISTS assessment_repositories (
+      run_id TEXT NOT NULL REFERENCES assessment_runs(id) ON DELETE CASCADE,
+      github_id INTEGER NOT NULL,
+      node_id TEXT NOT NULL,
+      organization_login TEXT NOT NULL,
+      name_with_owner TEXT NOT NULL,
+      visibility TEXT NOT NULL,
+      is_archived INTEGER NOT NULL DEFAULT 0,
+      is_fork INTEGER NOT NULL DEFAULT 0,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY(run_id, name_with_owner)
+    );
+
+    CREATE TABLE IF NOT EXISTS assessment_teams (
+      run_id TEXT NOT NULL REFERENCES assessment_runs(id) ON DELETE CASCADE,
+      github_id INTEGER NOT NULL,
+      node_id TEXT NOT NULL,
+      organization_login TEXT NOT NULL,
+      slug TEXT NOT NULL,
+      name TEXT NOT NULL,
+      privacy TEXT NOT NULL,
+      PRIMARY KEY(run_id, organization_login, slug)
+    );
+
+    CREATE TABLE IF NOT EXISTS assessment_findings (
+      run_id TEXT NOT NULL REFERENCES assessment_runs(id) ON DELETE CASCADE,
+      rule_key TEXT NOT NULL,
+      domain TEXT NOT NULL,
+      severity TEXT NOT NULL,
+      title TEXT NOT NULL,
+      summary TEXT NOT NULL,
+      recommendation TEXT NOT NULL,
+      affected_resources TEXT NOT NULL DEFAULT '[]',
+      PRIMARY KEY(run_id, rule_key)
+    );
+
+    CREATE TABLE IF NOT EXISTS assessment_security_defaults (
+      run_id TEXT NOT NULL REFERENCES assessment_runs(id) ON DELETE CASCADE,
+      default_scope TEXT NOT NULL,
+      configuration_id INTEGER NOT NULL,
+      configuration_name TEXT NOT NULL,
+      advanced_security TEXT NOT NULL,
+      dependency_graph TEXT NOT NULL,
+      dependabot_alerts TEXT NOT NULL,
+      code_scanning_default_setup TEXT NOT NULL,
+      secret_scanning TEXT NOT NULL,
+      secret_scanning_push_protection TEXT NOT NULL,
+      enforcement TEXT NOT NULL,
+      PRIMARY KEY(run_id, default_scope, configuration_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS assessment_actions_policies (
+      run_id TEXT PRIMARY KEY REFERENCES assessment_runs(id) ON DELETE CASCADE,
+      enabled_organizations TEXT NOT NULL,
+      allowed_actions TEXT NOT NULL,
+      sha_pinning_required INTEGER NOT NULL DEFAULT 0
+    );
+
+    CREATE TABLE IF NOT EXISTS assessment_copilot_seats (
+      run_id TEXT NOT NULL REFERENCES assessment_runs(id) ON DELETE CASCADE,
+      login TEXT NOT NULL,
+      plan_type TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      last_authenticated_at TEXT,
+      last_activity_at TEXT,
+      pending_cancellation_date TEXT,
+      assignment_count INTEGER NOT NULL DEFAULT 1,
+      PRIMARY KEY(run_id, login)
+    );
+
+    CREATE TABLE IF NOT EXISTS assessment_budgets (
+      run_id TEXT NOT NULL REFERENCES assessment_runs(id) ON DELETE CASCADE,
+      budget_id TEXT NOT NULL,
+      budget_type TEXT NOT NULL,
+      product_sku TEXT NOT NULL,
+      scope TEXT NOT NULL,
+      amount REAL NOT NULL,
+      consumed_amount REAL,
+      prevents_further_usage INTEGER NOT NULL DEFAULT 0,
+      alerting_enabled INTEGER NOT NULL DEFAULT 0,
+      alert_recipient_count INTEGER NOT NULL DEFAULT 0,
+      entity_name TEXT,
+      user_login TEXT,
+      expires_at TEXT,
+      PRIMARY KEY(run_id, budget_id)
+    );
   `);
 }
 
@@ -135,7 +277,6 @@ function getEncryptionKey(): Buffer {
   let key = process.env.ENCRYPTION_KEY;
   if (!key || key.length === 0) {
     // Auto-generate and persist if missing
-    const fs = require('fs');
     key = crypto.randomBytes(32).toString('hex');
     const envPath = path.join(process.cwd(), '.env.local');
     let content = '';
@@ -180,6 +321,14 @@ export function getEnvironments() {
 
 export function getActiveEnvironment() {
   return getDb().prepare('SELECT * FROM environments WHERE is_active = 1 LIMIT 1').get() as {
+    id: string; name: string; base_url: string; enterprise_slug: string;
+    org_name: string; auth_method: string; is_active: number;
+    created_at: string; updated_at: string;
+  } | undefined;
+}
+
+export function getEnvironment(environmentId: string) {
+  return getDb().prepare('SELECT * FROM environments WHERE id = ?').get(environmentId) as {
     id: string; name: string; base_url: string; enterprise_slug: string;
     org_name: string; auth_method: string; is_active: number;
     created_at: string; updated_at: string;
@@ -548,4 +697,438 @@ export function removeFavorite(operationId: string) {
 export function isFavorite(operationId: string): boolean {
   const row = getDb().prepare('SELECT 1 FROM favorites WHERE operation_id = ?').get(operationId);
   return !!row;
+}
+
+// === Assessment CRUD ===
+
+interface AssessmentRunRow {
+  id: string;
+  environment_id: string;
+  status: 'running' | 'completed' | 'failed';
+  started_at: string;
+  completed_at: string | null;
+  duration_ms: number | null;
+  error: string | null;
+}
+
+export function createAssessmentRun(id: string, environmentId: string) {
+  getDb().prepare(`
+    INSERT INTO assessment_runs (id, environment_id, status)
+    VALUES (?, ?, 'running')
+  `).run(id, environmentId);
+}
+
+export function completeAssessment(input: {
+  runId: string;
+  durationMs: number;
+  organizationCollector: { id: string; durationMs: number };
+  identityCollector: { id: string; durationMs: number };
+  repositoryCollector: { id: string; durationMs: number };
+  teamCollector: { id: string; durationMs: number };
+  securityCollector: { id: string; durationMs: number; error: string | null };
+  actionsCollector: { id: string; durationMs: number; error: string | null };
+  copilotCollector: { id: string; durationMs: number; error: string | null };
+  billingCollector: { id: string; durationMs: number; error: string | null };
+  organizations: Array<{
+    githubId: number;
+    nodeId: string;
+    login: string;
+    description: string | null;
+  }>;
+  members: Array<{
+    login: string;
+    name: string | null;
+    isOwner: boolean;
+  }>;
+  ownerCount: number;
+  repositories: Array<{
+    githubId: number;
+    nodeId: string;
+    organizationLogin: string;
+    nameWithOwner: string;
+    visibility: string;
+    isArchived: boolean;
+    isFork: boolean;
+    updatedAt: string;
+  }>;
+  repositoryFailures: Array<{ organizationLogin: string; error: string }>;
+  teams: Array<{
+    githubId: number;
+    nodeId: string;
+    organizationLogin: string;
+    slug: string;
+    name: string;
+    privacy: string;
+  }>;
+  teamFailures: Array<{ organizationLogin: string; error: string }>;
+  securityDefaults: AssessmentSecurityDefault[] | null;
+  actionsPolicy: AssessmentActionsPolicy | null;
+  copilotSeats: AssessmentCopilotSeatInventory | null;
+  budgets: AssessmentBudget[] | null;
+  evaluation: AssessmentEvaluation;
+}) {
+  const db = getDb();
+  const insertOrganization = db.prepare(`
+    INSERT INTO assessment_organizations (run_id, github_id, node_id, login, description)
+    VALUES (?, ?, ?, ?, ?)
+  `);
+  const insertMember = db.prepare(`
+    INSERT INTO assessment_members (run_id, login, name, is_owner)
+    VALUES (?, ?, ?, ?)
+  `);
+  const insertRepository = db.prepare(`
+    INSERT INTO assessment_repositories
+      (run_id, github_id, node_id, organization_login, name_with_owner, visibility, is_archived, is_fork, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  const insertTeam = db.prepare(`
+    INSERT INTO assessment_teams
+      (run_id, github_id, node_id, organization_login, slug, name, privacy)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `);
+  const insertFinding = db.prepare(`
+    INSERT INTO assessment_findings
+      (run_id, rule_key, domain, severity, title, summary, recommendation, affected_resources)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  const insertSecurityDefault = db.prepare(`
+    INSERT INTO assessment_security_defaults
+      (run_id, default_scope, configuration_id, configuration_name, advanced_security,
+       dependency_graph, dependabot_alerts, code_scanning_default_setup, secret_scanning,
+       secret_scanning_push_protection, enforcement)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  const insertCopilotSeat = db.prepare(`
+    INSERT INTO assessment_copilot_seats
+      (run_id, login, plan_type, created_at, last_authenticated_at, last_activity_at,
+       pending_cancellation_date, assignment_count)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  const insertBudget = db.prepare(`
+    INSERT INTO assessment_budgets
+      (run_id, budget_id, budget_type, product_sku, scope, amount, consumed_amount,
+       prevents_further_usage, alerting_enabled, alert_recipient_count, entity_name,
+       user_login, expires_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  const complete = db.transaction(() => {
+    for (const organization of input.organizations) {
+      insertOrganization.run(
+        input.runId,
+        organization.githubId,
+        organization.nodeId,
+        organization.login,
+        organization.description
+      );
+    }
+    for (const member of input.members) {
+      insertMember.run(input.runId, member.login, member.name, member.isOwner ? 1 : 0);
+    }
+    for (const repository of input.repositories) {
+      insertRepository.run(
+        input.runId,
+        repository.githubId,
+        repository.nodeId,
+        repository.organizationLogin,
+        repository.nameWithOwner,
+        repository.visibility,
+        repository.isArchived ? 1 : 0,
+        repository.isFork ? 1 : 0,
+        repository.updatedAt
+      );
+    }
+    for (const team of input.teams) {
+      insertTeam.run(
+        input.runId,
+        team.githubId,
+        team.nodeId,
+        team.organizationLogin,
+        team.slug,
+        team.name,
+        team.privacy
+      );
+    }
+    db.prepare(`
+      INSERT INTO assessment_metrics (run_id, metric_key, value)
+      VALUES (?, 'organizations', ?)
+    `).run(input.runId, input.organizations.length);
+    const insertMetric = db.prepare(`
+      INSERT INTO assessment_metrics (run_id, metric_key, value)
+      VALUES (?, ?, ?)
+    `);
+    insertMetric.run(input.runId, 'members', input.members.length);
+    insertMetric.run(input.runId, 'enterpriseOwners', input.ownerCount);
+    insertMetric.run(input.runId, 'repositories', input.repositories.length);
+    insertMetric.run(input.runId, 'teams', input.teams.length);
+    insertMetric.run(input.runId, 'healthScore', input.evaluation.healthScore);
+    insertMetric.run(input.runId, 'assessedDomains', input.evaluation.assessedDomainCount);
+    for (const [metricKey, value] of Object.entries(input.evaluation.metrics)) {
+      insertMetric.run(input.runId, metricKey, value);
+    }
+    for (const finding of input.evaluation.findings) {
+      insertFinding.run(
+        input.runId,
+        finding.ruleKey,
+        finding.domain,
+        finding.severity,
+        finding.title,
+        finding.summary,
+        finding.recommendation,
+        JSON.stringify(finding.affectedResources)
+      );
+    }
+    for (const securityDefault of input.securityDefaults || []) {
+      insertSecurityDefault.run(
+        input.runId,
+        securityDefault.defaultForNewRepositories,
+        securityDefault.configurationId,
+        securityDefault.configurationName,
+        securityDefault.advancedSecurity,
+        securityDefault.dependencyGraph,
+        securityDefault.dependabotAlerts,
+        securityDefault.codeScanningDefaultSetup,
+        securityDefault.secretScanning,
+        securityDefault.secretScanningPushProtection,
+        securityDefault.enforcement
+      );
+    }
+    if (input.actionsPolicy) {
+      db.prepare(`
+        INSERT INTO assessment_actions_policies
+          (run_id, enabled_organizations, allowed_actions, sha_pinning_required)
+        VALUES (?, ?, ?, ?)
+      `).run(
+        input.runId,
+        input.actionsPolicy.enabledOrganizations,
+        input.actionsPolicy.allowedActions,
+        input.actionsPolicy.shaPinningRequired ? 1 : 0
+      );
+    }
+    for (const seat of input.copilotSeats?.seats || []) {
+      insertCopilotSeat.run(
+        input.runId,
+        seat.login,
+        seat.planType,
+        seat.createdAt,
+        seat.lastAuthenticatedAt,
+        seat.lastActivityAt,
+        seat.pendingCancellationDate,
+        seat.assignmentCount
+      );
+    }
+    for (const budget of input.budgets || []) {
+      insertBudget.run(
+        input.runId,
+        budget.id,
+        budget.budgetType,
+        budget.productSku,
+        budget.scope,
+        budget.amount,
+        budget.consumedAmount,
+        budget.preventsFurtherUsage ? 1 : 0,
+        budget.alertingEnabled ? 1 : 0,
+        budget.alertRecipientCount,
+        budget.entityName,
+        budget.user,
+        budget.expiresAt
+      );
+    }
+    db.prepare(`
+      INSERT INTO assessment_collector_results
+        (id, run_id, collector_key, status, item_count, duration_ms)
+      VALUES (?, ?, 'organizations', 'completed', ?, ?)
+    `).run(
+      input.organizationCollector.id,
+      input.runId,
+      input.organizations.length,
+      input.organizationCollector.durationMs
+    );
+    db.prepare(`
+      INSERT INTO assessment_collector_results
+        (id, run_id, collector_key, status, item_count, duration_ms)
+      VALUES (?, ?, 'identity', 'completed', ?, ?)
+    `).run(
+      input.identityCollector.id,
+      input.runId,
+      input.members.length,
+      input.identityCollector.durationMs
+    );
+    db.prepare(`
+      INSERT INTO assessment_collector_results
+        (id, run_id, collector_key, status, item_count, duration_ms, error)
+      VALUES (?, ?, 'repositories', ?, ?, ?, ?)
+    `).run(
+      input.repositoryCollector.id,
+      input.runId,
+      input.repositoryFailures.length > 0 ? 'partial' : 'completed',
+      input.repositories.length,
+      input.repositoryCollector.durationMs,
+      formatAssessmentFailures(input.repositoryFailures)
+    );
+    db.prepare(`
+      INSERT INTO assessment_collector_results
+        (id, run_id, collector_key, status, item_count, duration_ms, error)
+      VALUES (?, ?, 'teams', ?, ?, ?, ?)
+    `).run(
+      input.teamCollector.id,
+      input.runId,
+      input.teamFailures.length > 0 ? 'partial' : 'completed',
+      input.teams.length,
+      input.teamCollector.durationMs,
+      formatAssessmentFailures(input.teamFailures)
+    );
+    db.prepare(`
+      INSERT INTO assessment_collector_results
+        (id, run_id, collector_key, status, item_count, duration_ms, error)
+      VALUES (?, ?, 'security', ?, ?, ?, ?)
+    `).run(
+      input.securityCollector.id,
+      input.runId,
+      input.securityCollector.error ? 'failed' : 'completed',
+      input.securityDefaults?.length || 0,
+      input.securityCollector.durationMs,
+      input.securityCollector.error
+    );
+    db.prepare(`
+      INSERT INTO assessment_collector_results
+        (id, run_id, collector_key, status, item_count, duration_ms, error)
+      VALUES (?, ?, 'actions', ?, ?, ?, ?)
+    `).run(
+      input.actionsCollector.id,
+      input.runId,
+      input.actionsCollector.error ? 'failed' : 'completed',
+      input.actionsPolicy ? 1 : 0,
+      input.actionsCollector.durationMs,
+      input.actionsCollector.error
+    );
+    db.prepare(`
+      INSERT INTO assessment_collector_results
+        (id, run_id, collector_key, status, item_count, duration_ms, error)
+      VALUES (?, ?, 'copilot', ?, ?, ?, ?)
+    `).run(
+      input.copilotCollector.id,
+      input.runId,
+      input.copilotCollector.error ? 'failed' : 'completed',
+      input.copilotSeats?.totalSeats || 0,
+      input.copilotCollector.durationMs,
+      input.copilotCollector.error
+    );
+    db.prepare(`
+      INSERT INTO assessment_collector_results
+        (id, run_id, collector_key, status, item_count, duration_ms, error)
+      VALUES (?, ?, 'billing', ?, ?, ?, ?)
+    `).run(
+      input.billingCollector.id,
+      input.runId,
+      input.billingCollector.error ? 'failed' : 'completed',
+      input.budgets?.length || 0,
+      input.billingCollector.durationMs,
+      input.billingCollector.error
+    );
+    db.prepare(`
+      UPDATE assessment_runs
+      SET status = 'completed', completed_at = datetime('now'), duration_ms = ?
+      WHERE id = ?
+    `).run(input.durationMs, input.runId);
+  });
+  complete();
+}
+
+export function failAssessmentRun(input: {
+  runId: string;
+  collectorResultId: string;
+  durationMs: number;
+  error: string;
+  collectorKey: 'organizations' | 'identity' | 'repositories' | 'teams';
+}) {
+  const db = getDb();
+  const fail = db.transaction(() => {
+    db.prepare(`
+      INSERT INTO assessment_collector_results
+        (id, run_id, collector_key, status, item_count, duration_ms, error)
+      VALUES (?, ?, ?, 'failed', 0, ?, ?)
+    `).run(input.collectorResultId, input.runId, input.collectorKey, input.durationMs, input.error);
+    db.prepare(`
+      UPDATE assessment_runs
+      SET status = 'failed', completed_at = datetime('now'), duration_ms = ?, error = ?
+      WHERE id = ?
+    `).run(input.durationMs, input.error, input.runId);
+  });
+  fail();
+}
+
+export function getLatestAssessment(environmentId: string) {
+  const run = getDb().prepare(`
+    SELECT * FROM assessment_runs
+    WHERE environment_id = ? AND status = 'completed'
+    ORDER BY started_at DESC, rowid DESC
+    LIMIT 1
+  `).get(environmentId) as AssessmentRunRow | undefined;
+  return run ? getAssessmentSnapshot(run) : null;
+}
+
+function formatAssessmentFailures(failures: Array<{ organizationLogin: string; error: string }>): string | null {
+  if (failures.length === 0) return null;
+  return failures
+    .map(failure => `${failure.organizationLogin}: ${failure.error.replace(/\s+/g, ' ').trim()}`)
+    .join('\n');
+}
+
+export function getAssessmentById(runId: string) {
+  const run = getDb().prepare('SELECT * FROM assessment_runs WHERE id = ?').get(runId) as AssessmentRunRow | undefined;
+  return run ? getAssessmentSnapshot(run) : null;
+}
+
+function getAssessmentSnapshot(run: AssessmentRunRow) {
+  const metrics = getDb().prepare(
+    'SELECT metric_key, value FROM assessment_metrics WHERE run_id = ?'
+  ).all(run.id) as Array<{ metric_key: string; value: number }>;
+  const collectors = getDb().prepare(`
+    SELECT collector_key, status, item_count, duration_ms, error
+    FROM assessment_collector_results
+    WHERE run_id = ?
+    ORDER BY collector_key
+  `).all(run.id);
+  const findings = getDb().prepare(`
+    SELECT rule_key, domain, severity, title, summary, recommendation, affected_resources
+    FROM assessment_findings
+    WHERE run_id = ?
+    ORDER BY
+      CASE severity
+        WHEN 'critical' THEN 1
+        WHEN 'high' THEN 2
+        WHEN 'medium' THEN 3
+        ELSE 4
+      END,
+      title
+  `).all(run.id) as Array<{
+    rule_key: string;
+    domain: string;
+    severity: string;
+    title: string;
+    summary: string;
+    recommendation: string;
+    affected_resources: string;
+  }>;
+
+  return {
+    id: run.id,
+    environmentId: run.environment_id,
+    status: run.status,
+    startedAt: run.started_at,
+    completedAt: run.completed_at,
+    durationMs: run.duration_ms,
+    error: run.error,
+    metrics: Object.fromEntries(metrics.map(metric => [metric.metric_key, metric.value])),
+    collectors,
+    findings: findings.map(finding => ({
+      ruleKey: finding.rule_key,
+      domain: finding.domain,
+      severity: finding.severity,
+      title: finding.title,
+      summary: finding.summary,
+      recommendation: finding.recommendation,
+      affectedResources: JSON.parse(finding.affected_resources) as string[],
+    })),
+  };
 }
