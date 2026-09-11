@@ -99,6 +99,73 @@ export interface AssessmentActionsPolicy {
   shaPinningRequired: boolean;
 }
 
+export interface AssessmentActionsSelectedPolicy {
+  githubOwnedAllowed: boolean | null;
+  verifiedAllowed: boolean | null;
+  patternsAllowed: string[] | null;
+}
+
+export interface AssessmentActionsWorkflowPermissions {
+  defaultWorkflowPermissions: string;
+  canApprovePullRequestReviews: boolean;
+}
+
+export interface AssessmentActionsForkPullRequestPolicy {
+  runWorkflowsFromForkPullRequests: boolean;
+  sendWriteTokensToWorkflows: boolean;
+  sendSecretsAndVariables: boolean;
+  requireApprovalForForkPullRequestWorkflows: boolean;
+}
+
+export interface AssessmentSelfHostedRunnerPolicy {
+  disabledForAllOrganizations: boolean;
+}
+
+export interface AssessmentRunnerGroup {
+  githubId: number;
+  name: string;
+  visibility: string;
+  isDefault: boolean;
+  allowsPublicRepositories: boolean;
+  restrictedToWorkflows: boolean | null;
+  selectedWorkflows: string[] | null;
+}
+
+export interface AssessmentRunner {
+  githubId: number;
+  runnerGroupId: number | null;
+  name: string;
+  os: string;
+  status: string;
+  busy: boolean;
+  ephemeral: boolean;
+  version: string | null;
+  labels: string[];
+}
+
+export type AssessmentActionsCheck =
+  | 'selected-actions'
+  | 'workflow-permissions'
+  | 'fork-pull-request-workflows'
+  | 'self-hosted-runner-policy'
+  | 'runner-groups'
+  | 'self-hosted-runners';
+
+export interface AssessmentActionsFailure {
+  check: AssessmentActionsCheck;
+  error: string;
+}
+
+export interface AssessmentActionsEvidence {
+  selectedActions: AssessmentActionsSelectedPolicy | null;
+  workflowPermissions: AssessmentActionsWorkflowPermissions | null;
+  forkPullRequestPolicy: AssessmentActionsForkPullRequestPolicy | null;
+  selfHostedRunnerPolicy: AssessmentSelfHostedRunnerPolicy | null;
+  runnerGroups: AssessmentRunnerGroup[] | null;
+  runners: AssessmentRunner[] | null;
+  failures: AssessmentActionsFailure[];
+}
+
 export interface AssessmentCopilotSeat {
   login: string;
   planType: string;
@@ -166,6 +233,15 @@ export interface AssessmentRepositorySecurityRequests {
   getCodeScanningDefaultSetup: (owner: string, repo: string) => Promise<AssessmentRestResponse>;
   checkDependabotAlerts: (owner: string, repo: string) => Promise<AssessmentRestResponse>;
   getConfiguration: (owner: string, repo: string) => Promise<AssessmentRestResponse>;
+}
+
+export interface AssessmentActionsRequests {
+  getSelectedActions: () => Promise<AssessmentRestResponse>;
+  getWorkflowPermissions: () => Promise<AssessmentRestResponse>;
+  getForkPullRequestPolicy: () => Promise<AssessmentRestResponse>;
+  getSelfHostedRunnerPolicy: () => Promise<AssessmentRestResponse>;
+  getRunnerGroups: (page: number, perPage: number) => Promise<AssessmentRestResponse>;
+  getRunners: (page: number, perPage: number) => Promise<AssessmentRestResponse>;
 }
 
 const STALE_REPOSITORY_DAYS = 365;
@@ -412,6 +488,326 @@ export async function collectEnterpriseActionsPolicy(
   };
 }
 
+function normalizeAssessmentError(error: unknown): string {
+  const message = error instanceof Error
+    ? error.message
+    : typeof error === 'string' ? error : 'Assessment collection failed';
+  return message.replace(/\s+/g, ' ').trim();
+}
+
+function readAssessmentObject(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  return value as Record<string, unknown>;
+}
+
+function requireAssessmentString(
+  data: Record<string, unknown>,
+  key: string,
+  context: string
+): string {
+  const value = data[key];
+  if (typeof value !== 'string') {
+    throw new Error(`${context} did not include a valid ${key}`);
+  }
+  return value;
+}
+
+function requireAssessmentBoolean(
+  data: Record<string, unknown>,
+  key: string,
+  context: string
+): boolean {
+  const value = data[key];
+  if (typeof value !== 'boolean') {
+    throw new Error(`${context} did not include a valid ${key}`);
+  }
+  return value;
+}
+
+function readOptionalAssessmentBoolean(
+  data: Record<string, unknown>,
+  key: string,
+  context: string
+): boolean | null {
+  const value = data[key];
+  if (value === undefined) return null;
+  if (typeof value !== 'boolean') {
+    throw new Error(`${context} did not include a valid ${key}`);
+  }
+  return value;
+}
+
+function requireSuccessfulAssessmentResponse(
+  response: AssessmentRestResponse,
+  context: string
+): Record<string, unknown> {
+  const data = readAssessmentObject(response.data);
+  if (response.status < 200 || response.status >= 300) {
+    const message =
+      typeof data?.message === 'string' ? `: ${normalizeAssessmentError(data.message)}` : '';
+    throw new Error(`${context} returned HTTP ${response.status}${message}`);
+  }
+  if (!data) {
+    throw new Error(`${context} returned an invalid response`);
+  }
+  return data;
+}
+
+async function collectPagedActionsResources<T>(
+  request: (page: number, perPage: number) => Promise<AssessmentRestResponse>,
+  arrayKey: 'runner_groups' | 'runners',
+  context: string,
+  normalize: (item: Record<string, unknown>) => T
+): Promise<T[]> {
+  const resources: T[] = [];
+  let page = 1;
+  let expectedTotal: number | null = null;
+
+  while (true) {
+    const data = requireSuccessfulAssessmentResponse(
+      await request(page, REST_PAGE_SIZE),
+      context
+    );
+    const totalCount = data.total_count;
+    const items = data[arrayKey];
+    if (!Number.isInteger(totalCount) || (totalCount as number) < 0 || !Array.isArray(items)) {
+      throw new Error(`${context} returned an invalid paginated response`);
+    }
+
+    if (expectedTotal === null) {
+      expectedTotal = totalCount as number;
+    } else if (totalCount !== expectedTotal) {
+      throw new Error(`${context} total_count changed while paging`);
+    }
+
+    resources.push(...items.map(item => {
+      const object = readAssessmentObject(item);
+      if (!object) {
+        throw new Error(`${context} returned an invalid resource`);
+      }
+      return normalize(object);
+    }));
+
+    if (resources.length >= expectedTotal || items.length < REST_PAGE_SIZE) {
+      break;
+    }
+    page += 1;
+  }
+
+  return resources;
+}
+
+export async function collectEnterpriseActionsEvidence(
+  requests: AssessmentActionsRequests,
+  allowedActions: string | null
+): Promise<AssessmentActionsEvidence> {
+  const failures: AssessmentActionsFailure[] = [];
+
+  const collectCheck = async <T>(
+    check: AssessmentActionsCheck,
+    request: () => Promise<AssessmentRestResponse>,
+    context: string,
+    normalize: (data: Record<string, unknown>) => T
+  ): Promise<T | null> => {
+    try {
+      return normalize(requireSuccessfulAssessmentResponse(await request(), context));
+    } catch (error) {
+      failures.push({ check, error: normalizeAssessmentError(error) });
+      return null;
+    }
+  };
+
+  const selectedActions =
+    allowedActions === 'selected'
+      ? await collectCheck(
+          'selected-actions',
+          requests.getSelectedActions,
+          'Selected Actions policy',
+          data => {
+            const patternsAllowed = data.patterns_allowed;
+            if (
+              patternsAllowed !== undefined
+              && (
+                !Array.isArray(patternsAllowed)
+                || patternsAllowed.some(item => typeof item !== 'string')
+              )
+            ) {
+              throw new Error('Selected Actions policy did not include valid patterns_allowed');
+            }
+            return {
+              githubOwnedAllowed: readOptionalAssessmentBoolean(
+                data,
+                'github_owned_allowed',
+                'Selected Actions policy'
+              ),
+              verifiedAllowed: readOptionalAssessmentBoolean(
+                data,
+                'verified_allowed',
+                'Selected Actions policy'
+              ),
+              patternsAllowed: (patternsAllowed as string[] | undefined) ?? null,
+            };
+          }
+        )
+      : null;
+
+  const workflowPermissions = await collectCheck(
+    'workflow-permissions',
+    requests.getWorkflowPermissions,
+    'Workflow permissions policy',
+    data => ({
+      defaultWorkflowPermissions: requireAssessmentString(
+        data,
+        'default_workflow_permissions',
+        'Workflow permissions policy'
+      ),
+      canApprovePullRequestReviews: requireAssessmentBoolean(
+        data,
+        'can_approve_pull_request_reviews',
+        'Workflow permissions policy'
+      ),
+    })
+  );
+
+  const forkPullRequestPolicy = await collectCheck(
+    'fork-pull-request-workflows',
+    requests.getForkPullRequestPolicy,
+    'Private fork pull-request policy',
+    data => ({
+      runWorkflowsFromForkPullRequests: requireAssessmentBoolean(
+        data,
+        'run_workflows_from_fork_pull_requests',
+        'Private fork pull-request policy'
+      ),
+      sendWriteTokensToWorkflows: requireAssessmentBoolean(
+        data,
+        'send_write_tokens_to_workflows',
+        'Private fork pull-request policy'
+      ),
+      sendSecretsAndVariables: requireAssessmentBoolean(
+        data,
+        'send_secrets_and_variables',
+        'Private fork pull-request policy'
+      ),
+      requireApprovalForForkPullRequestWorkflows: requireAssessmentBoolean(
+        data,
+        'require_approval_for_fork_pr_workflows',
+        'Private fork pull-request policy'
+      ),
+    })
+  );
+
+  const selfHostedRunnerPolicy = await collectCheck(
+    'self-hosted-runner-policy',
+    requests.getSelfHostedRunnerPolicy,
+    'Self-hosted runner policy',
+    data => ({
+      disabledForAllOrganizations: requireAssessmentBoolean(
+        data,
+        'disable_self_hosted_runners_for_all_orgs',
+        'Self-hosted runner policy'
+      ),
+    })
+  );
+
+  let runnerGroups: AssessmentRunnerGroup[] | null = null;
+  try {
+    runnerGroups = await collectPagedActionsResources(
+      requests.getRunnerGroups,
+      'runner_groups',
+      'Runner groups',
+      data => {
+        const selectedWorkflows = data.selected_workflows;
+        if (
+          selectedWorkflows !== undefined
+          && (
+            !Array.isArray(selectedWorkflows)
+            || selectedWorkflows.some(item => typeof item !== 'string')
+          )
+        ) {
+          throw new Error('Runner group included invalid selected_workflows');
+        }
+        if (!Number.isInteger(data.id)) {
+          throw new Error('Runner group did not include a valid id');
+        }
+        return {
+          githubId: data.id as number,
+          name: requireAssessmentString(data, 'name', 'Runner group'),
+          visibility: requireAssessmentString(data, 'visibility', 'Runner group'),
+          isDefault: requireAssessmentBoolean(data, 'default', 'Runner group'),
+          allowsPublicRepositories: requireAssessmentBoolean(
+            data,
+            'allows_public_repositories',
+            'Runner group'
+          ),
+          restrictedToWorkflows: readOptionalAssessmentBoolean(
+            data,
+            'restricted_to_workflows',
+            'Runner group'
+          ),
+          selectedWorkflows: (selectedWorkflows as string[] | undefined) ?? null,
+        };
+      }
+    );
+  } catch (error) {
+    failures.push({ check: 'runner-groups', error: normalizeAssessmentError(error) });
+  }
+
+  let runners: AssessmentRunner[] | null = null;
+  try {
+    runners = await collectPagedActionsResources(
+      requests.getRunners,
+      'runners',
+      'Self-hosted runners',
+      data => {
+        if (!Number.isInteger(data.id)) {
+          throw new Error('Self-hosted runner did not include a valid id');
+        }
+        if (
+          data.runner_group_id !== undefined
+          && data.runner_group_id !== null
+          && !Number.isInteger(data.runner_group_id)
+        ) {
+          throw new Error('Self-hosted runner included an invalid runner_group_id');
+        }
+        if (!Array.isArray(data.labels)) {
+          throw new Error('Self-hosted runner did not include valid labels');
+        }
+        const labels = data.labels.map(label => {
+          const object = readAssessmentObject(label);
+          if (!object || typeof object.name !== 'string') {
+            throw new Error('Self-hosted runner included an invalid label');
+          }
+          return object.name;
+        });
+        return {
+          githubId: data.id as number,
+          runnerGroupId: (data.runner_group_id as number | null) ?? null,
+          name: requireAssessmentString(data, 'name', 'Self-hosted runner'),
+          os: requireAssessmentString(data, 'os', 'Self-hosted runner'),
+          status: requireAssessmentString(data, 'status', 'Self-hosted runner'),
+          busy: requireAssessmentBoolean(data, 'busy', 'Self-hosted runner'),
+          ephemeral: data.ephemeral === true,
+          version: typeof data.version === 'string' ? data.version : null,
+          labels,
+        };
+      }
+    );
+  } catch (error) {
+    failures.push({ check: 'self-hosted-runners', error: normalizeAssessmentError(error) });
+  }
+
+  return {
+    selectedActions,
+    workflowPermissions,
+    forkPullRequestPolicy,
+    selfHostedRunnerPolicy,
+    runnerGroups,
+    runners,
+    failures,
+  };
+}
+
 export async function collectRepositorySecurity(
   requests: AssessmentRepositorySecurityRequests,
   repositories: AssessmentRepository[]
@@ -617,6 +1013,7 @@ export function evaluateAssessmentBaseline(input: {
   securityDefaults?: AssessmentSecurityDefault[] | null;
   repositorySecurity?: AssessmentRepositorySecurity[] | null;
   actionsPolicy?: AssessmentActionsPolicy | null;
+  actionsEvidence?: AssessmentActionsEvidence | null;
   copilotSeats?: AssessmentCopilotSeatInventory | null;
   budgets?: AssessmentBudget[] | null;
   now?: Date;
@@ -846,6 +1243,146 @@ export function evaluateAssessmentBaseline(input: {
     }
   }
 
+  let selfHostedRunnerCount = 0;
+  let offlineSelfHostedRunnerCount = 0;
+  let runnerGroupCount = 0;
+  let publicRepositoryRunnerGroupCount = 0;
+  let broadlyAccessibleRunnerGroupCount = 0;
+  if (input.actionsEvidence) {
+    const evidence = input.actionsEvidence;
+    if (evidence.selectedActions?.patternsAllowed?.some(pattern => {
+      const normalized = pattern.trim();
+      return normalized === '*' || normalized === '*/*';
+    })) {
+      findings.push({
+        ruleKey: 'actions-selected-policy-broad-patterns',
+        domain: 'actions',
+        severity: 'medium',
+        title: 'The selected Actions allow list contains a global wildcard',
+        summary: 'The selected Actions policy includes a pattern that permits actions or reusable workflows from any source.',
+        recommendation: 'Replace global wildcards with the minimum approved organization, repository, and action patterns.',
+        affectedResources: evidence.selectedActions.patternsAllowed,
+      });
+    }
+
+    if (evidence.workflowPermissions?.defaultWorkflowPermissions === 'write') {
+      findings.push({
+        ruleKey: 'actions-default-workflow-write-permissions',
+        domain: 'actions',
+        severity: 'high',
+        title: 'Workflows receive write permissions by default',
+        summary: 'The enterprise default grants write access to the GITHUB_TOKEN unless a workflow reduces its permissions.',
+        recommendation: 'Set the enterprise default workflow permission to read, then grant write scopes explicitly in reviewed workflows.',
+        affectedResources: [],
+      });
+    }
+    if (evidence.workflowPermissions?.canApprovePullRequestReviews) {
+      findings.push({
+        ruleKey: 'actions-workflows-can-approve-pull-requests',
+        domain: 'actions',
+        severity: 'medium',
+        title: 'Workflows can approve pull requests',
+        summary: 'GitHub Actions workflows are allowed to create approving pull-request reviews.',
+        recommendation: 'Disable workflow pull-request approvals unless an approved automation scenario requires them.',
+        affectedResources: [],
+      });
+    }
+
+    const forkPolicy = evidence.forkPullRequestPolicy;
+    if (
+      forkPolicy?.runWorkflowsFromForkPullRequests
+      && (forkPolicy.sendWriteTokensToWorkflows || forkPolicy.sendSecretsAndVariables)
+    ) {
+      findings.push({
+        ruleKey: 'actions-private-fork-workflows-receive-privileged-data',
+        domain: 'actions',
+        severity: 'high',
+        title: 'Private fork workflows can receive privileged data',
+        summary: 'Workflows triggered from private repository forks can receive write tokens, secrets, or variables.',
+        recommendation: 'Disable write-token and secret access for fork pull-request workflows, then use narrowly scoped trusted workflows for privileged operations.',
+        affectedResources: [],
+      });
+    } else if (
+      forkPolicy?.runWorkflowsFromForkPullRequests
+      && !forkPolicy.requireApprovalForForkPullRequestWorkflows
+    ) {
+      findings.push({
+        ruleKey: 'actions-private-fork-workflows-run-without-approval',
+        domain: 'actions',
+        severity: 'medium',
+        title: 'Private fork workflows can run without approval',
+        summary: 'Pull requests from private repository forks can start workflows without an approval gate.',
+        recommendation: 'Require approval before running fork pull-request workflows, or disable those workflows if they are not needed.',
+        affectedResources: [],
+      });
+    }
+
+    const runners = evidence.runners ?? [];
+    const runnerGroups = evidence.runnerGroups ?? [];
+    selfHostedRunnerCount = runners.length;
+    offlineSelfHostedRunnerCount = runners.filter(
+      runner => !runner.ephemeral && runner.status !== 'online'
+    ).length;
+    runnerGroupCount = runnerGroups.length;
+    publicRepositoryRunnerGroupCount = runnerGroups.filter(
+      group => group.allowsPublicRepositories
+    ).length;
+
+    const runnerGroupIdsWithRunners = new Set(
+      runners
+        .map(runner => runner.runnerGroupId)
+        .filter((groupId): groupId is number => groupId !== null)
+    );
+    const publicRepositoryRunnerGroups = runnerGroups.filter(
+      group => group.allowsPublicRepositories
+    );
+    const broadlyAccessibleRunnerGroups = runnerGroups.filter(
+      group =>
+        runnerGroupIdsWithRunners.has(group.githubId)
+        && group.visibility === 'all'
+        && group.restrictedToWorkflows === false
+    );
+    broadlyAccessibleRunnerGroupCount = broadlyAccessibleRunnerGroups.length;
+
+    if (publicRepositoryRunnerGroups.length > 0) {
+      findings.push({
+        ruleKey: 'actions-runner-groups-allow-public-repositories',
+        domain: 'actions',
+        severity: 'high',
+        title: 'Self-hosted runner groups allow public repositories',
+        summary: `${publicRepositoryRunnerGroups.length} ${publicRepositoryRunnerGroups.length === 1 ? 'runner group permits' : 'runner groups permit'} public repositories to schedule jobs.`,
+        recommendation: 'Disable public repository access for self-hosted runner groups and use GitHub-hosted runners for untrusted public workflows.',
+        affectedResources: publicRepositoryRunnerGroups.map(group => group.name),
+      });
+    }
+    if (broadlyAccessibleRunnerGroups.length > 0) {
+      findings.push({
+        ruleKey: 'actions-runner-groups-broadly-accessible',
+        domain: 'actions',
+        severity: 'medium',
+        title: 'Runner groups with active capacity have broad workflow access',
+        summary: `${broadlyAccessibleRunnerGroups.length} ${broadlyAccessibleRunnerGroups.length === 1 ? 'runner group is' : 'runner groups are'} available to all organizations without a selected-workflow restriction.`,
+        recommendation: 'Limit self-hosted runner groups to the organizations and reusable workflows that require their trust boundary.',
+        affectedResources: broadlyAccessibleRunnerGroups.map(group => group.name),
+      });
+    }
+
+    const offlineRunners = runners.filter(
+      runner => !runner.ephemeral && runner.status !== 'online'
+    );
+    if (offlineRunners.length > 0) {
+      findings.push({
+        ruleKey: 'actions-self-hosted-runners-offline',
+        domain: 'actions',
+        severity: 'low',
+        title: 'Persistent self-hosted runners are offline',
+        summary: `${offlineRunners.length} non-ephemeral self-hosted ${offlineRunners.length === 1 ? 'runner is' : 'runners are'} not online.`,
+        recommendation: 'Remove retired runners or restore and monitor the runner services that should remain available.',
+        affectedResources: offlineRunners.map(runner => runner.name),
+      });
+    }
+  }
+
   let activeCopilotSeats = 0;
   let inactiveCopilotSeats = 0;
   let pendingCopilotSeatCancellations = 0;
@@ -948,7 +1485,7 @@ export function evaluateAssessmentBaseline(input: {
     healthScore,
     assessedDomainCount: 2
       + (input.securityDefaults || input.repositorySecurity ? 1 : 0)
-      + (input.actionsPolicy ? 1 : 0)
+      + (input.actionsPolicy || input.actionsEvidence ? 1 : 0)
       + (input.copilotSeats ? 1 : 0)
       + (input.budgets ? 1 : 0),
     findings,
@@ -971,6 +1508,13 @@ export function evaluateAssessmentBaseline(input: {
         repositorySecurityUnknownRepositories,
         secretScanningEnabledRepositories,
         securityConfigurationAppliedRepositories,
+      } : {}),
+      ...(input.actionsEvidence ? {
+        broadlyAccessibleRunnerGroupCount,
+        offlineSelfHostedRunnerCount,
+        publicRepositoryRunnerGroupCount,
+        runnerGroupCount,
+        selfHostedRunnerCount,
       } : {}),
       ...(input.copilotSeats ? {
         activeCopilotSeats,

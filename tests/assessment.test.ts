@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  collectEnterpriseActionsEvidence,
   collectEnterpriseActionsPolicy,
   collectEnterpriseBudgets,
   collectEnterpriseCopilotSeats,
@@ -247,6 +248,149 @@ test('rejects malformed security and Actions policy responses', async () => {
     () => collectEnterpriseActionsPolicy(async () => ({ allowed_actions: 'all' })),
     /incomplete enterprise Actions policy response/
   );
+});
+
+test('collects selected Actions policy and paginated runner evidence', async () => {
+  const runnerGroupPages: number[] = [];
+  const firstPageGroups = Array.from({ length: 100 }, (_, index) => ({
+    id: index + 1,
+    name: `Group ${index + 1}`,
+    visibility: 'selected',
+    default: index === 0,
+    allows_public_repositories: false,
+    restricted_to_workflows: true,
+    selected_workflows: ['acme/workflows/.github/workflows/build.yml@refs/heads/main'],
+  }));
+
+  const evidence = await collectEnterpriseActionsEvidence({
+    getSelectedActions: async () => ({
+      status: 200,
+      data: {
+        github_owned_allowed: true,
+        verified_allowed: false,
+        patterns_allowed: ['acme/*'],
+      },
+    }),
+    getWorkflowPermissions: async () => ({
+      status: 200,
+      data: {
+        default_workflow_permissions: 'read',
+        can_approve_pull_request_reviews: false,
+      },
+    }),
+    getForkPullRequestPolicy: async () => ({
+      status: 200,
+      data: {
+        run_workflows_from_fork_pull_requests: false,
+        send_write_tokens_to_workflows: false,
+        send_secrets_and_variables: false,
+        require_approval_for_fork_pr_workflows: false,
+      },
+    }),
+    getSelfHostedRunnerPolicy: async () => ({
+      status: 200,
+      data: { disable_self_hosted_runners_for_all_orgs: false },
+    }),
+    getRunnerGroups: async page => {
+      runnerGroupPages.push(page);
+      return {
+        status: 200,
+        data: {
+          total_count: 101,
+          runner_groups: page === 1
+            ? firstPageGroups
+            : [{
+                ...firstPageGroups[0],
+                id: 101,
+                name: 'Group 101',
+              }],
+        },
+      };
+    },
+    getRunners: async () => ({
+      status: 200,
+      data: {
+        total_count: 1,
+        runners: [{
+          id: 501,
+          runner_group_id: 1,
+          name: 'runner-1',
+          os: 'linux',
+          status: 'online',
+          busy: false,
+          ephemeral: true,
+          version: '2.329.0',
+          labels: [{ id: 1, name: 'self-hosted', type: 'read-only' }],
+        }],
+      },
+    }),
+  }, 'selected');
+
+  assert.deepEqual(runnerGroupPages, [1, 2]);
+  assert.equal(evidence.runnerGroups?.length, 101);
+  assert.deepEqual(evidence.selectedActions, {
+    githubOwnedAllowed: true,
+    verifiedAllowed: false,
+    patternsAllowed: ['acme/*'],
+  });
+  assert.deepEqual(evidence.runners, [{
+    githubId: 501,
+    runnerGroupId: 1,
+    name: 'runner-1',
+    os: 'linux',
+    status: 'online',
+    busy: false,
+    ephemeral: true,
+    version: '2.329.0',
+    labels: ['self-hosted'],
+  }]);
+  assert.deepEqual(evidence.failures, []);
+});
+
+test('retains available Actions evidence when individual checks fail', async () => {
+  let selectedActionsRequested = false;
+  const evidence = await collectEnterpriseActionsEvidence({
+    getSelectedActions: async () => {
+      selectedActionsRequested = true;
+      return { status: 409, data: { message: 'Conflict' } };
+    },
+    getWorkflowPermissions: async () => ({
+      status: 403,
+      data: { message: 'Resource protected by SAML' },
+    }),
+    getForkPullRequestPolicy: async () => ({
+      status: 200,
+      data: {
+        run_workflows_from_fork_pull_requests: false,
+        send_write_tokens_to_workflows: false,
+        send_secrets_and_variables: false,
+        require_approval_for_fork_pr_workflows: false,
+      },
+    }),
+    getSelfHostedRunnerPolicy: async () => ({
+      status: 200,
+      data: { disable_self_hosted_runners_for_all_orgs: true },
+    }),
+    getRunnerGroups: async () => ({
+      status: 200,
+      data: { total_count: 0, runner_groups: [] },
+    }),
+    getRunners: async () => {
+      throw new Error('Runner inventory permission denied');
+    },
+  }, 'all');
+
+  assert.equal(selectedActionsRequested, false);
+  assert.equal(evidence.selectedActions, null);
+  assert.equal(evidence.workflowPermissions, null);
+  assert.equal(evidence.runnerGroups?.length, 0);
+  assert.equal(evidence.runners, null);
+  assert.equal(evidence.selfHostedRunnerPolicy?.disabledForAllOrganizations, true);
+  assert.deepEqual(evidence.failures.map(failure => failure.check), [
+    'workflow-permissions',
+    'self-hosted-runners',
+  ]);
+  assert.match(evidence.failures[0].error, /403.*SAML/);
 });
 
 test('collects repository-level security features, Dependabot alerts, and configurations', async () => {
@@ -601,6 +745,86 @@ test('evaluates enterprise security defaults and Actions policy', () => {
       'actions-sha-pinning-not-required',
     ]
   );
+});
+
+test('evaluates workflow permissions and self-hosted runner trust boundaries', () => {
+  const evaluation = evaluateAssessmentBaseline({
+    organizations: [],
+    members: [
+      { login: 'owner-one', name: null, isOwner: true },
+      { login: 'owner-two', name: null, isOwner: true },
+    ],
+    ownerCount: 2,
+    repositories: [],
+    teams: [],
+    actionsPolicy: {
+      enabledOrganizations: 'all',
+      allowedActions: 'selected',
+      shaPinningRequired: true,
+    },
+    actionsEvidence: {
+      selectedActions: {
+        githubOwnedAllowed: true,
+        verifiedAllowed: false,
+        patternsAllowed: ['*'],
+      },
+      workflowPermissions: {
+        defaultWorkflowPermissions: 'write',
+        canApprovePullRequestReviews: true,
+      },
+      forkPullRequestPolicy: {
+        runWorkflowsFromForkPullRequests: true,
+        sendWriteTokensToWorkflows: true,
+        sendSecretsAndVariables: true,
+        requireApprovalForForkPullRequestWorkflows: false,
+      },
+      selfHostedRunnerPolicy: {
+        disabledForAllOrganizations: false,
+      },
+      runnerGroups: [{
+        githubId: 1,
+        name: 'Default',
+        visibility: 'all',
+        isDefault: true,
+        allowsPublicRepositories: true,
+        restrictedToWorkflows: false,
+        selectedWorkflows: [],
+      }],
+      runners: [{
+        githubId: 101,
+        runnerGroupId: 1,
+        name: 'retired-runner',
+        os: 'linux',
+        status: 'offline',
+        busy: false,
+        ephemeral: false,
+        version: null,
+        labels: ['self-hosted', 'linux'],
+      }],
+      failures: [],
+    },
+    now: new Date('2026-09-10T00:00:00Z'),
+  });
+
+  assert.equal(evaluation.assessedDomainCount, 3);
+  assert.equal(evaluation.healthScore, 5);
+  assert.deepEqual(
+    evaluation.findings.map(finding => finding.ruleKey),
+    [
+      'actions-selected-policy-broad-patterns',
+      'actions-default-workflow-write-permissions',
+      'actions-workflows-can-approve-pull-requests',
+      'actions-private-fork-workflows-receive-privileged-data',
+      'actions-runner-groups-allow-public-repositories',
+      'actions-runner-groups-broadly-accessible',
+      'actions-self-hosted-runners-offline',
+    ]
+  );
+  assert.equal(evaluation.metrics.selfHostedRunnerCount, 1);
+  assert.equal(evaluation.metrics.offlineSelfHostedRunnerCount, 1);
+  assert.equal(evaluation.metrics.runnerGroupCount, 1);
+  assert.equal(evaluation.metrics.publicRepositoryRunnerGroupCount, 1);
+  assert.equal(evaluation.metrics.broadlyAccessibleRunnerGroupCount, 1);
 });
 
 test('evaluates measured repository security coverage without treating unknown states as disabled', () => {

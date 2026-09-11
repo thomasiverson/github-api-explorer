@@ -4,6 +4,7 @@ import crypto from 'crypto';
 import fs from 'fs';
 import type { ImportedEndpoint } from './openapi-import';
 import type {
+  AssessmentActionsEvidence,
   AssessmentActionsPolicy,
   AssessmentBudget,
   AssessmentCopilotSeatInventory,
@@ -259,6 +260,53 @@ function initSchema(db: Database.Database) {
       enabled_organizations TEXT NOT NULL,
       allowed_actions TEXT NOT NULL,
       sha_pinning_required INTEGER NOT NULL DEFAULT 0
+    );
+
+    CREATE TABLE IF NOT EXISTS assessment_actions_details (
+      run_id TEXT PRIMARY KEY REFERENCES assessment_runs(id) ON DELETE CASCADE,
+      github_owned_allowed INTEGER,
+      verified_allowed INTEGER,
+      patterns_allowed TEXT,
+      default_workflow_permissions TEXT,
+      can_approve_pull_request_reviews INTEGER,
+      run_workflows_from_fork_pull_requests INTEGER,
+      send_write_tokens_to_workflows INTEGER,
+      send_secrets_and_variables INTEGER,
+      require_approval_for_fork_pr_workflows INTEGER,
+      self_hosted_runners_disabled_for_all_orgs INTEGER
+    );
+
+    CREATE TABLE IF NOT EXISTS assessment_actions_runner_groups (
+      run_id TEXT NOT NULL REFERENCES assessment_runs(id) ON DELETE CASCADE,
+      github_id INTEGER NOT NULL,
+      name TEXT NOT NULL,
+      visibility TEXT NOT NULL,
+      is_default INTEGER NOT NULL DEFAULT 0,
+      allows_public_repositories INTEGER NOT NULL DEFAULT 0,
+      restricted_to_workflows INTEGER NOT NULL DEFAULT 0,
+      selected_workflows TEXT NOT NULL,
+      PRIMARY KEY(run_id, github_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS assessment_actions_runners (
+      run_id TEXT NOT NULL REFERENCES assessment_runs(id) ON DELETE CASCADE,
+      github_id INTEGER NOT NULL,
+      runner_group_id INTEGER,
+      name TEXT NOT NULL,
+      os TEXT NOT NULL,
+      status TEXT NOT NULL,
+      busy INTEGER NOT NULL DEFAULT 0,
+      ephemeral INTEGER NOT NULL DEFAULT 0,
+      version TEXT,
+      labels TEXT NOT NULL,
+      PRIMARY KEY(run_id, github_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS assessment_actions_failures (
+      run_id TEXT NOT NULL REFERENCES assessment_runs(id) ON DELETE CASCADE,
+      check_key TEXT NOT NULL,
+      error TEXT NOT NULL,
+      PRIMARY KEY(run_id, check_key)
     );
 
     CREATE TABLE IF NOT EXISTS assessment_copilot_seats (
@@ -739,6 +787,11 @@ export function createAssessmentRun(id: string, environmentId: string) {
   `).run(id, environmentId);
 }
 
+function nullableBooleanToInteger(value: boolean | null | undefined): number | null {
+  if (value === undefined || value === null) return null;
+  return value ? 1 : 0;
+}
+
 export function completeAssessment(input: {
   runId: string;
   durationMs: number;
@@ -749,6 +802,7 @@ export function completeAssessment(input: {
   securityCollector: { id: string; durationMs: number; error: string | null };
   repositorySecurityCollector: { id: string; durationMs: number };
   actionsCollector: { id: string; durationMs: number; error: string | null };
+  actionsDepthCollector: { id: string; durationMs: number; error: string | null };
   copilotCollector: { id: string; durationMs: number; error: string | null };
   billingCollector: { id: string; durationMs: number; error: string | null };
   organizations: Array<{
@@ -787,6 +841,7 @@ export function completeAssessment(input: {
   repositorySecurity: AssessmentRepositorySecurity[];
   repositorySecurityFailures: AssessmentRepositorySecurityFailure[];
   actionsPolicy: AssessmentActionsPolicy | null;
+  actionsEvidence: AssessmentActionsEvidence | null;
   copilotSeats: AssessmentCopilotSeatInventory | null;
   budgets: AssessmentBudget[] | null;
   evaluation: AssessmentEvaluation;
@@ -829,6 +884,30 @@ export function completeAssessment(input: {
        dependabot_security_updates, configuration_status, configuration_id,
        configuration_name, configuration_enforcement)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  const insertActionsDetails = db.prepare(`
+    INSERT INTO assessment_actions_details
+      (run_id, github_owned_allowed, verified_allowed, patterns_allowed,
+       default_workflow_permissions, can_approve_pull_request_reviews,
+       run_workflows_from_fork_pull_requests, send_write_tokens_to_workflows,
+       send_secrets_and_variables, require_approval_for_fork_pr_workflows,
+       self_hosted_runners_disabled_for_all_orgs)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  const insertActionsRunnerGroup = db.prepare(`
+    INSERT INTO assessment_actions_runner_groups
+      (run_id, github_id, name, visibility, is_default, allows_public_repositories,
+       restricted_to_workflows, selected_workflows)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  const insertActionsRunner = db.prepare(`
+    INSERT INTO assessment_actions_runners
+      (run_id, github_id, runner_group_id, name, os, status, busy, ephemeral, version, labels)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  const insertActionsFailure = db.prepare(`
+    INSERT INTO assessment_actions_failures (run_id, check_key, error)
+    VALUES (?, ?, ?)
   `);
   const insertCopilotSeat = db.prepare(`
     INSERT INTO assessment_copilot_seats
@@ -955,6 +1034,56 @@ export function completeAssessment(input: {
         input.actionsPolicy.shaPinningRequired ? 1 : 0
       );
     }
+    if (input.actionsEvidence) {
+      const selected = input.actionsEvidence.selectedActions;
+      const workflow = input.actionsEvidence.workflowPermissions;
+      const fork = input.actionsEvidence.forkPullRequestPolicy;
+      const runnerPolicy = input.actionsEvidence.selfHostedRunnerPolicy;
+      insertActionsDetails.run(
+        input.runId,
+        nullableBooleanToInteger(selected?.githubOwnedAllowed),
+        nullableBooleanToInteger(selected?.verifiedAllowed),
+        selected?.patternsAllowed ? JSON.stringify(selected.patternsAllowed) : null,
+        workflow?.defaultWorkflowPermissions ?? null,
+        nullableBooleanToInteger(workflow?.canApprovePullRequestReviews),
+        nullableBooleanToInteger(fork?.runWorkflowsFromForkPullRequests),
+        nullableBooleanToInteger(fork?.sendWriteTokensToWorkflows),
+        nullableBooleanToInteger(fork?.sendSecretsAndVariables),
+        nullableBooleanToInteger(fork?.requireApprovalForForkPullRequestWorkflows),
+        nullableBooleanToInteger(runnerPolicy?.disabledForAllOrganizations)
+      );
+      for (const runnerGroup of input.actionsEvidence.runnerGroups ?? []) {
+        insertActionsRunnerGroup.run(
+          input.runId,
+          runnerGroup.githubId,
+          runnerGroup.name,
+          runnerGroup.visibility,
+          runnerGroup.isDefault ? 1 : 0,
+          runnerGroup.allowsPublicRepositories ? 1 : 0,
+          runnerGroup.restrictedToWorkflows === null
+            ? -1
+            : runnerGroup.restrictedToWorkflows ? 1 : 0,
+          JSON.stringify(runnerGroup.selectedWorkflows)
+        );
+      }
+      for (const runner of input.actionsEvidence.runners ?? []) {
+        insertActionsRunner.run(
+          input.runId,
+          runner.githubId,
+          runner.runnerGroupId,
+          runner.name,
+          runner.os,
+          runner.status,
+          runner.busy ? 1 : 0,
+          runner.ephemeral ? 1 : 0,
+          runner.version,
+          JSON.stringify(runner.labels)
+        );
+      }
+      for (const failure of input.actionsEvidence.failures) {
+        insertActionsFailure.run(input.runId, failure.check, failure.error);
+      }
+    }
     for (const seat of input.copilotSeats?.seats || []) {
       insertCopilotSeat.run(
         input.runId,
@@ -1064,6 +1193,30 @@ export function completeAssessment(input: {
       input.actionsCollector.durationMs,
       input.actionsCollector.error
     );
+    const actionsDepthFailures = input.actionsEvidence?.failures ?? [];
+    db.prepare(`
+      INSERT INTO assessment_collector_results
+        (id, run_id, collector_key, status, item_count, duration_ms, error)
+      VALUES (?, ?, 'actionsDepth', ?, ?, ?, ?)
+    `).run(
+      input.actionsDepthCollector.id,
+      input.runId,
+      input.actionsDepthCollector.error
+        ? 'failed'
+        : actionsDepthFailures.length > 0 ? 'partial' : 'completed',
+      input.actionsEvidence
+        ? (input.actionsEvidence.runnerGroups?.length ?? 0)
+          + (input.actionsEvidence.runners?.length ?? 0)
+          + [
+            input.actionsEvidence.selectedActions,
+            input.actionsEvidence.workflowPermissions,
+            input.actionsEvidence.forkPullRequestPolicy,
+            input.actionsEvidence.selfHostedRunnerPolicy,
+          ].filter(Boolean).length
+        : 0,
+      input.actionsDepthCollector.durationMs,
+      input.actionsDepthCollector.error ?? formatActionsFailures(actionsDepthFailures)
+    );
     db.prepare(`
       INSERT INTO assessment_collector_results
         (id, run_id, collector_key, status, item_count, duration_ms, error)
@@ -1148,6 +1301,15 @@ function formatRepositorySecurityFailures(
     .join('\n');
 }
 
+function formatActionsFailures(
+  failures: AssessmentActionsEvidence['failures']
+): string | null {
+  if (failures.length === 0) return null;
+  return failures
+    .map(failure => `${failure.check}: ${failure.error.replace(/\s+/g, ' ').trim()}`)
+    .join('\n');
+}
+
 export function getAssessmentById(runId: string) {
   const run = getDb().prepare('SELECT * FROM assessment_runs WHERE id = ?').get(runId) as AssessmentRunRow | undefined;
   return run ? getAssessmentSnapshot(run) : null;
@@ -1208,6 +1370,67 @@ function getAssessmentSnapshot(run: AssessmentRunRow) {
     configuration_name: string | null;
     configuration_enforcement: string | null;
   }>;
+  const actionsDetails = getDb().prepare(`
+    SELECT github_owned_allowed, verified_allowed, patterns_allowed,
+      default_workflow_permissions, can_approve_pull_request_reviews,
+      run_workflows_from_fork_pull_requests, send_write_tokens_to_workflows,
+      send_secrets_and_variables, require_approval_for_fork_pr_workflows,
+      self_hosted_runners_disabled_for_all_orgs
+    FROM assessment_actions_details
+    WHERE run_id = ?
+  `).get(run.id) as {
+    github_owned_allowed: number | null;
+    verified_allowed: number | null;
+    patterns_allowed: string | null;
+    default_workflow_permissions: string | null;
+    can_approve_pull_request_reviews: number | null;
+    run_workflows_from_fork_pull_requests: number | null;
+    send_write_tokens_to_workflows: number | null;
+    send_secrets_and_variables: number | null;
+    require_approval_for_fork_pr_workflows: number | null;
+    self_hosted_runners_disabled_for_all_orgs: number | null;
+  } | undefined;
+  const actionsRunnerGroups = getDb().prepare(`
+    SELECT github_id, name, visibility, is_default, allows_public_repositories,
+      restricted_to_workflows, selected_workflows
+    FROM assessment_actions_runner_groups
+    WHERE run_id = ?
+    ORDER BY name
+  `).all(run.id) as Array<{
+    github_id: number;
+    name: string;
+    visibility: string;
+    is_default: number;
+    allows_public_repositories: number;
+    restricted_to_workflows: number;
+    selected_workflows: string;
+  }>;
+  const actionsRunners = getDb().prepare(`
+    SELECT github_id, runner_group_id, name, os, status, busy, ephemeral, version, labels
+    FROM assessment_actions_runners
+    WHERE run_id = ?
+    ORDER BY name
+  `).all(run.id) as Array<{
+    github_id: number;
+    runner_group_id: number | null;
+    name: string;
+    os: string;
+    status: string;
+    busy: number;
+    ephemeral: number;
+    version: string | null;
+    labels: string;
+  }>;
+  const actionsFailures = getDb().prepare(`
+    SELECT check_key, error
+    FROM assessment_actions_failures
+    WHERE run_id = ?
+    ORDER BY check_key
+  `).all(run.id) as Array<{
+    check_key: AssessmentActionsEvidence['failures'][number]['check'];
+    error: string;
+  }>;
+  const failedActionsChecks = new Set(actionsFailures.map(failure => failure.check_key));
 
   return {
     id: run.id,
@@ -1235,6 +1458,73 @@ function getAssessmentSnapshot(run: AssessmentRunRow) {
       configurationName: repository.configuration_name,
       configurationEnforcement: repository.configuration_enforcement,
     })),
+    actionsEvidence: actionsDetails ? {
+      selectedActions:
+        actionsDetails.github_owned_allowed === null
+        && actionsDetails.verified_allowed === null
+        && actionsDetails.patterns_allowed === null
+          ? null
+          : {
+              githubOwnedAllowed: actionsDetails.github_owned_allowed === null
+                ? null
+                : actionsDetails.github_owned_allowed === 1,
+              verifiedAllowed: actionsDetails.verified_allowed === null
+                ? null
+                : actionsDetails.verified_allowed === 1,
+              patternsAllowed: actionsDetails.patterns_allowed === null
+                ? null
+                : JSON.parse(actionsDetails.patterns_allowed) as string[],
+            },
+      workflowPermissions: actionsDetails.default_workflow_permissions === null ? null : {
+        defaultWorkflowPermissions: actionsDetails.default_workflow_permissions,
+        canApprovePullRequestReviews:
+          actionsDetails.can_approve_pull_request_reviews === 1,
+      },
+      forkPullRequestPolicy:
+        actionsDetails.run_workflows_from_fork_pull_requests === null ? null : {
+          runWorkflowsFromForkPullRequests:
+            actionsDetails.run_workflows_from_fork_pull_requests === 1,
+          sendWriteTokensToWorkflows: actionsDetails.send_write_tokens_to_workflows === 1,
+          sendSecretsAndVariables: actionsDetails.send_secrets_and_variables === 1,
+          requireApprovalForForkPullRequestWorkflows:
+            actionsDetails.require_approval_for_fork_pr_workflows === 1,
+        },
+      selfHostedRunnerPolicy:
+        actionsDetails.self_hosted_runners_disabled_for_all_orgs === null ? null : {
+          disabledForAllOrganizations:
+            actionsDetails.self_hosted_runners_disabled_for_all_orgs === 1,
+        },
+      runnerGroups: failedActionsChecks.has('runner-groups')
+        ? null
+        : actionsRunnerGroups.map(group => ({
+            githubId: group.github_id,
+            name: group.name,
+            visibility: group.visibility,
+            isDefault: group.is_default === 1,
+            allowsPublicRepositories: group.allows_public_repositories === 1,
+            restrictedToWorkflows: group.restricted_to_workflows === -1
+              ? null
+              : group.restricted_to_workflows === 1,
+            selectedWorkflows: JSON.parse(group.selected_workflows) as string[] | null,
+          })),
+      runners: failedActionsChecks.has('self-hosted-runners')
+        ? null
+        : actionsRunners.map(runner => ({
+            githubId: runner.github_id,
+            runnerGroupId: runner.runner_group_id,
+            name: runner.name,
+            os: runner.os,
+            status: runner.status,
+            busy: runner.busy === 1,
+            ephemeral: runner.ephemeral === 1,
+            version: runner.version,
+            labels: JSON.parse(runner.labels) as string[],
+          })),
+      failures: actionsFailures.map(failure => ({
+        check: failure.check_key,
+        error: failure.error,
+      })),
+    } : null,
     findings: findings.map(finding => ({
       ruleKey: finding.rule_key,
       domain: finding.domain,

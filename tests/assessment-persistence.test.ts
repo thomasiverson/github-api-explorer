@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
-test('persists and reloads repository security evidence', async () => {
+test('persists and reloads repository security and Actions evidence', async () => {
   const originalWorkingDirectory = process.cwd();
   const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), 'github-api-explorer-assessment-'));
   let closeDatabase: (() => void) | null = null;
@@ -35,6 +35,7 @@ test('persists and reloads repository security evidence', async () => {
       securityCollector: { id: 'collector-security', durationMs: 1, error: null },
       repositorySecurityCollector: { id: 'collector-repository-security', durationMs: 1 },
       actionsCollector: { id: 'collector-actions', durationMs: 1, error: null },
+      actionsDepthCollector: { id: 'collector-actions-depth', durationMs: 1, error: null },
       copilotCollector: { id: 'collector-copilot', durationMs: 1, error: null },
       billingCollector: { id: 'collector-billing', durationMs: 1, error: null },
       organizations: [],
@@ -63,6 +64,46 @@ test('persists and reloads repository security evidence', async () => {
       }],
       repositorySecurityFailures: [],
       actionsPolicy: null,
+      actionsEvidence: {
+        selectedActions: null,
+        workflowPermissions: {
+          defaultWorkflowPermissions: 'read',
+          canApprovePullRequestReviews: false,
+        },
+        forkPullRequestPolicy: {
+          runWorkflowsFromForkPullRequests: false,
+          sendWriteTokensToWorkflows: false,
+          sendSecretsAndVariables: false,
+          requireApprovalForForkPullRequestWorkflows: false,
+        },
+        selfHostedRunnerPolicy: {
+          disabledForAllOrganizations: false,
+        },
+        runnerGroups: [{
+          githubId: 1,
+          name: 'Default',
+          visibility: 'all',
+          isDefault: true,
+          allowsPublicRepositories: false,
+          restrictedToWorkflows: false,
+          selectedWorkflows: [],
+        }],
+        runners: [{
+          githubId: 101,
+          runnerGroupId: 1,
+          name: 'runner-1',
+          os: 'linux',
+          status: 'online',
+          busy: false,
+          ephemeral: false,
+          version: '2.329.0',
+          labels: ['self-hosted', 'linux'],
+        }],
+        failures: [{
+          check: 'selected-actions',
+          error: 'Selected Actions policy returned HTTP 403',
+        }],
+      },
       copilotSeats: null,
       budgets: null,
       evaluation: {
@@ -72,6 +113,8 @@ test('persists and reloads repository security evidence', async () => {
         metrics: {
           codeScanningDefaultSetupRepositories: 1,
           eligibleSecurityRepositories: 1,
+          runnerGroupCount: 1,
+          selfHostedRunnerCount: 1,
         },
       },
     });
@@ -95,6 +138,46 @@ test('persists and reloads repository security evidence', async () => {
       configurationEnforcement: 'enforced',
     }]);
     assert.equal(snapshot.metrics.codeScanningDefaultSetupRepositories, 1);
+    assert.deepEqual(snapshot.actionsEvidence, {
+      selectedActions: null,
+      workflowPermissions: {
+        defaultWorkflowPermissions: 'read',
+        canApprovePullRequestReviews: false,
+      },
+      forkPullRequestPolicy: {
+        runWorkflowsFromForkPullRequests: false,
+        sendWriteTokensToWorkflows: false,
+        sendSecretsAndVariables: false,
+        requireApprovalForForkPullRequestWorkflows: false,
+      },
+      selfHostedRunnerPolicy: {
+        disabledForAllOrganizations: false,
+      },
+      runnerGroups: [{
+        githubId: 1,
+        name: 'Default',
+        visibility: 'all',
+        isDefault: true,
+        allowsPublicRepositories: false,
+        restrictedToWorkflows: false,
+        selectedWorkflows: [],
+      }],
+      runners: [{
+        githubId: 101,
+        runnerGroupId: 1,
+        name: 'runner-1',
+        os: 'linux',
+        status: 'online',
+        busy: false,
+        ephemeral: false,
+        version: '2.329.0',
+        labels: ['self-hosted', 'linux'],
+      }],
+      failures: [{
+        check: 'selected-actions',
+        error: 'Selected Actions policy returned HTTP 403',
+      }],
+    });
     assert.deepEqual(snapshot.collectors.find(
       collector => collector.collector_key === 'repositorySecurity'
     ), {
@@ -104,9 +187,23 @@ test('persists and reloads repository security evidence', async () => {
       duration_ms: 1,
       error: null,
     });
+    assert.deepEqual(snapshot.collectors.find(
+      collector => collector.collector_key === 'actionsDepth'
+    ), {
+      collector_key: 'actionsDepth',
+      status: 'partial',
+      item_count: 5,
+      duration_ms: 1,
+      error: 'selected-actions: Selected Actions policy returned HTTP 403',
+    });
   } finally {
     closeDatabase?.();
     process.chdir(originalWorkingDirectory);
-    await rm(temporaryDirectory, { recursive: true, force: true });
+    await rm(temporaryDirectory, {
+      recursive: true,
+      force: true,
+      maxRetries: 5,
+      retryDelay: 100,
+    });
   }
 });

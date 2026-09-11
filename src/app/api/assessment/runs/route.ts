@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { v4 as uuidv4 } from 'uuid';
 import { createOctokit } from '@/lib/auth';
 import {
+  collectEnterpriseActionsEvidence,
   collectEnterpriseActionsPolicy,
   collectEnterpriseBudgets,
   collectEnterpriseCopilotSeats,
@@ -66,6 +67,7 @@ export async function POST(request: Request) {
   const securityCollectorId = uuidv4();
   const repositorySecurityCollectorId = uuidv4();
   const actionsCollectorId = uuidv4();
+  const actionsDepthCollectorId = uuidv4();
   const copilotCollectorId = uuidv4();
   const billingCollectorId = uuidv4();
   const collectorIds = {
@@ -167,6 +169,56 @@ export async function POST(request: Request) {
         )
       ).data)
     ));
+    const actionsDepthResult = await collectOptionalEvidence(() => (
+      collectEnterpriseActionsEvidence({
+        getSelectedActions: () => requestWithStatus(() => octokit.request(
+          'GET /enterprises/{enterprise}/actions/permissions/selected-actions',
+          {
+            enterprise: environment.enterprise_slug,
+            headers: { 'X-GitHub-Api-Version': '2026-03-10' },
+          }
+        )),
+        getWorkflowPermissions: () => requestWithStatus(() => octokit.request(
+          'GET /enterprises/{enterprise}/actions/permissions/workflow',
+          {
+            enterprise: environment.enterprise_slug,
+            headers: { 'X-GitHub-Api-Version': '2026-03-10' },
+          }
+        )),
+        getForkPullRequestPolicy: () => requestWithStatus(() => octokit.request(
+          'GET /enterprises/{enterprise}/actions/permissions/fork-pr-workflows-private-repos',
+          {
+            enterprise: environment.enterprise_slug,
+            headers: { 'X-GitHub-Api-Version': '2026-03-10' },
+          }
+        )),
+        getSelfHostedRunnerPolicy: () => requestWithStatus(() => octokit.request(
+          'GET /enterprises/{enterprise}/actions/permissions/self-hosted-runners',
+          {
+            enterprise: environment.enterprise_slug,
+            headers: { 'X-GitHub-Api-Version': '2026-03-10' },
+          }
+        )),
+        getRunnerGroups: (page, perPage) => requestWithStatus(() => octokit.request(
+          'GET /enterprises/{enterprise}/actions/runner-groups',
+          {
+            enterprise: environment.enterprise_slug,
+            page,
+            per_page: perPage,
+            headers: { 'X-GitHub-Api-Version': '2026-03-10' },
+          }
+        )),
+        getRunners: (page, perPage) => requestWithStatus(() => octokit.request(
+          'GET /enterprises/{enterprise}/actions/runners',
+          {
+            enterprise: environment.enterprise_slug,
+            page,
+            per_page: perPage,
+            headers: { 'X-GitHub-Api-Version': '2026-03-10' },
+          }
+        )),
+      }, actionsResult.value?.allowedActions ?? null)
+    ));
     const copilotResult = await collectOptionalEvidence(() => (
       collectEnterpriseCopilotSeats(async (page, perPage) => (
         await octokit.request(
@@ -202,6 +254,7 @@ export async function POST(request: Request) {
       securityDefaults: securityResult.value,
       repositorySecurity: repositorySecurityResult.items,
       actionsPolicy: actionsResult.value,
+      actionsEvidence: actionsDepthResult.value,
       copilotSeats: copilotResult.value,
       budgets: billingResult.value,
     });
@@ -234,6 +287,11 @@ export async function POST(request: Request) {
         durationMs: actionsResult.durationMs,
         error: actionsResult.error,
       },
+      actionsDepthCollector: {
+        id: actionsDepthCollectorId,
+        durationMs: actionsDepthResult.durationMs,
+        error: actionsDepthResult.error,
+      },
       copilotCollector: {
         id: copilotCollectorId,
         durationMs: copilotResult.durationMs,
@@ -248,6 +306,7 @@ export async function POST(request: Request) {
       repositorySecurity: repositorySecurityResult.items,
       repositorySecurityFailures: repositorySecurityResult.failures,
       actionsPolicy: actionsResult.value,
+      actionsEvidence: actionsDepthResult.value,
       copilotSeats: copilotResult.value,
       budgets: billingResult.value,
       evaluation,

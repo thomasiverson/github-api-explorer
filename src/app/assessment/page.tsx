@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { TopBar } from '@/components/TopBar';
 import { useApp } from '@/components/AppContext';
+import type { AssessmentActionsEvidence } from '@/lib/assessment';
 
 const INVENTORY_METRICS = [
   { key: 'organizations', label: 'Organizations', description: 'Enterprise organizations' },
@@ -18,7 +19,7 @@ const ASSESSMENT_DOMAINS = [
   { key: 'identity', name: 'Identity & access', detail: 'Members and enterprise owner resilience' },
   { key: 'repositories', name: 'Repository governance', detail: 'Visibility, archival state, and repository activity' },
   { key: 'security', name: 'Security posture', detail: 'Secret scanning, code scanning, Dependabot, security configurations' },
-  { key: 'actions', name: 'Actions & runners', detail: 'Allowed action sources and commit SHA pinning' },
+  { key: 'actions', name: 'Actions & runners', detail: 'Workflow permissions, fork trust, runner groups, and runner health' },
   { key: 'copilot', name: 'Copilot', detail: 'Billed seats and recent activity' },
   { key: 'billing', name: 'Billing & licensing', detail: 'Budget coverage, enforcement, and alerting' },
 ] as const;
@@ -61,6 +62,7 @@ interface AssessmentSnapshot {
   metrics: Record<string, number>;
   collectors: AssessmentCollectorResult[];
   repositorySecurity: AssessmentRepositorySecurity[];
+  actionsEvidence: AssessmentActionsEvidence | null;
   findings: AssessmentFinding[];
 }
 
@@ -144,12 +146,21 @@ export default function AssessmentPage() {
     collector => collector.collector_key === 'repositorySecurity'
   );
   const actionsCollector = snapshot?.collectors.find(collector => collector.collector_key === 'actions');
+  const actionsDepthCollector = snapshot?.collectors.find(
+    collector => collector.collector_key === 'actionsDepth'
+  );
   const copilotCollector = snapshot?.collectors.find(collector => collector.collector_key === 'copilot');
   const billingCollector = snapshot?.collectors.find(collector => collector.collector_key === 'billing');
   const repositorySecurity = snapshot?.repositorySecurity || [];
   const eligibleRepositorySecurity = repositorySecurity.filter(
     repository => !repository.isArchived && !repository.isFork
   );
+  const actionsEvidence = snapshot?.actionsEvidence;
+  const runnersByGroup = new Map<number, number>();
+  for (const runner of actionsEvidence?.runners ?? []) {
+    if (runner.runnerGroupId === null) continue;
+    runnersByGroup.set(runner.runnerGroupId, (runnersByGroup.get(runner.runnerGroupId) ?? 0) + 1);
+  }
   const domainStatuses: Record<AssessmentDomainKey, string> = {
     identity: baselineEvaluated ? 'Baseline' : 'Not assessed',
     repositories: baselineEvaluated
@@ -163,7 +174,11 @@ export default function AssessmentPage() {
           : securityCollector?.status === 'completed' ? 'Baseline' : 'Unavailable'
       : 'Not assessed',
     actions: baselineEvaluated
-      ? actionsCollector?.status === 'completed' ? 'Baseline' : 'Unavailable'
+      ? actionsDepthCollector?.status === 'completed'
+        ? 'Runner depth'
+        : actionsDepthCollector?.status === 'partial'
+          ? 'Partial runner depth'
+          : actionsCollector?.status === 'completed' ? 'Baseline' : 'Unavailable'
       : 'Not assessed',
     copilot: baselineEvaluated
       ? copilotCollector?.status === 'completed' ? 'Baseline' : 'Unavailable'
@@ -244,7 +259,9 @@ export default function AssessmentPage() {
                     const failures = splitCollectorFailures(collector.error);
                     const failureSubject = collector.collector_key === 'repositorySecurity'
                       ? `${failures.length} incomplete repository ${failures.length === 1 ? 'check' : 'checks'}`
-                      : `${failures.length} inaccessible ${failures.length === 1 ? 'organization' : 'organizations'}`;
+                      : collector.collector_key === 'actionsDepth'
+                        ? `${failures.length} incomplete Actions ${failures.length === 1 ? 'check' : 'checks'}`
+                        : `${failures.length} inaccessible ${failures.length === 1 ? 'organization' : 'organizations'}`;
                     return (
                       <div key={collector.collector_key}>
                         <p className="text-xs font-medium text-text-primary capitalize">
@@ -461,6 +478,185 @@ export default function AssessmentPage() {
             )}
           </section>
 
+          <section aria-labelledby="actions-trust-heading" className="border border-border bg-panel rounded-lg overflow-hidden">
+            <div className="px-4 py-3 border-b border-border flex flex-col gap-2 md:flex-row md:items-end md:justify-between">
+              <div>
+                <h2 id="actions-trust-heading" className="text-sm font-semibold text-text-primary">
+                  Actions trust boundaries
+                </h2>
+                <p className="text-xs text-text-muted mt-0.5">
+                  Enterprise workflow privileges and the self-hosted compute they can reach.
+                </p>
+              </div>
+              <span className="text-xs text-text-muted">
+                {actionsEvidence
+                  ? `${actionsEvidence.runners?.length ?? '--'} self-hosted runners`
+                  : 'Awaiting assessment'}
+              </span>
+            </div>
+            <div className="grid sm:grid-cols-2 lg:grid-cols-5 divide-y sm:divide-y-0 sm:divide-x divide-border">
+              <ActionsPolicySignal
+                label="Default workflow token"
+                value={actionsEvidence?.workflowPermissions
+                  ? actionsEvidence.workflowPermissions.defaultWorkflowPermissions === 'read'
+                    ? '✔ Read-only'
+                    : 'Write access'
+                  : null}
+                safe={actionsEvidence?.workflowPermissions?.defaultWorkflowPermissions === 'read'}
+              />
+              <ActionsPolicySignal
+                label="Workflow PR approvals"
+                value={actionsEvidence?.workflowPermissions
+                  ? actionsEvidence.workflowPermissions.canApprovePullRequestReviews
+                    ? 'Allowed'
+                    : '✔ Blocked'
+                  : null}
+                safe={actionsEvidence?.workflowPermissions
+                  ? !actionsEvidence.workflowPermissions.canApprovePullRequestReviews
+                  : undefined}
+              />
+              <ActionsPolicySignal
+                label="Private fork workflows"
+                value={formatForkWorkflowPolicy(actionsEvidence)}
+                safe={actionsEvidence?.forkPullRequestPolicy
+                  ? !actionsEvidence.forkPullRequestPolicy.runWorkflowsFromForkPullRequests
+                    || actionsEvidence.forkPullRequestPolicy.requireApprovalForForkPullRequestWorkflows
+                  : undefined}
+              />
+              <ActionsPolicySignal
+                label="Organization runner access"
+                value={actionsEvidence?.selfHostedRunnerPolicy
+                  ? actionsEvidence.selfHostedRunnerPolicy.disabledForAllOrganizations
+                    ? '✔ Disabled'
+                    : 'Allowed'
+                  : null}
+                safe={actionsEvidence?.selfHostedRunnerPolicy?.disabledForAllOrganizations}
+              />
+              <ActionsPolicySignal
+                label="Persistent runner health"
+                value={snapshot?.metrics.offlineSelfHostedRunnerCount === undefined
+                  ? null
+                  : snapshot.metrics.offlineSelfHostedRunnerCount === 0
+                    ? '✔ No offline runners'
+                    : `${snapshot.metrics.offlineSelfHostedRunnerCount} offline`}
+                safe={snapshot?.metrics.offlineSelfHostedRunnerCount === undefined
+                  ? undefined
+                  : snapshot.metrics.offlineSelfHostedRunnerCount === 0}
+              />
+            </div>
+            {actionsEvidence ? (
+              <details className="border-t border-border">
+                <summary className="px-4 py-3 text-xs font-medium text-accent cursor-pointer">
+                  Review runner groups and inventory
+                </summary>
+                <div className="border-t border-border">
+                  {actionsEvidence.runnerGroups === null ? (
+                    <p className="px-4 py-4 text-xs text-text-muted">
+                      Runner group evidence was not available to this credential.
+                    </p>
+                  ) : actionsEvidence.runnerGroups.length === 0 ? (
+                    <p className="px-4 py-4 text-xs text-text-muted">
+                      No enterprise runner groups were returned.
+                    </p>
+                  ) : (
+                    <div className="overflow-x-auto">
+                      <table className="w-full min-w-[760px] text-left">
+                        <thead className="bg-surface">
+                          <tr className="text-[10px] uppercase tracking-wide text-text-muted">
+                            <th className="px-4 py-2 font-medium">Runner group</th>
+                            <th className="px-3 py-2 font-medium">Organization access</th>
+                            <th className="px-3 py-2 font-medium">Public repositories</th>
+                            <th className="px-3 py-2 font-medium">Workflow access</th>
+                            <th className="px-3 py-2 font-medium">Runners</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-border">
+                          {actionsEvidence.runnerGroups.map(group => (
+                            <tr key={group.githubId} className="text-xs">
+                              <td className="px-4 py-2.5 text-text-primary">
+                                {group.name}
+                                {group.isDefault && (
+                                  <span className="ml-2 text-[10px] text-text-muted">(Default)</span>
+                                )}
+                              </td>
+                              <td className="px-3 py-2.5 text-text-secondary">{formatRunnerGroupVisibility(group.visibility)}</td>
+                              <td className="px-3 py-2.5">
+                                {group.allowsPublicRepositories
+                                  ? <span className="font-medium text-warning">Allowed</span>
+                                  : <span className="font-medium text-success">✔ Blocked</span>}
+                              </td>
+                              <td className="px-3 py-2.5 text-text-secondary">
+                                {group.restrictedToWorkflows === null
+                                  ? '? Not reported'
+                                  : group.restrictedToWorkflows
+                                    ? group.selectedWorkflows === null
+                                      ? 'Selected workflows'
+                                      : `${group.selectedWorkflows.length} selected`
+                                    : 'All workflows'}
+                              </td>
+                              <td className="px-3 py-2.5 font-mono text-text-primary">
+                                {actionsEvidence.runners === null
+                                  ? '?'
+                                  : runnersByGroup.get(group.githubId) ?? 0}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                  {actionsEvidence.runners === null ? (
+                    <p className="border-t border-border px-4 py-4 text-xs text-text-muted">
+                      Self-hosted runner inventory was not available to this credential.
+                    </p>
+                  ) : actionsEvidence.runners.length > 0 ? (
+                    <div className="overflow-x-auto border-t border-border">
+                      <table className="w-full min-w-[760px] text-left">
+                        <caption className="text-left px-4 py-3 text-xs font-medium text-text-primary bg-surface">
+                          Self-hosted runner inventory
+                        </caption>
+                        <thead className="bg-surface">
+                          <tr className="text-[10px] uppercase tracking-wide text-text-muted">
+                            <th className="px-4 py-2 font-medium">Runner</th>
+                            <th className="px-3 py-2 font-medium">Operating system</th>
+                            <th className="px-3 py-2 font-medium">Status</th>
+                            <th className="px-3 py-2 font-medium">Workload</th>
+                            <th className="px-3 py-2 font-medium">Labels</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-border">
+                          {actionsEvidence.runners.map(runner => (
+                            <tr key={runner.githubId} className="text-xs">
+                              <td className="px-4 py-2.5 font-mono text-text-primary">{runner.name}</td>
+                              <td className="px-3 py-2.5 text-text-secondary">{runner.os}</td>
+                              <td className="px-3 py-2.5">
+                                {runner.status === 'online'
+                                  ? <span className="font-medium text-success">✔ Online</span>
+                                  : <span className="font-medium text-warning">— {runner.status}</span>}
+                              </td>
+                              <td className="px-3 py-2.5 text-text-secondary">
+                                {runner.busy ? 'Busy' : 'Idle'}{runner.ephemeral ? ' · Ephemeral' : ''}
+                              </td>
+                              <td className="px-3 py-2.5 text-text-muted">{runner.labels.join(', ') || 'None'}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  ) : (
+                    <p className="border-t border-border px-4 py-4 text-xs text-text-muted">
+                      No self-hosted runners are registered at the enterprise level.
+                    </p>
+                  )}
+                </div>
+              </details>
+            ) : (
+              <p className="border-t border-border px-4 py-4 text-xs text-text-muted">
+                Run the assessment to collect workflow and runner evidence.
+              </p>
+            )}
+          </section>
+
           <section aria-labelledby="domains-heading" className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_360px]">
             <div className="border border-border bg-panel rounded-lg overflow-hidden">
               <div className="px-4 py-3 border-b border-border">
@@ -534,6 +730,43 @@ export default function AssessmentPage() {
       </main>
     </div>
   );
+}
+
+function ActionsPolicySignal({
+  label,
+  value,
+  safe,
+}: {
+  label: string;
+  value: string | null;
+  safe: boolean | undefined;
+}) {
+  const valueClass = safe === undefined
+    ? 'text-text-muted'
+    : safe ? 'text-success' : 'text-warning';
+  return (
+    <div className="px-4 py-3 min-w-0">
+      <p className="text-[11px] text-text-muted">{label}</p>
+      <p className={`text-sm font-medium mt-1 ${valueClass}`}>{value ?? '? Not collected'}</p>
+    </div>
+  );
+}
+
+function formatForkWorkflowPolicy(
+  evidence: AssessmentActionsEvidence | null | undefined
+): string | null {
+  const policy = evidence?.forkPullRequestPolicy;
+  if (!policy) return null;
+  if (!policy.runWorkflowsFromForkPullRequests) return '✔ Blocked';
+  if (policy.requireApprovalForForkPullRequestWorkflows) return '✔ Approval required';
+  return 'Runs automatically';
+}
+
+function formatRunnerGroupVisibility(visibility: string): string {
+  if (visibility === 'all') return 'All organizations';
+  if (visibility === 'selected') return 'Selected organizations';
+  if (visibility === 'private') return 'Private repositories';
+  return visibility;
 }
 
 function StatusRow({ label, value }: { label: string; value: string }) {
