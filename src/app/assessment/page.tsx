@@ -166,6 +166,7 @@ export default function AssessmentPage() {
   const [executionMessage, setExecutionMessage] = useState<string | null>(null);
   const [selectedPacingProfile, setSelectedPacingProfile] =
     useState<AssessmentPacingProfile | null>(null);
+  const [assessmentControlsExpanded, setAssessmentControlsExpanded] = useState(false);
   const [pageError, setPageError] = useState<string | null>(null);
   const [comparisonError, setComparisonError] = useState<string | null>(null);
   const [readinessError, setReadinessError] = useState<string | null>(null);
@@ -205,6 +206,13 @@ export default function AssessmentPage() {
       setSnapshot(latest);
       setRunHistory(history);
       setActiveRun(activeData as ActiveAssessmentRun | null);
+      const controlsPreference = window.localStorage.getItem(
+        `assessment-controls:${environmentId}`
+      );
+      setAssessmentControlsExpanded(
+        controlsPreference === 'expanded'
+          || (controlsPreference === null && latest === null)
+      );
       const preferredRunExists = history.some(
         run => run.id === preferredComparisonRunId && run.id !== latest?.id
       );
@@ -219,6 +227,10 @@ export default function AssessmentPage() {
       setIsLoading(false);
     }
   }, []);
+
+  useEffect(() => {
+    if (pageError || readinessError) setAssessmentControlsExpanded(true);
+  }, [pageError, readinessError]);
 
   const loadAssessmentReadiness = useCallback(async (environmentId: string) => {
     setIsLoadingReadiness(true);
@@ -251,6 +263,7 @@ export default function AssessmentPage() {
       setReadinessError(null);
       setComparisonRunId('');
       setComparisonSnapshot(null);
+      setAssessmentControlsExpanded(false);
       setSelectedPacingProfile(null);
       return;
     }
@@ -349,6 +362,11 @@ export default function AssessmentPage() {
     setIsRunning(true);
     setPageError(null);
     setExecutionMessage(null);
+    setAssessmentControlsExpanded(false);
+    window.localStorage.setItem(
+      `assessment-controls:${activeEnv.id}`,
+      'collapsed'
+    );
     try {
       const response = await fetch('/api/assessment/runs', {
         method: 'POST',
@@ -381,6 +399,18 @@ export default function AssessmentPage() {
     } finally {
       setIsRunning(false);
     }
+  }
+
+  function toggleAssessmentControls() {
+    if (!activeEnv) return;
+    setAssessmentControlsExpanded(current => {
+      const next = !current;
+      window.localStorage.setItem(
+        `assessment-controls:${activeEnv.id}`,
+        next ? 'expanded' : 'collapsed'
+      );
+      return next;
+    });
   }
 
   async function controlAssessment(action: 'pause' | 'cancel') {
@@ -632,6 +662,34 @@ export default function AssessmentPage() {
       readiness.graphqlRateLimit.remaining - readiness.graphqlRateLimit.reserve
     )
     : null;
+  const projectedRestCapacityPercent = readiness?.estimatedRestRequests !== null
+    && readiness?.estimatedRestRequests !== undefined
+    && currentRestCapacity !== null
+    && currentRestCapacity > 0
+    ? Math.min(
+        100,
+        Math.round((readiness.estimatedRestRequests / currentRestCapacity) * 100)
+      )
+    : null;
+  const assessmentControlsSummary = assessmentIsRunning
+    ? activeRun?.currentCheckpoint && activeRun.currentCollector
+      ? `${formatCollectorKey(activeRun.currentCollector)} · ${formatCheckpointProgress(activeRun.currentCheckpoint)}`
+      : `${effectivePacingLabel} pacing · ${requestTotal.toLocaleString()} requests sent`
+    : `${effectivePacingLabel} · ${
+        readiness?.estimatedTotalRequests === null
+          || readiness?.estimatedTotalRequests === undefined
+          ? 'calibration needed'
+          : `~${readiness.estimatedTotalRequests.toLocaleString()} requests`
+      } · ${formatEstimatedDuration(selectedEstimatedDurationMs)}`;
+  const assessmentControlsGuidance = readinessError
+    ? '✘ Readiness unavailable'
+    : isLoadingReadiness
+      ? 'Checking GitHub allowance...'
+      : readiness?.currentWindowFits === false
+        ? '! A rate-limit reset pause may be required'
+        : readiness?.currentWindowFits === true
+          ? `✔ Fits current window · ${currentRestCapacity?.toLocaleString() ?? '--'} REST available`
+          : 'Allowance has not been confirmed';
   const budgetById = new Map((budgets ?? []).map(budget => [budget.id, budget]));
   const budgetStateCountById = new Map<string, number>();
   for (const state of billingEvidence?.multiUserBudgetStates ?? []) {
@@ -755,54 +813,6 @@ export default function AssessmentPage() {
                 A measured view of governance, security, access, automation, and platform adoption.
               </p>
             </div>
-            <div className="flex flex-wrap items-center gap-2">
-              {activeRun && !assessmentCanResume && !assessmentIsCancelling && (
-                <button
-                  type="button"
-                  onClick={() => void controlAssessment('pause')}
-                  disabled={
-                    executionAction !== null
-                    || assessmentIsPausing
-                    || activeRun.controlState !== 'running'
-                  }
-                  className="px-3 py-2 border border-border bg-surface text-text-primary text-sm font-medium rounded-md hover:bg-panel disabled:opacity-50 disabled:cursor-not-allowed"
-                >
-                  {assessmentIsPausing || executionAction === 'pause'
-                    ? 'Pausing...'
-                    : 'Pause safely'}
-                </button>
-              )}
-              {activeRun && (
-                <button
-                  type="button"
-                  onClick={() => void controlAssessment('cancel')}
-                  disabled={executionAction !== null || assessmentIsCancelling}
-                  className="px-3 py-2 border border-warning/60 text-warning text-sm font-medium rounded-md hover:bg-warning/10 disabled:opacity-50 disabled:cursor-not-allowed"
-                >
-                  {assessmentIsCancelling || executionAction === 'cancel'
-                    ? 'Cancelling...'
-                    : 'Cancel run'}
-                </button>
-              )}
-              <button
-                type="button"
-                onClick={() => void runAssessment(assessmentCanResume ? activeRun : null)}
-                disabled={!activeEnv || assessmentIsRunning}
-                className="px-4 py-2 bg-accent-emphasis text-white text-sm font-medium rounded-md hover:opacity-90 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
-              >
-                {assessmentIsRunning && (
-                  <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24" aria-hidden="true">
-                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
-                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-                  </svg>
-                )}
-                {assessmentIsRunning
-                  ? 'Collecting evidence...'
-                  : assessmentCanResume
-                    ? `Resume · ${effectivePacingLabel}`
-                    : `${snapshot ? 'Run again' : 'Run assessment'} · ${effectivePacingLabel}`}
-              </button>
-            </div>
           </header>
 
           {assessmentCanResume && activeRun && (
@@ -842,30 +852,134 @@ export default function AssessmentPage() {
 
           {activeEnv && (
             <section
-              aria-labelledby="assessment-readiness-heading"
+              aria-labelledby="assessment-controls-heading"
               className="border border-border bg-panel rounded-lg overflow-hidden"
             >
-              <div className="px-4 py-3 border-b border-border flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-                <div>
-                  <h2 id="assessment-readiness-heading" className="text-sm font-semibold text-text-primary">
-                    Assessment readiness
-                  </h2>
-                  <p className="text-xs text-text-muted mt-0.5">
-                    Projected API demand compared with GitHub&apos;s currently available allowance.
-                  </p>
-                </div>
-                {isLoadingReadiness ? (
-                  <span className="text-xs text-text-muted" role="status">Checking allowance...</span>
-                ) : readinessError ? (
-                  <span className="text-xs font-medium text-danger">✘ Readiness unavailable</span>
-                ) : readinessLabel ? (
-                  <span className={`text-xs font-medium ${readinessProfile === 'immediate' ? 'text-success' : 'text-warning'}`}>
-                    {readinessProfile === 'immediate' ? '✔' : '!'} {readinessLabel} recommended
+              <div className="flex flex-col gap-3 px-4 py-3 sm:flex-row sm:items-center">
+                <button
+                  type="button"
+                  onClick={toggleAssessmentControls}
+                  aria-expanded={assessmentControlsExpanded}
+                  aria-controls="assessment-controls-detail"
+                  className="min-w-0 flex-1 text-left rounded-md focus:outline-none focus:ring-1 focus:ring-accent"
+                >
+                  <span className="flex items-center gap-2">
+                    <svg
+                      className={`h-4 w-4 shrink-0 text-text-muted transition-transform ${assessmentControlsExpanded ? 'rotate-90' : ''}`}
+                      viewBox="0 0 20 20"
+                      fill="currentColor"
+                      aria-hidden="true"
+                    >
+                      <path d="M7 5l6 5-6 5V5z" />
+                    </svg>
+                    <span id="assessment-controls-heading" className="text-sm font-semibold text-text-primary">
+                      Assessment controls
+                    </span>
+                    <span className="text-[10px] font-medium uppercase tracking-wide text-text-muted">
+                      {assessmentControlsExpanded ? 'Hide details' : 'Show details'}
+                    </span>
                   </span>
-                ) : (
-                  <span className="text-xs font-medium text-warning">! Calibration needed</span>
-                )}
+                  <span className="mt-1 block pl-6 text-xs text-text-secondary">
+                    {assessmentControlsSummary}
+                  </span>
+                  <span className={`mt-0.5 block pl-6 text-[11px] ${
+                    readinessError
+                      ? 'text-danger'
+                      : readiness?.currentWindowFits === false
+                        ? 'text-warning'
+                        : 'text-text-muted'
+                  }`}>
+                    {assessmentControlsGuidance}
+                  </span>
+                  {projectedRestCapacityPercent !== null && (
+                    <span className="mt-2 block pl-6">
+                      <span
+                        className="block h-1 overflow-hidden rounded-full bg-surface"
+                        role="img"
+                        aria-label={`Projected REST demand uses ${projectedRestCapacityPercent}% of currently usable capacity`}
+                      >
+                        <span
+                          className="block h-full rounded-full bg-accent-emphasis"
+                          style={{ width: `${Math.max(2, projectedRestCapacityPercent)}%` }}
+                        />
+                      </span>
+                    </span>
+                  )}
+                </button>
+                <div className="flex flex-wrap items-center gap-2 pl-6 sm:pl-0">
+                  {activeRun && !assessmentCanResume && !assessmentIsCancelling && (
+                    <button
+                      type="button"
+                      onClick={() => void controlAssessment('pause')}
+                      disabled={
+                        executionAction !== null
+                        || assessmentIsPausing
+                        || activeRun.controlState !== 'running'
+                      }
+                      className="px-3 py-1.5 border border-border bg-surface text-text-primary text-sm font-medium rounded-md hover:bg-canvas disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      {assessmentIsPausing || executionAction === 'pause'
+                        ? 'Pausing...'
+                        : 'Pause safely'}
+                    </button>
+                  )}
+                  {activeRun && (
+                    <button
+                      type="button"
+                      onClick={() => void controlAssessment('cancel')}
+                      disabled={executionAction !== null || assessmentIsCancelling}
+                      className="px-3 py-1.5 border border-warning/60 text-warning text-sm font-medium rounded-md hover:bg-warning/10 disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      {assessmentIsCancelling || executionAction === 'cancel'
+                        ? 'Cancelling...'
+                        : 'Cancel run'}
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => void runAssessment(assessmentCanResume ? activeRun : null)}
+                    disabled={assessmentIsRunning}
+                    className="px-4 py-1.5 bg-accent-emphasis text-white text-sm font-medium rounded-md hover:opacity-90 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
+                  >
+                    {assessmentIsRunning && (
+                      <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24" aria-hidden="true">
+                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
+                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                      </svg>
+                    )}
+                    {assessmentIsRunning
+                      ? 'Collecting...'
+                      : assessmentCanResume
+                        ? `Resume · ${effectivePacingLabel}`
+                        : `${snapshot ? 'Run again' : 'Run assessment'} · ${effectivePacingLabel}`}
+                  </button>
+                </div>
               </div>
+
+              {assessmentControlsExpanded && (
+                <div id="assessment-controls-detail" className="border-t border-border">
+                  <section aria-labelledby="assessment-readiness-heading">
+                    <div className="px-4 py-3 border-b border-border flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                      <div>
+                        <h3 id="assessment-readiness-heading" className="text-sm font-semibold text-text-primary">
+                          Assessment readiness
+                        </h3>
+                        <p className="text-xs text-text-muted mt-0.5">
+                          Projected API demand compared with GitHub&apos;s currently available allowance.
+                        </p>
+                      </div>
+                      {isLoadingReadiness ? (
+                        <span className="text-xs text-text-muted" role="status">Checking allowance...</span>
+                      ) : readinessError ? (
+                        <span className="text-xs font-medium text-danger">✘ Readiness unavailable</span>
+                      ) : readinessLabel ? (
+                        <span className={`text-xs font-medium ${readinessProfile === 'immediate' ? 'text-success' : 'text-warning'}`}>
+                          {readinessProfile === 'immediate' ? '✔' : '!'} {readinessLabel} recommended
+                        </span>
+                      ) : (
+                        <span className="text-xs font-medium text-warning">! Calibration needed</span>
+                      )}
+                    </div>
 
               {readinessError ? (
                 <div className="px-4 py-4" role="alert">
@@ -967,6 +1081,65 @@ export default function AssessmentPage() {
                   </div>
                 </>
               )}
+                  </section>
+
+                  {(assessmentHasActiveRun || requestTotal > 0) && (
+                    <section
+                      aria-labelledby="api-usage-heading"
+                      aria-live={assessmentHasActiveRun ? 'polite' : 'off'}
+                      className="border-t border-border"
+                    >
+                      <div className="px-4 py-3 border-b border-border flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
+                        <div>
+                          <h3 id="api-usage-heading" className="text-sm font-semibold text-text-primary">
+                            API request ledger
+                          </h3>
+                          <p className="text-xs text-text-muted mt-0.5">
+                            Every assessment request passes through the rate-limit safety governor.
+                          </p>
+                        </div>
+                        <span className={`text-xs font-medium ${assessmentHasActiveRun ? 'text-warning' : 'text-success'}`}>
+                          {assessmentCanResume
+                            ? assessmentIsPaused
+                              ? '|| Paused · checkpoint saved'
+                              : '! Interrupted · checkpoint saved'
+                            : assessmentIsRunning
+                              ? activeRun?.currentCheckpoint && activeRun.currentCollector
+                                ? `Running · ${formatCollectorKey(activeRun.currentCollector)} ${formatCheckpointProgress(activeRun.currentCheckpoint)}`
+                                : 'Running · safeguards active'
+                              : '✔ Request accounting complete'}
+                        </span>
+                      </div>
+                      <div className="grid sm:grid-cols-2 xl:grid-cols-4 divide-y sm:divide-y-0 sm:divide-x divide-border">
+                        <div className="px-4 py-3">
+                          <p className="text-[10px] uppercase tracking-wide text-text-muted">Outbound requests</p>
+                          <p className="text-xl font-semibold tabular-nums text-text-primary mt-1">{requestTotal}</p>
+                          <p className="text-[11px] text-text-secondary mt-0.5">
+                            REST {apiUsage?.restRequests ?? 0} · GraphQL {apiUsage?.graphqlRequests ?? 0}
+                          </p>
+                        </div>
+                        <RateLimitSignal label="REST allowance" rateLimit={restRateLimit} />
+                        <RateLimitSignal label="GraphQL allowance" rateLimit={graphqlRateLimit} />
+                        <div className="px-4 py-3">
+                          <p className="text-[10px] uppercase tracking-wide text-text-muted">Throttle protection</p>
+                          <p className={`text-sm font-semibold mt-1 ${(apiUsage?.throttleCount ?? 0) > 0 ? 'text-warning' : 'text-text-primary'}`}>
+                            {(apiUsage?.throttleCount ?? 0) > 0
+                              ? `${apiUsage?.throttleCount} ${apiUsage?.throttleCount === 1 ? 'wait' : 'waits'} enforced`
+                              : 'No waits required'}
+                          </p>
+                          <p className="text-[11px] text-text-secondary mt-1">
+                            {apiUsage?.retryCount ?? 0} retries
+                            {' · '}
+                            {formatElapsedTime(apiUsage?.throttleWaitMs ?? 0)} GitHub-limit wait
+                            {' · '}
+                            {formatElapsedTime(apiUsage?.pacingWaitMs ?? 0)} intentional pacing
+                          </p>
+                        </div>
+                      </div>
+                    </section>
+                  )}
+                </div>
+              )}
             </section>
           )}
 
@@ -1026,62 +1199,6 @@ export default function AssessmentPage() {
                 </div>
               </details>
             </div>
-          )}
-
-          {(assessmentHasActiveRun || requestTotal > 0) && (
-            <section
-              aria-labelledby="api-usage-heading"
-              aria-live={assessmentHasActiveRun ? 'polite' : 'off'}
-              className="border border-border bg-panel rounded-lg overflow-hidden"
-            >
-              <div className="px-4 py-3 border-b border-border flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
-                <div>
-                  <h2 id="api-usage-heading" className="text-sm font-semibold text-text-primary">
-                    API request ledger
-                  </h2>
-                  <p className="text-xs text-text-muted mt-0.5">
-                    Every assessment request passes through the rate-limit safety governor.
-                  </p>
-                </div>
-                <span className={`text-xs font-medium ${assessmentHasActiveRun ? 'text-warning' : 'text-success'}`}>
-                  {assessmentCanResume
-                    ? assessmentIsPaused
-                      ? '|| Paused · checkpoint saved'
-                      : '! Interrupted · checkpoint saved'
-                    : assessmentIsRunning
-                      ? activeRun?.currentCheckpoint && activeRun.currentCollector
-                        ? `Running · ${formatCollectorKey(activeRun.currentCollector)} ${formatCheckpointProgress(activeRun.currentCheckpoint)}`
-                        : 'Running · safeguards active'
-                      : '✔ Request accounting complete'}
-                </span>
-              </div>
-              <div className="grid sm:grid-cols-2 xl:grid-cols-4 divide-y sm:divide-y-0 sm:divide-x divide-border">
-                <div className="px-4 py-3">
-                  <p className="text-[10px] uppercase tracking-wide text-text-muted">Outbound requests</p>
-                  <p className="text-xl font-semibold tabular-nums text-text-primary mt-1">{requestTotal}</p>
-                  <p className="text-[11px] text-text-secondary mt-0.5">
-                    REST {apiUsage?.restRequests ?? 0} · GraphQL {apiUsage?.graphqlRequests ?? 0}
-                  </p>
-                </div>
-                <RateLimitSignal label="REST allowance" rateLimit={restRateLimit} />
-                <RateLimitSignal label="GraphQL allowance" rateLimit={graphqlRateLimit} />
-                <div className="px-4 py-3">
-                  <p className="text-[10px] uppercase tracking-wide text-text-muted">Throttle protection</p>
-                  <p className={`text-sm font-semibold mt-1 ${(apiUsage?.throttleCount ?? 0) > 0 ? 'text-warning' : 'text-text-primary'}`}>
-                    {(apiUsage?.throttleCount ?? 0) > 0
-                      ? `${apiUsage?.throttleCount} ${apiUsage?.throttleCount === 1 ? 'wait' : 'waits'} enforced`
-                      : 'No waits required'}
-                  </p>
-                  <p className="text-[11px] text-text-secondary mt-1">
-                    {apiUsage?.retryCount ?? 0} retries
-                    {' · '}
-                    {formatElapsedTime(apiUsage?.throttleWaitMs ?? 0)} GitHub-limit wait
-                    {' · '}
-                    {formatElapsedTime(apiUsage?.pacingWaitMs ?? 0)} intentional pacing
-                  </p>
-                </div>
-              </div>
-            </section>
           )}
 
           <section aria-labelledby="posture-heading" className="grid gap-4 lg:grid-cols-[minmax(0,1.35fr)_minmax(280px,0.65fr)]">
