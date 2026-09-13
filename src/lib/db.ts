@@ -3,7 +3,11 @@ import path from 'path';
 import crypto from 'crypto';
 import fs from 'fs';
 import type { ImportedEndpoint } from './openapi-import';
-import { calculateAssessmentScores, getAssessmentFindingEvidence } from './assessment';
+import {
+  calculateAssessmentScores,
+  getAssessmentFindingEvidence,
+  getAssessmentFindingRemediation,
+} from './assessment';
 import type {
   AssessmentActionsEvidence,
   AssessmentActionsPolicy,
@@ -29,6 +33,15 @@ import type {
   AssessmentSeverity,
   AssessmentScimInventory,
 } from './assessment';
+import type {
+  AssessmentApiUsage,
+  AssessmentRateLimitBucket,
+} from './assessment-request-governor';
+import type { AssessmentPacingProfile } from './assessment-readiness';
+import {
+  AssessmentRunControlError,
+  type AssessmentRunControlState,
+} from './assessment-run-control';
 
 const DB_PATH = path.join(process.cwd(), 'data', 'harness.db');
 
@@ -160,11 +173,54 @@ function initSchema(db: Database.Database) {
       started_at TEXT NOT NULL DEFAULT (datetime('now')),
       completed_at TEXT,
       duration_ms INTEGER,
-      error TEXT
+      error TEXT,
+      protected_at TEXT
     );
 
     CREATE INDEX IF NOT EXISTS idx_assessment_runs_environment
       ON assessment_runs(environment_id, started_at DESC);
+
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_assessment_runs_one_running
+      ON assessment_runs(environment_id)
+      WHERE status = 'running';
+
+    CREATE TABLE IF NOT EXISTS assessment_api_usage (
+      run_id TEXT PRIMARY KEY REFERENCES assessment_runs(id) ON DELETE CASCADE,
+      rest_requests INTEGER NOT NULL DEFAULT 0,
+      graphql_requests INTEGER NOT NULL DEFAULT 0,
+      retry_count INTEGER NOT NULL DEFAULT 0,
+      throttle_count INTEGER NOT NULL DEFAULT 0,
+      throttle_wait_ms INTEGER NOT NULL DEFAULT 0,
+      pacing_wait_count INTEGER NOT NULL DEFAULT 0,
+      pacing_wait_ms INTEGER NOT NULL DEFAULT 0,
+      last_request_at TEXT,
+      rate_limits TEXT NOT NULL DEFAULT '{}',
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS assessment_run_state (
+      run_id TEXT PRIMARY KEY REFERENCES assessment_runs(id) ON DELETE CASCADE,
+      current_collector TEXT,
+      lease_owner TEXT,
+      lease_expires_at TEXT,
+      last_heartbeat_at TEXT NOT NULL DEFAULT (datetime('now')),
+      resume_count INTEGER NOT NULL DEFAULT 0,
+      pacing_profile TEXT NOT NULL DEFAULT 'immediate',
+      control_state TEXT NOT NULL DEFAULT 'running',
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS assessment_checkpoints (
+      run_id TEXT NOT NULL REFERENCES assessment_runs(id) ON DELETE CASCADE,
+      collector_key TEXT NOT NULL,
+      output_json TEXT NOT NULL,
+      duration_ms INTEGER NOT NULL DEFAULT 0,
+      cursor INTEGER NOT NULL DEFAULT 0,
+      total_items INTEGER NOT NULL DEFAULT 0,
+      is_complete INTEGER NOT NULL DEFAULT 1,
+      completed_at TEXT NOT NULL DEFAULT (datetime('now')),
+      PRIMARY KEY(run_id, collector_key)
+    );
 
     CREATE TABLE IF NOT EXISTS assessment_collector_results (
       id TEXT PRIMARY KEY,
@@ -632,6 +688,42 @@ function initSchema(db: Database.Database) {
   if (!findingColumns.some(column => column.name === 'evidence_sources')) {
     db.exec("ALTER TABLE assessment_findings ADD COLUMN evidence_sources TEXT NOT NULL DEFAULT '[]'");
   }
+  const assessmentRunColumns = db.prepare(
+    'PRAGMA table_info(assessment_runs)'
+  ).all() as Array<{ name: string }>;
+  if (!assessmentRunColumns.some(column => column.name === 'protected_at')) {
+    db.exec('ALTER TABLE assessment_runs ADD COLUMN protected_at TEXT');
+  }
+  const assessmentCheckpointColumns = db.prepare(
+    'PRAGMA table_info(assessment_checkpoints)'
+  ).all() as Array<{ name: string }>;
+  if (!assessmentCheckpointColumns.some(column => column.name === 'cursor')) {
+    db.exec('ALTER TABLE assessment_checkpoints ADD COLUMN cursor INTEGER NOT NULL DEFAULT 0');
+  }
+  if (!assessmentCheckpointColumns.some(column => column.name === 'is_complete')) {
+    db.exec('ALTER TABLE assessment_checkpoints ADD COLUMN is_complete INTEGER NOT NULL DEFAULT 1');
+  }
+  if (!assessmentCheckpointColumns.some(column => column.name === 'total_items')) {
+    db.exec('ALTER TABLE assessment_checkpoints ADD COLUMN total_items INTEGER NOT NULL DEFAULT 0');
+  }
+  const assessmentApiUsageColumns = db.prepare(
+    'PRAGMA table_info(assessment_api_usage)'
+  ).all() as Array<{ name: string }>;
+  if (!assessmentApiUsageColumns.some(column => column.name === 'pacing_wait_count')) {
+    db.exec('ALTER TABLE assessment_api_usage ADD COLUMN pacing_wait_count INTEGER NOT NULL DEFAULT 0');
+  }
+  if (!assessmentApiUsageColumns.some(column => column.name === 'pacing_wait_ms')) {
+    db.exec('ALTER TABLE assessment_api_usage ADD COLUMN pacing_wait_ms INTEGER NOT NULL DEFAULT 0');
+  }
+  const assessmentRunStateColumns = db.prepare(
+    'PRAGMA table_info(assessment_run_state)'
+  ).all() as Array<{ name: string }>;
+  if (!assessmentRunStateColumns.some(column => column.name === 'pacing_profile')) {
+    db.exec("ALTER TABLE assessment_run_state ADD COLUMN pacing_profile TEXT NOT NULL DEFAULT 'immediate'");
+  }
+  if (!assessmentRunStateColumns.some(column => column.name === 'control_state')) {
+    db.exec("ALTER TABLE assessment_run_state ADD COLUMN control_state TEXT NOT NULL DEFAULT 'running'");
+  }
 }
 
 // === Encryption Helpers ===
@@ -1072,13 +1164,414 @@ interface AssessmentRunRow {
   completed_at: string | null;
   duration_ms: number | null;
   error: string | null;
+  protected_at: string | null;
 }
 
-export function createAssessmentRun(id: string, environmentId: string) {
+interface AssessmentApiUsageRow {
+  rest_requests: number;
+  graphql_requests: number;
+  retry_count: number;
+  throttle_count: number;
+  throttle_wait_ms: number;
+  pacing_wait_count: number;
+  pacing_wait_ms: number;
+  last_request_at: string | null;
+  rate_limits: string;
+}
+
+interface AssessmentRunStateRow {
+  current_collector: string | null;
+  lease_owner: string | null;
+  lease_expires_at: string | null;
+  last_heartbeat_at: string;
+  resume_count: number;
+  pacing_profile: AssessmentPacingProfile;
+  control_state: AssessmentRunControlState;
+  lease_expired: number;
+  completed_checkpoint_count: number;
+  current_checkpoint_cursor: number | null;
+  current_checkpoint_total: number | null;
+  current_checkpoint_complete: number | null;
+}
+
+export interface AssessmentCheckpoint<T = unknown> {
+  collectorKey: string;
+  output: T;
+  durationMs: number;
+  cursor: number;
+  totalItems: number;
+  completed: boolean;
+  completedAt: string;
+}
+
+const ASSESSMENT_LEASE_SECONDS = 45;
+
+export function createAssessmentRun(
+  id: string,
+  environmentId: string,
+  leaseOwner: string | null = null,
+  pacingProfile: AssessmentPacingProfile = 'immediate'
+): boolean {
+  const db = getDb();
+  const create = db.transaction(() => {
+    const result = db.prepare(`
+      INSERT OR IGNORE INTO assessment_runs (id, environment_id, status)
+      VALUES (?, ?, 'running')
+    `).run(id, environmentId);
+    if (result.changes !== 1) return false;
+    db.prepare('INSERT INTO assessment_api_usage (run_id) VALUES (?)').run(id);
+    db.prepare(`
+      INSERT INTO assessment_run_state
+        (run_id, lease_owner, lease_expires_at, last_heartbeat_at, pacing_profile,
+         control_state, updated_at)
+      VALUES (
+        ?,
+        ?,
+        CASE WHEN ? IS NULL THEN NULL ELSE datetime('now', ?) END,
+        datetime('now'),
+        ?,
+        'running',
+        datetime('now')
+      )
+    `).run(
+      id,
+      leaseOwner,
+      leaseOwner,
+      `+${ASSESSMENT_LEASE_SECONDS} seconds`,
+      pacingProfile
+    );
+    return true;
+  });
+  return create();
+}
+
+export function acquireAssessmentRunLease(
+  runId: string,
+  environmentId: string,
+  leaseOwner: string,
+  pacingProfile?: AssessmentPacingProfile
+): boolean {
+  const db = getDb();
+  const acquire = db.transaction(() => {
+    const run = db.prepare(`
+      SELECT 1
+      FROM assessment_runs
+      WHERE id = ? AND environment_id = ? AND status = 'running'
+    `).get(runId, environmentId);
+    if (!run) return false;
+    db.prepare(`
+      INSERT OR IGNORE INTO assessment_run_state (run_id)
+      VALUES (?)
+    `).run(runId);
+    const result = db.prepare(`
+      UPDATE assessment_run_state
+      SET lease_owner = ?,
+          lease_expires_at = datetime('now', ?),
+          last_heartbeat_at = datetime('now'),
+          resume_count = resume_count + 1,
+          pacing_profile = COALESCE(?, pacing_profile),
+          control_state = 'running',
+          updated_at = datetime('now')
+      WHERE run_id = ?
+        AND (lease_owner IS NULL OR lease_expires_at <= datetime('now'))
+        AND control_state IN ('running', 'paused')
+    `).run(
+      leaseOwner,
+      `+${ASSESSMENT_LEASE_SECONDS} seconds`,
+      pacingProfile ?? null,
+      runId
+    );
+    return result.changes === 1;
+  });
+  return acquire();
+}
+
+export function renewAssessmentRunLease(runId: string, leaseOwner: string): boolean {
+  const result = getDb().prepare(`
+    UPDATE assessment_run_state
+    SET lease_expires_at = datetime('now', ?),
+        last_heartbeat_at = datetime('now'),
+        updated_at = datetime('now')
+    WHERE run_id = ? AND lease_owner = ?
+  `).run(`+${ASSESSMENT_LEASE_SECONDS} seconds`, runId, leaseOwner);
+  return result.changes === 1;
+}
+
+export function releaseAssessmentRunLease(runId: string, leaseOwner: string) {
   getDb().prepare(`
-    INSERT INTO assessment_runs (id, environment_id, status)
-    VALUES (?, ?, 'running')
-  `).run(id, environmentId);
+    UPDATE assessment_run_state
+    SET lease_owner = NULL,
+        lease_expires_at = NULL,
+        updated_at = datetime('now')
+    WHERE run_id = ? AND lease_owner = ?
+  `).run(runId, leaseOwner);
+}
+
+export function assertAssessmentRunExecution(
+  runId: string,
+  leaseOwner: string
+) {
+  const state = getDb().prepare(`
+    SELECT control_state
+    FROM assessment_run_state
+    WHERE run_id = ? AND lease_owner = ?
+  `).get(runId, leaseOwner) as {
+    control_state: AssessmentRunControlState;
+  } | undefined;
+  if (!state) return;
+  if (state.control_state === 'pause_requested') {
+    throw new AssessmentRunControlError('pause');
+  }
+  if (state.control_state === 'cancel_requested') {
+    throw new AssessmentRunControlError('cancel');
+  }
+}
+
+export function requestAssessmentRunPause(
+  environmentId: string,
+  runId: string
+): 'requested' | 'paused' | 'not_found' | 'conflict' {
+  const db = getDb();
+  const request = db.transaction(() => {
+    const state = db.prepare(`
+      SELECT state.control_state, state.lease_owner, state.lease_expires_at
+      FROM assessment_runs AS runs
+      JOIN assessment_run_state AS state ON state.run_id = runs.id
+      WHERE runs.id = ? AND runs.environment_id = ? AND runs.status = 'running'
+    `).get(runId, environmentId) as {
+      control_state: AssessmentRunControlState;
+      lease_owner: string | null;
+      lease_expires_at: string | null;
+    } | undefined;
+    if (!state) return 'not_found' as const;
+    if (state.control_state === 'paused') return 'paused' as const;
+    if (state.control_state !== 'running') return 'conflict' as const;
+    const leaseIsActive = state.lease_owner !== null
+      && state.lease_expires_at !== null
+      && Date.parse(`${state.lease_expires_at}Z`) > Date.now();
+    db.prepare(`
+      UPDATE assessment_run_state
+      SET control_state = ?,
+          lease_owner = CASE WHEN ? = 'paused' THEN NULL ELSE lease_owner END,
+          lease_expires_at = CASE WHEN ? = 'paused' THEN NULL ELSE lease_expires_at END,
+          updated_at = datetime('now')
+      WHERE run_id = ?
+    `).run(
+      leaseIsActive ? 'pause_requested' : 'paused',
+      leaseIsActive ? 'pause_requested' : 'paused',
+      leaseIsActive ? 'pause_requested' : 'paused',
+      runId
+    );
+    return leaseIsActive ? 'requested' as const : 'paused' as const;
+  });
+  return request();
+}
+
+export function markAssessmentRunPaused(runId: string, leaseOwner: string): boolean {
+  const result = getDb().prepare(`
+    UPDATE assessment_run_state
+    SET control_state = 'paused',
+        lease_owner = NULL,
+        lease_expires_at = NULL,
+        updated_at = datetime('now')
+    WHERE run_id = ? AND lease_owner = ? AND control_state = 'pause_requested'
+  `).run(runId, leaseOwner);
+  return result.changes === 1;
+}
+
+export function requestAssessmentRunCancellation(
+  environmentId: string,
+  runId: string
+): 'requested' | 'cancelled' | 'not_found' | 'conflict' {
+  const db = getDb();
+  const request = db.transaction(() => {
+    const state = db.prepare(`
+      SELECT state.control_state, state.lease_owner, state.lease_expires_at
+      FROM assessment_runs AS runs
+      JOIN assessment_run_state AS state ON state.run_id = runs.id
+      WHERE runs.id = ? AND runs.environment_id = ? AND runs.status = 'running'
+    `).get(runId, environmentId) as {
+      control_state: AssessmentRunControlState;
+      lease_owner: string | null;
+      lease_expires_at: string | null;
+    } | undefined;
+    if (!state) return 'not_found' as const;
+    if (state.control_state === 'cancel_requested') return 'conflict' as const;
+    const leaseIsActive = state.lease_owner !== null
+      && state.lease_expires_at !== null
+      && Date.parse(`${state.lease_expires_at}Z`) > Date.now();
+    if (leaseIsActive) {
+      db.prepare(`
+        UPDATE assessment_run_state
+        SET control_state = 'cancel_requested', updated_at = datetime('now')
+        WHERE run_id = ?
+      `).run(runId);
+      return 'requested' as const;
+    }
+    db.prepare('DELETE FROM assessment_runs WHERE id = ?').run(runId);
+    return 'cancelled' as const;
+  });
+  return request();
+}
+
+export function cancelAssessmentRun(runId: string): boolean {
+  return getDb().prepare(`
+    DELETE FROM assessment_runs
+    WHERE id = ? AND status = 'running'
+  `).run(runId).changes === 1;
+}
+
+export function beginAssessmentCollector(
+  runId: string,
+  leaseOwner: string,
+  collectorKey: string
+): boolean {
+  const result = getDb().prepare(`
+    UPDATE assessment_run_state
+    SET current_collector = ?,
+        lease_expires_at = datetime('now', ?),
+        last_heartbeat_at = datetime('now'),
+        updated_at = datetime('now')
+    WHERE run_id = ? AND lease_owner = ?
+  `).run(
+    collectorKey,
+    `+${ASSESSMENT_LEASE_SECONDS} seconds`,
+    runId,
+    leaseOwner
+  );
+  return result.changes === 1;
+}
+
+export function saveAssessmentCheckpoint<T>(
+  runId: string,
+  leaseOwner: string,
+  checkpoint: Omit<
+    AssessmentCheckpoint<T>,
+    'completedAt' | 'cursor' | 'totalItems' | 'completed'
+  > & {
+    cursor?: number;
+    totalItems?: number;
+    completed?: boolean;
+  }
+): boolean {
+  const db = getDb();
+  const save = db.transaction(() => {
+    const lease = db.prepare(`
+      SELECT 1
+      FROM assessment_run_state
+      WHERE run_id = ? AND lease_owner = ?
+    `).get(runId, leaseOwner);
+    if (!lease) return false;
+    db.prepare(`
+      INSERT INTO assessment_checkpoints
+        (run_id, collector_key, output_json, duration_ms, cursor, total_items,
+         is_complete, completed_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now'))
+      ON CONFLICT(run_id, collector_key) DO UPDATE SET
+        output_json = excluded.output_json,
+        duration_ms = excluded.duration_ms,
+        cursor = excluded.cursor,
+        total_items = excluded.total_items,
+        is_complete = excluded.is_complete,
+        completed_at = datetime('now')
+    `).run(
+      runId,
+      checkpoint.collectorKey,
+      JSON.stringify(checkpoint.output),
+      checkpoint.durationMs,
+      checkpoint.cursor ?? 0,
+      checkpoint.totalItems ?? 0,
+      checkpoint.completed === false ? 0 : 1
+    );
+    db.prepare(`
+      UPDATE assessment_run_state
+      SET lease_expires_at = datetime('now', ?),
+          last_heartbeat_at = datetime('now'),
+          updated_at = datetime('now')
+      WHERE run_id = ? AND lease_owner = ?
+    `).run(
+      `+${ASSESSMENT_LEASE_SECONDS} seconds`,
+      runId,
+      leaseOwner
+    );
+    return true;
+  });
+  return save();
+}
+
+export function getAssessmentCheckpoints(
+  runId: string
+): Record<string, AssessmentCheckpoint> {
+  const rows = getDb().prepare(`
+    SELECT collector_key, output_json, duration_ms, cursor, total_items,
+      is_complete, completed_at
+    FROM assessment_checkpoints
+    WHERE run_id = ?
+    ORDER BY completed_at, collector_key
+  `).all(runId) as Array<{
+    collector_key: string;
+    output_json: string;
+    duration_ms: number;
+    cursor: number;
+    total_items: number;
+    is_complete: number;
+    completed_at: string;
+  }>;
+  return Object.fromEntries(rows.map(row => {
+    let output: unknown;
+    try {
+      output = JSON.parse(row.output_json);
+    } catch (error) {
+      throw new Error(
+        `Assessment checkpoint ${row.collector_key} contains invalid JSON`,
+        { cause: error }
+      );
+    }
+    return [row.collector_key, {
+      collectorKey: row.collector_key,
+      output,
+      durationMs: row.duration_ms,
+      cursor: row.cursor,
+      totalItems: row.total_items,
+      completed: row.is_complete === 1,
+      completedAt: row.completed_at,
+    }];
+  }));
+}
+
+export function updateAssessmentApiUsage(
+  runId: string,
+  usage: AssessmentApiUsage
+) {
+  getDb().prepare(`
+    INSERT INTO assessment_api_usage
+      (run_id, rest_requests, graphql_requests, retry_count, throttle_count,
+       throttle_wait_ms, pacing_wait_count, pacing_wait_ms, last_request_at,
+       rate_limits, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+    ON CONFLICT(run_id) DO UPDATE SET
+      rest_requests = excluded.rest_requests,
+      graphql_requests = excluded.graphql_requests,
+      retry_count = excluded.retry_count,
+      throttle_count = excluded.throttle_count,
+      throttle_wait_ms = excluded.throttle_wait_ms,
+      pacing_wait_count = excluded.pacing_wait_count,
+      pacing_wait_ms = excluded.pacing_wait_ms,
+      last_request_at = excluded.last_request_at,
+      rate_limits = excluded.rate_limits,
+      updated_at = datetime('now')
+  `).run(
+    runId,
+    usage.restRequests,
+    usage.graphqlRequests,
+    usage.retryCount,
+    usage.throttleCount,
+    usage.throttleWaitMs,
+    usage.pacingWaitCount,
+    usage.pacingWaitMs,
+    usage.lastRequestAt,
+    JSON.stringify(usage.rateLimits)
+  );
 }
 
 function nullableBooleanToInteger(value: boolean | null | undefined): number | null {
@@ -2026,6 +2519,8 @@ export function completeAssessment(input: {
       SET status = 'completed', completed_at = datetime('now'), duration_ms = ?
       WHERE id = ?
     `).run(input.durationMs, input.runId);
+    db.prepare('DELETE FROM assessment_checkpoints WHERE run_id = ?').run(input.runId);
+    db.prepare('DELETE FROM assessment_run_state WHERE run_id = ?').run(input.runId);
   });
   complete();
 }
@@ -2035,7 +2530,7 @@ export function failAssessmentRun(input: {
   collectorResultId: string;
   durationMs: number;
   error: string;
-  collectorKey: 'organizations' | 'identity' | 'repositories' | 'teams';
+  collectorKey: string;
 }) {
   const db = getDb();
   const fail = db.transaction(() => {
@@ -2049,6 +2544,8 @@ export function failAssessmentRun(input: {
       SET status = 'failed', completed_at = datetime('now'), duration_ms = ?, error = ?
       WHERE id = ?
     `).run(input.durationMs, input.error, input.runId);
+    db.prepare('DELETE FROM assessment_checkpoints WHERE run_id = ?').run(input.runId);
+    db.prepare('DELETE FROM assessment_run_state WHERE run_id = ?').run(input.runId);
   });
   fail();
 }
@@ -2061,6 +2558,226 @@ export function getLatestAssessment(environmentId: string) {
     LIMIT 1
   `).get(environmentId) as AssessmentRunRow | undefined;
   return run ? getAssessmentSnapshot(run) : null;
+}
+
+export function listAssessmentRuns(environmentId: string, limit = 20) {
+  const boundedLimit = Math.min(Math.max(Math.trunc(limit), 1), 50);
+  const rows = getDb().prepare(`
+    SELECT runs.*,
+           COALESCE(usage.rest_requests, 0) AS rest_requests,
+           COALESCE(usage.graphql_requests, 0) AS graphql_requests,
+           COALESCE(usage.retry_count, 0) AS retry_count,
+           COALESCE(usage.throttle_count, 0) AS throttle_count,
+           COALESCE(usage.throttle_wait_ms, 0) AS throttle_wait_ms,
+           COALESCE(usage.pacing_wait_count, 0) AS pacing_wait_count,
+           COALESCE(usage.pacing_wait_ms, 0) AS pacing_wait_ms,
+           usage.last_request_at,
+           COALESCE(usage.rate_limits, '{}') AS rate_limits,
+           (
+             SELECT COUNT(*) FROM assessment_collector_results
+             WHERE run_id = runs.id
+           ) AS collector_count,
+           (
+             SELECT COUNT(*) FROM assessment_collector_results
+             WHERE run_id = runs.id AND status = 'completed'
+           ) AS successful_collector_count,
+           (
+             SELECT COUNT(*) FROM assessment_collector_results
+             WHERE run_id = runs.id AND status != 'completed'
+           ) AS warning_count
+    FROM assessment_runs AS runs
+    LEFT JOIN assessment_api_usage AS usage ON usage.run_id = runs.id
+    WHERE runs.environment_id = ? AND runs.status = 'completed'
+    ORDER BY runs.started_at DESC, runs.rowid DESC
+    LIMIT ?
+  `).all(environmentId, boundedLimit) as Array<AssessmentRunRow & {
+    rest_requests: number;
+    graphql_requests: number;
+    retry_count: number;
+    throttle_count: number;
+    throttle_wait_ms: number;
+    last_request_at: string | null;
+    rate_limits: string;
+    collector_count: number;
+    successful_collector_count: number;
+    warning_count: number;
+  }>;
+
+  return rows.map(row => {
+    const healthScore = getStoredAssessmentHealthScore(row.id);
+    return {
+      id: row.id,
+      environmentId: row.environment_id,
+      status: row.status,
+      startedAt: row.started_at,
+      completedAt: row.completed_at,
+      healthScore,
+      protectedAt: row.protected_at,
+      apiUsage: mapAssessmentApiUsage(row),
+      collectorCount: row.collector_count,
+      successfulCollectorCount: row.successful_collector_count,
+      warningCount: row.warning_count,
+    };
+  });
+}
+
+export function setAssessmentRunProtection(
+  environmentId: string,
+  runId: string,
+  isProtected: boolean
+): boolean {
+  const result = getDb().prepare(`
+    UPDATE assessment_runs
+    SET protected_at = CASE WHEN ? = 1 THEN datetime('now') ELSE NULL END
+    WHERE id = ? AND environment_id = ? AND status = 'completed'
+  `).run(isProtected ? 1 : 0, runId, environmentId);
+  return result.changes === 1;
+}
+
+export function deleteAssessmentRun(
+  environmentId: string,
+  runId: string
+): 'deleted' | 'protected' | 'not_found' {
+  const db = getDb();
+  const remove = db.transaction(() => {
+    const run = db.prepare(`
+      SELECT protected_at
+      FROM assessment_runs
+      WHERE id = ? AND environment_id = ?
+    `).get(runId, environmentId) as { protected_at: string | null } | undefined;
+    if (!run) return 'not_found' as const;
+    if (run.protected_at) return 'protected' as const;
+    db.prepare('DELETE FROM assessment_runs WHERE id = ?').run(runId);
+    return 'deleted' as const;
+  });
+  return remove();
+}
+
+export function clearPreviousAssessmentRuns(environmentId: string): number {
+  const db = getDb();
+  const clear = db.transaction(() => {
+    const latest = db.prepare(`
+      SELECT id
+      FROM assessment_runs
+      WHERE environment_id = ? AND status = 'completed'
+      ORDER BY started_at DESC, rowid DESC
+      LIMIT 1
+    `).get(environmentId) as { id: string } | undefined;
+    const result = latest
+      ? db.prepare(`
+          DELETE FROM assessment_runs
+          WHERE environment_id = ? AND protected_at IS NULL AND id != ?
+        `).run(environmentId, latest.id)
+      : db.prepare(`
+          DELETE FROM assessment_runs
+          WHERE environment_id = ? AND protected_at IS NULL
+        `).run(environmentId);
+    return result.changes;
+  });
+  return clear();
+}
+
+export function pruneAssessmentRuns(
+  environmentId: string,
+  completedRunLimit = 50,
+  failedRunRetentionDays = 7
+) {
+  const boundedRunLimit = Math.max(1, Math.trunc(completedRunLimit));
+  const boundedFailedDays = Math.max(1, Math.trunc(failedRunRetentionDays));
+  const db = getDb();
+  const prune = db.transaction(() => {
+    const failed = db.prepare(`
+      DELETE FROM assessment_runs
+      WHERE environment_id = ?
+        AND status = 'failed'
+        AND protected_at IS NULL
+        AND completed_at < datetime('now', ?)
+    `).run(environmentId, `-${boundedFailedDays} days`);
+    const completed = db.prepare(`
+      DELETE FROM assessment_runs
+      WHERE environment_id = ?
+        AND status = 'completed'
+        AND protected_at IS NULL
+        AND id NOT IN (
+          SELECT id
+          FROM assessment_runs
+          WHERE environment_id = ? AND status = 'completed'
+          ORDER BY started_at DESC, rowid DESC
+          LIMIT ?
+        )
+    `).run(environmentId, environmentId, boundedRunLimit);
+    return {
+      completedDeleted: completed.changes,
+      failedDeleted: failed.changes,
+    };
+  });
+  return prune();
+}
+
+function getStoredAssessmentHealthScore(runId: string): number | null {
+  const metrics = getDb().prepare(`
+    SELECT metric_key, value
+    FROM assessment_metrics
+    WHERE run_id = ?
+      AND (
+        metric_key IN ('healthScore', 'assessedDomains')
+        OR metric_key LIKE 'domainScore.%'
+      )
+  `).all(runId) as Array<{ metric_key: string; value: number }>;
+  const metricValues = Object.fromEntries(
+    metrics.map(metric => [metric.metric_key, metric.value])
+  ) as Record<string, number>;
+  if (metricValues.healthScore === undefined) return null;
+
+  const findings = getDb().prepare(`
+    SELECT domain, severity
+    FROM assessment_findings
+    WHERE run_id = ?
+  `).all(runId) as Array<{
+    domain: AssessmentDomain;
+    severity: AssessmentSeverity;
+  }>;
+  const collectors = getDb().prepare(`
+    SELECT collector_key, status
+    FROM assessment_collector_results
+    WHERE run_id = ?
+  `).all(runId) as Array<{
+    collector_key: string;
+    status: string;
+  }>;
+  return recalculateStoredAssessmentScores(metricValues, collectors, findings).healthScore;
+}
+
+function recalculateStoredAssessmentScores(
+  metricValues: Record<string, number>,
+  collectors: ReadonlyArray<{ collector_key: string; status: string }>,
+  findings: ReadonlyArray<Pick<AssessmentFinding, 'domain' | 'severity'>>
+) {
+  const allDomains: AssessmentDomain[] = [
+    'identity',
+    'repositories',
+    'security',
+    'actions',
+    'copilot',
+    'billing',
+  ];
+  let assessedDomains = allDomains.filter(
+    domain => metricValues[`domainScore.${domain}`] !== undefined
+  );
+  if (assessedDomains.length === 0 && metricValues.healthScore !== undefined) {
+    assessedDomains = ['identity', 'repositories'];
+    const collectorHasEvidence = (...keys: string[]) => collectors.some(
+      collector => keys.includes(collector.collector_key) && collector.status !== 'failed'
+    );
+    if (collectorHasEvidence('security', 'repositorySecurity')) assessedDomains.push('security');
+    if (collectorHasEvidence('actions', 'actionsDepth')) assessedDomains.push('actions');
+    if (collectorHasEvidence('copilot', 'copilotDepth')) assessedDomains.push('copilot');
+    if (collectorHasEvidence('billing', 'billingDepth')) assessedDomains.push('billing');
+  }
+  const recalculatedScores = assessedDomains.length > 0
+    ? calculateAssessmentScores(findings, assessedDomains)
+    : { healthScore: metricValues.healthScore ?? 100, domainScores: {} as AssessmentDomainScores };
+  return { assessedDomains, ...recalculatedScores };
 }
 
 function formatAssessmentFailures(failures: Array<{ organizationLogin: string; error: string }>): string | null {
@@ -2156,9 +2873,97 @@ function formatRepositoryAccessFailures(
     .join('\n');
 }
 
+function getAssessmentApiUsage(runId: string): AssessmentApiUsage {
+  const row = getDb().prepare(`
+    SELECT rest_requests, graphql_requests, retry_count, throttle_count,
+      throttle_wait_ms, pacing_wait_count, pacing_wait_ms, last_request_at,
+      rate_limits
+    FROM assessment_api_usage
+    WHERE run_id = ?
+  `).get(runId) as AssessmentApiUsageRow | undefined;
+  return mapAssessmentApiUsage(row);
+}
+
+function mapAssessmentApiUsage(
+  row: Partial<AssessmentApiUsageRow> | undefined
+): AssessmentApiUsage {
+  return {
+    restRequests: row?.rest_requests ?? 0,
+    graphqlRequests: row?.graphql_requests ?? 0,
+    retryCount: row?.retry_count ?? 0,
+    throttleCount: row?.throttle_count ?? 0,
+    throttleWaitMs: row?.throttle_wait_ms ?? 0,
+    pacingWaitCount: row?.pacing_wait_count ?? 0,
+    pacingWaitMs: row?.pacing_wait_ms ?? 0,
+    lastRequestAt: row?.last_request_at ?? null,
+    rateLimits: row?.rate_limits
+      ? JSON.parse(row.rate_limits) as Record<string, AssessmentRateLimitBucket>
+      : {},
+  };
+}
+
 export function getAssessmentById(runId: string) {
   const run = getDb().prepare('SELECT * FROM assessment_runs WHERE id = ?').get(runId) as AssessmentRunRow | undefined;
   return run ? getAssessmentSnapshot(run) : null;
+}
+
+export function getActiveAssessmentRun(environmentId: string) {
+  const row = getDb().prepare(`
+    SELECT runs.*, usage.rest_requests, usage.graphql_requests, usage.retry_count,
+      usage.throttle_count, usage.throttle_wait_ms, usage.last_request_at,
+      usage.pacing_wait_count, usage.pacing_wait_ms, usage.rate_limits,
+      state.current_collector, state.lease_owner,
+      state.lease_expires_at, state.last_heartbeat_at, state.resume_count,
+      state.pacing_profile, state.control_state,
+      CASE
+        WHEN state.run_id IS NULL OR state.lease_owner IS NULL
+          OR state.lease_expires_at <= datetime('now')
+        THEN 1
+        ELSE 0
+      END AS lease_expired,
+      (
+        SELECT COUNT(*)
+        FROM assessment_checkpoints
+        WHERE run_id = runs.id AND is_complete = 1
+      ) AS completed_checkpoint_count,
+      current_checkpoint.cursor AS current_checkpoint_cursor,
+      current_checkpoint.total_items AS current_checkpoint_total,
+      current_checkpoint.is_complete AS current_checkpoint_complete
+    FROM assessment_runs AS runs
+    LEFT JOIN assessment_api_usage AS usage ON usage.run_id = runs.id
+    LEFT JOIN assessment_run_state AS state ON state.run_id = runs.id
+    LEFT JOIN assessment_checkpoints AS current_checkpoint
+      ON current_checkpoint.run_id = runs.id
+      AND current_checkpoint.collector_key = state.current_collector
+    WHERE runs.environment_id = ? AND runs.status = 'running'
+    ORDER BY runs.started_at DESC, runs.rowid DESC
+    LIMIT 1
+  `).get(environmentId) as (
+    AssessmentRunRow
+    & Partial<AssessmentApiUsageRow>
+    & Partial<AssessmentRunStateRow>
+  ) | undefined;
+  if (!row) return null;
+  return {
+    id: row.id,
+    environmentId: row.environment_id,
+    status: row.status,
+    startedAt: row.started_at,
+    apiUsage: mapAssessmentApiUsage(row),
+    currentCollector: row.current_collector ?? null,
+    completedCollectorCount: row.completed_checkpoint_count ?? 0,
+    currentCheckpoint: row.current_checkpoint_complete === 0
+      ? {
+          processedItems: row.current_checkpoint_cursor ?? 0,
+          totalItems: row.current_checkpoint_total || null,
+        }
+      : null,
+    lastHeartbeatAt: row.last_heartbeat_at ?? null,
+    resumeCount: row.resume_count ?? 0,
+    pacingProfile: row.pacing_profile ?? 'immediate',
+    controlState: row.control_state ?? 'running',
+    resumable: row.control_state === 'paused' || row.lease_expired !== 0,
+  };
 }
 
 function getAssessmentSnapshot(run: AssessmentRunRow) {
@@ -2648,32 +3453,14 @@ function getAssessmentSnapshot(run: AssessmentRunRow) {
       evidenceSources: evidenceSources.length > 0
         ? evidenceSources
         : fallbackEvidence.evidenceSources,
+      remediation: getAssessmentFindingRemediation(finding.rule_key),
     };
   });
-  const allDomains: AssessmentDomain[] = [
-    'identity',
-    'repositories',
-    'security',
-    'actions',
-    'copilot',
-    'billing',
-  ];
-  let assessedDomains = allDomains.filter(
-    domain => metricValues[`domainScore.${domain}`] !== undefined
+  const { assessedDomains, ...recalculatedScores } = recalculateStoredAssessmentScores(
+    metricValues,
+    collectors,
+    normalizedFindings
   );
-  if (assessedDomains.length === 0 && metricValues.healthScore !== undefined) {
-    assessedDomains = ['identity', 'repositories'];
-    const collectorHasEvidence = (...keys: string[]) => collectors.some(
-      collector => keys.includes(collector.collector_key) && collector.status !== 'failed'
-    );
-    if (collectorHasEvidence('security', 'repositorySecurity')) assessedDomains.push('security');
-    if (collectorHasEvidence('actions', 'actionsDepth')) assessedDomains.push('actions');
-    if (collectorHasEvidence('copilot', 'copilotDepth')) assessedDomains.push('copilot');
-    if (collectorHasEvidence('billing', 'billingDepth')) assessedDomains.push('billing');
-  }
-  const recalculatedScores = assessedDomains.length > 0
-    ? calculateAssessmentScores(normalizedFindings, assessedDomains)
-    : { healthScore: metricValues.healthScore ?? 100, domainScores: {} as AssessmentDomainScores };
   if (metricValues.healthScore !== undefined) {
     metricValues.healthScore = recalculatedScores.healthScore;
     metricValues.assessedDomains = assessedDomains.length;
@@ -2687,6 +3474,8 @@ function getAssessmentSnapshot(run: AssessmentRunRow) {
     completedAt: run.completed_at,
     durationMs: run.duration_ms,
     error: run.error,
+    protectedAt: run.protected_at,
+    apiUsage: getAssessmentApiUsage(run.id),
     metrics: metricValues,
     domainScores: recalculatedScores.domainScores,
     collectors,

@@ -4,6 +4,8 @@ import { useCallback, useEffect, useState } from 'react';
 import { TopBar } from '@/components/TopBar';
 import { useApp } from '@/components/AppContext';
 import {
+  ASSESSMENT_COLLECTOR_KEYS,
+  compareAssessmentSnapshots,
   formatScimRoleLabel,
   type AssessmentActionsEvidence,
   type AssessmentBillingEvidence,
@@ -11,12 +13,23 @@ import {
   type AssessmentCopilotEvidence,
   type AssessmentCopilotSeatInventory,
   type AssessmentFinding,
+  type AssessmentFindingChangeStatus,
   type AssessmentOrganizationAccess,
   type AssessmentRepositoryAccess,
   type AssessmentRepositoryRules,
   type AssessmentRulesetDetail,
   type AssessmentScimInventory,
 } from '@/lib/assessment';
+import type {
+  AssessmentApiUsage,
+  AssessmentRateLimitBucket,
+} from '@/lib/assessment-request-governor';
+import {
+  estimateAssessmentPacedDuration,
+  type AssessmentPacingProfile,
+  type AssessmentReadiness,
+} from '@/lib/assessment-readiness';
+import type { AssessmentRunControlState } from '@/lib/assessment-run-control';
 
 const INVENTORY_METRICS = [
   { key: 'organizations', label: 'Organizations', description: 'Enterprise organizations' },
@@ -36,6 +49,18 @@ const ASSESSMENT_DOMAINS = [
   { key: 'copilot', name: 'Copilot', detail: 'Billed seats and recent activity' },
   { key: 'billing', name: 'Billing & licensing', detail: 'Budget coverage, enforcement, and alerting' },
 ] as const;
+
+const PACING_PROFILES: Array<{
+  key: AssessmentPacingProfile;
+  label: string;
+  range: string;
+  cadence: string;
+}> = [
+  { key: 'immediate', label: 'Immediate', range: 'Up to 25%', cadence: 'No intentional delay' },
+  { key: 'measured', label: 'Measured', range: '25–75%', cadence: '1.5 seconds between requests' },
+  { key: 'overnight', label: 'Overnight', range: '75–200%', cadence: '5 seconds between requests' },
+  { key: 'extended', label: 'Extended', range: 'Over 200%', cadence: '15 seconds between requests' },
+];
 
 type AssessmentDomainKey = (typeof ASSESSMENT_DOMAINS)[number]['key'];
 
@@ -72,6 +97,8 @@ interface AssessmentSnapshot {
   completedAt: string | null;
   durationMs: number | null;
   error: string | null;
+  protectedAt: string | null;
+  apiUsage: AssessmentApiUsage;
   metrics: Record<string, number>;
   domainScores: Partial<Record<AssessmentDomainKey, number>>;
   collectors: AssessmentCollectorResult[];
@@ -89,21 +116,103 @@ interface AssessmentSnapshot {
   findings: AssessmentFinding[];
 }
 
+interface AssessmentRunSummary {
+  id: string;
+  environmentId: string;
+  status: 'completed';
+  startedAt: string;
+  completedAt: string | null;
+  healthScore: number | null;
+  protectedAt: string | null;
+  apiUsage: AssessmentApiUsage;
+  collectorCount: number;
+  successfulCollectorCount: number;
+  warningCount: number;
+}
+
+interface ActiveAssessmentRun {
+  id: string;
+  environmentId: string;
+  status: 'running';
+  startedAt: string;
+  apiUsage: AssessmentApiUsage;
+  currentCollector: string | null;
+  completedCollectorCount: number;
+  currentCheckpoint: {
+    processedItems: number;
+    totalItems: number | null;
+  } | null;
+  lastHeartbeatAt: string | null;
+  resumeCount: number;
+  pacingProfile: AssessmentPacingProfile;
+  controlState: AssessmentRunControlState;
+  resumable: boolean;
+}
+
 export default function AssessmentPage() {
   const { activeEnv } = useApp();
   const [snapshot, setSnapshot] = useState<AssessmentSnapshot | null>(null);
+  const [runHistory, setRunHistory] = useState<AssessmentRunSummary[]>([]);
+  const [comparisonRunId, setComparisonRunId] = useState('');
+  const [comparisonSnapshot, setComparisonSnapshot] = useState<AssessmentSnapshot | null>(null);
+  const [activeRun, setActiveRun] = useState<ActiveAssessmentRun | null>(null);
+  const [readiness, setReadiness] = useState<AssessmentReadiness | null>(null);
   const [isLoading, setIsLoading] = useState(false);
+  const [isLoadingReadiness, setIsLoadingReadiness] = useState(false);
+  const [isLoadingComparison, setIsLoadingComparison] = useState(false);
   const [isRunning, setIsRunning] = useState(false);
+  const [runActionId, setRunActionId] = useState<string | null>(null);
+  const [executionAction, setExecutionAction] = useState<'pause' | 'cancel' | null>(null);
+  const [executionMessage, setExecutionMessage] = useState<string | null>(null);
+  const [selectedPacingProfile, setSelectedPacingProfile] =
+    useState<AssessmentPacingProfile | null>(null);
   const [pageError, setPageError] = useState<string | null>(null);
+  const [comparisonError, setComparisonError] = useState<string | null>(null);
+  const [readinessError, setReadinessError] = useState<string | null>(null);
+  const [runManagementError, setRunManagementError] = useState<string | null>(null);
+  const [runManagementMessage, setRunManagementMessage] = useState<string | null>(null);
+  const activeRunId = activeRun?.id;
 
-  const loadLatestAssessment = useCallback(async (environmentId: string) => {
+  const loadLatestAssessment = useCallback(async (
+    environmentId: string,
+    preferredComparisonRunId = ''
+  ) => {
     setIsLoading(true);
     setPageError(null);
     try {
-      const response = await fetch(`/api/assessment/runs?environmentId=${encodeURIComponent(environmentId)}`);
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || 'Unable to load the latest assessment');
-      setSnapshot(data);
+      const encodedEnvironmentId = encodeURIComponent(environmentId);
+      const [latestResponse, historyResponse, activeResponse] = await Promise.all([
+        fetch(`/api/assessment/runs?environmentId=${encodedEnvironmentId}`),
+        fetch(`/api/assessment/runs?environmentId=${encodedEnvironmentId}&history=true&limit=50`),
+        fetch(`/api/assessment/runs?environmentId=${encodedEnvironmentId}&active=true`),
+      ]);
+      const [latestData, historyData, activeData] = await Promise.all([
+        latestResponse.json(),
+        historyResponse.json(),
+        activeResponse.json(),
+      ]);
+      if (!latestResponse.ok) {
+        throw new Error(latestData.error || 'Unable to load the latest assessment');
+      }
+      if (!historyResponse.ok) {
+        throw new Error(historyData.error || 'Unable to load assessment history');
+      }
+      if (!activeResponse.ok) {
+        throw new Error(activeData.error || 'Unable to load active assessment status');
+      }
+      const history = historyData as AssessmentRunSummary[];
+      const latest = latestData as AssessmentSnapshot | null;
+      setSnapshot(latest);
+      setRunHistory(history);
+      setActiveRun(activeData as ActiveAssessmentRun | null);
+      const preferredRunExists = history.some(
+        run => run.id === preferredComparisonRunId && run.id !== latest?.id
+      );
+      setComparisonRunId(
+        preferredRunExists
+          ? preferredComparisonRunId
+          : history.find(run => run.id !== latest?.id)?.id ?? ''
+      );
     } catch (error) {
       setPageError(error instanceof Error ? error.message : 'Unable to load the latest assessment');
     } finally {
@@ -111,31 +220,312 @@ export default function AssessmentPage() {
     }
   }, []);
 
+  const loadAssessmentReadiness = useCallback(async (environmentId: string) => {
+    setIsLoadingReadiness(true);
+    setReadinessError(null);
+    try {
+      const response = await fetch(
+        `/api/assessment/runs?environmentId=${encodeURIComponent(environmentId)}&preflight=true`
+      );
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.error || 'Unable to estimate assessment readiness');
+      }
+      setReadiness(data as AssessmentReadiness);
+    } catch (error) {
+      setReadiness(null);
+      setReadinessError(
+        error instanceof Error ? error.message : 'Unable to estimate assessment readiness'
+      );
+    } finally {
+      setIsLoadingReadiness(false);
+    }
+  }, []);
+
   useEffect(() => {
     if (!activeEnv) {
       setSnapshot(null);
+      setRunHistory([]);
+      setActiveRun(null);
+      setReadiness(null);
+      setReadinessError(null);
+      setComparisonRunId('');
+      setComparisonSnapshot(null);
+      setSelectedPacingProfile(null);
       return;
     }
-    loadLatestAssessment(activeEnv.id);
-  }, [activeEnv, loadLatestAssessment]);
+    void loadLatestAssessment(activeEnv.id);
+    void loadAssessmentReadiness(activeEnv.id);
+  }, [activeEnv, loadAssessmentReadiness, loadLatestAssessment]);
 
-  async function runAssessment() {
-    if (!activeEnv || isRunning) return;
+  useEffect(() => {
+    if (!activeEnv || (!isRunning && !activeRunId)) return;
+
+    let cancelled = false;
+    const pollActiveRun = async () => {
+      try {
+        const response = await fetch(
+          `/api/assessment/runs?environmentId=${encodeURIComponent(activeEnv.id)}&active=true`
+        );
+        const data = await response.json();
+        if (!response.ok) {
+          throw new Error(data.error || 'Unable to load active assessment status');
+        }
+        if (cancelled) return;
+        const nextActiveRun = data as ActiveAssessmentRun | null;
+        const completedInAnotherSession = activeRunId !== undefined
+          && nextActiveRun === null
+          && !isRunning;
+        setActiveRun(nextActiveRun);
+        if (completedInAnotherSession) {
+          await Promise.all([
+            loadLatestAssessment(activeEnv.id),
+            loadAssessmentReadiness(activeEnv.id),
+          ]);
+        }
+      } catch (error) {
+        if (!cancelled) {
+          setPageError(
+            error instanceof Error ? error.message : 'Unable to load active assessment status'
+          );
+        }
+      }
+    };
+
+    void pollActiveRun();
+    const interval = window.setInterval(() => {
+      void pollActiveRun();
+    }, 2_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, [
+    activeEnv,
+    activeRunId,
+    isRunning,
+    loadAssessmentReadiness,
+    loadLatestAssessment,
+  ]);
+
+  useEffect(() => {
+    setComparisonSnapshot(null);
+    setComparisonError(null);
+    if (!activeEnv || !comparisonRunId) {
+      setIsLoadingComparison(false);
+      return;
+    }
+
+    const controller = new AbortController();
+    setIsLoadingComparison(true);
+    void (async () => {
+      try {
+        const response = await fetch(
+          `/api/assessment/runs?environmentId=${encodeURIComponent(activeEnv.id)}&runId=${encodeURIComponent(comparisonRunId)}`,
+          { signal: controller.signal }
+        );
+        const data = await response.json();
+        if (!response.ok) {
+          throw new Error(data.error || 'Unable to load the comparison assessment');
+        }
+        setComparisonSnapshot(data);
+      } catch (error) {
+        if (error instanceof DOMException && error.name === 'AbortError') return;
+        setComparisonError(error instanceof Error ? error.message : 'Unable to load the comparison assessment');
+      } finally {
+        if (!controller.signal.aborted) setIsLoadingComparison(false);
+      }
+    })();
+
+    return () => controller.abort();
+  }, [activeEnv, comparisonRunId]);
+
+  async function runAssessment(resumeRun: ActiveAssessmentRun | null = null) {
+    if (
+      !activeEnv
+      || isRunning
+      || (activeRun !== null && (!resumeRun || !activeRun.resumable))
+    ) return;
     setIsRunning(true);
+    setPageError(null);
+    setExecutionMessage(null);
+    try {
+      const response = await fetch('/api/assessment/runs', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(resumeRun
+          ? {
+              environmentId: activeEnv.id,
+              action: 'resume',
+              runId: resumeRun.id,
+              pacingProfile: effectivePacingProfile,
+            }
+          : {
+              environmentId: activeEnv.id,
+              action: 'start',
+              pacingProfile: effectivePacingProfile,
+            }),
+      });
+      const data = await response.json();
+      if (response.status === 409 && data.activeRun) {
+        setActiveRun(data.activeRun as ActiveAssessmentRun);
+      }
+
+      if (!response.ok) throw new Error(data?.error || 'Assessment collection failed');
+      await Promise.all([
+        loadLatestAssessment(activeEnv.id),
+        loadAssessmentReadiness(activeEnv.id),
+      ]);
+    } catch (error) {
+      setPageError(error instanceof Error ? error.message : 'Assessment collection failed');
+    } finally {
+      setIsRunning(false);
+    }
+  }
+
+  async function controlAssessment(action: 'pause' | 'cancel') {
+    if (!activeEnv || !activeRun || executionAction) return;
+    if (
+      action === 'cancel'
+      && !window.confirm(
+        'Cancel this assessment? Completed evidence and saved checkpoints for this run will be deleted.'
+      )
+    ) return;
+    setExecutionAction(action);
     setPageError(null);
     try {
       const response = await fetch('/api/assessment/runs', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ environmentId: activeEnv.id }),
+        body: JSON.stringify({
+          environmentId: activeEnv.id,
+          action,
+          runId: activeRun.id,
+        }),
       });
       const data = await response.json();
-      if (data?.id) setSnapshot(data);
-      if (!response.ok) throw new Error(data?.error || 'Assessment collection failed');
+      if (!response.ok) {
+        throw new Error(data?.error || `Unable to ${action} assessment`);
+      }
+      setActiveRun((data.activeRun as ActiveAssessmentRun | null) ?? null);
+      setExecutionMessage(
+        action === 'pause'
+          ? data.state === 'paused'
+            ? 'Assessment paused. Saved evidence is ready to resume.'
+            : 'Pause requested. The assessment will stop at the next safe boundary.'
+          : data.state === 'cancelled'
+            ? 'Assessment cancelled. Its partial evidence was removed.'
+            : 'Cancellation requested. Partial evidence will be removed at the next safe boundary.'
+      );
+      if (data.state === 'cancelled') {
+        await Promise.all([
+          loadLatestAssessment(activeEnv.id),
+          loadAssessmentReadiness(activeEnv.id),
+        ]);
+      }
     } catch (error) {
-      setPageError(error instanceof Error ? error.message : 'Assessment collection failed');
+      setPageError(
+        error instanceof Error ? error.message : `Unable to ${action} assessment`
+      );
     } finally {
-      setIsRunning(false);
+      setExecutionAction(null);
+    }
+  }
+
+  async function updateRunProtection(run: AssessmentRunSummary) {
+    if (!activeEnv || runActionId) return;
+    const protect = !run.protectedAt;
+    setRunActionId(run.id);
+    setRunManagementError(null);
+    setRunManagementMessage(null);
+    try {
+      const response = await fetch('/api/assessment/runs', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          environmentId: activeEnv.id,
+          runId: run.id,
+          protected: protect,
+        }),
+      });
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.error || 'Unable to update run protection');
+      }
+      await loadLatestAssessment(activeEnv.id, comparisonRunId);
+      setRunManagementMessage(
+        protect
+          ? 'Run protected from deletion and automatic cleanup.'
+          : 'Run protection removed.'
+      );
+    } catch (error) {
+      setRunManagementError(
+        error instanceof Error ? error.message : 'Unable to update run protection'
+      );
+    } finally {
+      setRunActionId(null);
+    }
+  }
+
+  async function removeAssessmentRun(run: AssessmentRunSummary) {
+    if (!activeEnv || runActionId || run.protectedAt) return;
+    const confirmed = window.confirm(
+      `Delete the assessment run from ${formatAssessmentDate(run.completedAt)}? This cannot be undone.`
+    );
+    if (!confirmed) return;
+
+    setRunActionId(run.id);
+    setRunManagementError(null);
+    setRunManagementMessage(null);
+    try {
+      const response = await fetch(
+        `/api/assessment/runs?environmentId=${encodeURIComponent(activeEnv.id)}&runId=${encodeURIComponent(run.id)}`,
+        { method: 'DELETE' }
+      );
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.error || 'Unable to delete the assessment run');
+      }
+      await loadLatestAssessment(activeEnv.id);
+      setRunManagementMessage('Assessment run deleted.');
+    } catch (error) {
+      setRunManagementError(
+        error instanceof Error ? error.message : 'Unable to delete the assessment run'
+      );
+    } finally {
+      setRunActionId(null);
+    }
+  }
+
+  async function clearPreviousRuns() {
+    if (!activeEnv || runActionId || runHistory.length < 2) return;
+    const confirmed = window.confirm(
+      'Delete all unprotected assessment runs except the latest completed run? Protected runs will be preserved. This cannot be undone.'
+    );
+    if (!confirmed) return;
+
+    setRunActionId('clear-previous');
+    setRunManagementError(null);
+    setRunManagementMessage(null);
+    try {
+      const response = await fetch(
+        `/api/assessment/runs?environmentId=${encodeURIComponent(activeEnv.id)}&clearPrevious=true`,
+        { method: 'DELETE' }
+      );
+      const data = await response.json();
+      if (!response.ok) {
+        throw new Error(data.error || 'Unable to clear previous assessment runs');
+      }
+      await loadLatestAssessment(activeEnv.id);
+      setRunManagementMessage(
+        `${data.deletedCount} previous ${data.deletedCount === 1 ? 'run was' : 'runs were'} deleted.`
+      );
+    } catch (error) {
+      setRunManagementError(
+        error instanceof Error ? error.message : 'Unable to clear previous assessment runs'
+      );
+    } finally {
+      setRunActionId(null);
     }
   }
 
@@ -197,6 +587,51 @@ export default function AssessmentPage() {
   const copilotEvidence = snapshot?.copilotEvidence;
   const budgets = snapshot?.budgets;
   const billingEvidence = snapshot?.billingEvidence;
+  const assessmentIsPaused = activeRun?.controlState === 'paused';
+  const assessmentIsPausing = activeRun?.controlState === 'pause_requested';
+  const assessmentIsCancelling = activeRun?.controlState === 'cancel_requested';
+  const assessmentCanResume = !isRunning
+    && activeRun?.resumable === true
+    && !assessmentIsCancelling;
+  const assessmentIsRunning = isRunning || (
+    activeRun !== null && !activeRun.resumable
+  );
+  const assessmentHasActiveRun = activeRun !== null;
+  const apiUsage = assessmentHasActiveRun ? activeRun.apiUsage : snapshot?.apiUsage;
+  const restRateLimit = apiUsage
+    ? Object.values(apiUsage.rateLimits).find(rateLimit => rateLimit.resource !== 'graphql')
+    : undefined;
+  const graphqlRateLimit = apiUsage?.rateLimits.graphql;
+  const requestTotal = (apiUsage?.restRequests ?? 0) + (apiUsage?.graphqlRequests ?? 0);
+  const readinessProfile = readiness?.recommendedProfile ?? null;
+  const readinessLabel = readinessProfile
+    ? PACING_PROFILES.find(profile => profile.key === readinessProfile)?.label
+    : null;
+  const effectivePacingProfile = activeRun?.controlState !== 'paused'
+    ? activeRun?.pacingProfile ?? selectedPacingProfile ?? readinessProfile ?? 'immediate'
+    : selectedPacingProfile ?? activeRun.pacingProfile;
+  const effectivePacingLabel = PACING_PROFILES.find(
+    profile => profile.key === effectivePacingProfile
+  )?.label ?? 'Immediate';
+  const selectedEstimatedDurationMs = readiness?.estimatedTotalRequests === null
+    || readiness?.estimatedTotalRequests === undefined
+    ? null
+    : estimateAssessmentPacedDuration(
+        readiness.estimatedTotalRequests,
+        effectivePacingProfile
+      );
+  const currentRestCapacity = readiness?.restRateLimit
+    ? Math.max(
+      0,
+      readiness.restRateLimit.remaining - readiness.restRateLimit.reserve
+    )
+    : null;
+  const currentGraphqlCapacity = readiness?.graphqlRateLimit
+    ? Math.max(
+      0,
+      readiness.graphqlRateLimit.remaining - readiness.graphqlRateLimit.reserve
+    )
+    : null;
   const budgetById = new Map((budgets ?? []).map(budget => [budget.id, budget]));
   const budgetStateCountById = new Map<string, number>();
   for (const state of billingEvidence?.multiUserBudgetStates ?? []) {
@@ -267,13 +702,36 @@ export default function AssessmentPage() {
           : billingCollector?.status === 'completed' ? 'Baseline' : 'Unavailable'
       : 'Not assessed',
   };
-  const assessmentState = isRunning
-    ? 'Running'
+  const assessmentState = assessmentIsPaused
+    ? 'Paused · Ready to resume'
+    : assessmentIsPausing
+      ? 'Pausing at a safe boundary'
+      : assessmentIsCancelling
+        ? 'Cancelling'
+        : assessmentCanResume
+          ? 'Interrupted · Ready to resume'
+    : assessmentIsRunning
+      ? 'Running'
     : snapshot?.status === 'completed'
       ? baselineEvaluated ? 'Baseline assessed' : 'Inventory baseline'
       : snapshot?.status === 'failed'
         ? 'Collection failed'
         : 'Not assessed';
+  const comparison = snapshot && comparisonSnapshot
+    ? compareAssessmentSnapshots(comparisonSnapshot, snapshot)
+    : null;
+  const comparisonOptions = runHistory.filter(run => run.id !== snapshot?.id);
+  const selectedComparisonRun = comparisonOptions.find(run => run.id === comparisonRunId);
+  const comparisonChanges = comparison?.findingChanges.filter(change => change.status !== 'unchanged') ?? [];
+  const comparisonCounts = {
+    new: comparison?.findingChanges.filter(change => change.status === 'new').length ?? 0,
+    worsened: comparison?.findingChanges.filter(change => change.status === 'worsened').length ?? 0,
+    improved: comparison?.findingChanges.filter(change => change.status === 'improved').length ?? 0,
+    resolved: comparison?.findingChanges.filter(change => change.status === 'resolved').length ?? 0,
+    unverified: comparison?.findingChanges.filter(change => change.status === 'unverified').length ?? 0,
+    changed: comparison?.findingChanges.filter(change => change.status === 'changed').length ?? 0,
+    unchanged: comparison?.findingChanges.filter(change => change.status === 'unchanged').length ?? 0,
+  };
 
   return (
     <div className="h-full flex flex-col bg-canvas">
@@ -284,7 +742,7 @@ export default function AssessmentPage() {
             <div>
               <div className="flex items-center gap-2 mb-2">
                 <span className="inline-flex items-center gap-1.5 text-xs font-medium text-text-secondary">
-                  <span className={`w-2 h-2 rounded-full ${isRunning ? 'bg-warning animate-pulse' : snapshot?.status === 'completed' ? 'bg-success' : snapshot?.status === 'failed' ? 'bg-danger' : 'bg-text-muted'}`} aria-hidden="true" />
+                  <span className={`w-2 h-2 rounded-full ${assessmentIsRunning ? 'bg-warning animate-pulse' : assessmentCanResume ? 'bg-warning' : snapshot?.status === 'completed' ? 'bg-success' : snapshot?.status === 'failed' ? 'bg-danger' : 'bg-text-muted'}`} aria-hidden="true" />
                   {assessmentState}
                 </span>
                 <span className="text-text-muted" aria-hidden="true">/</span>
@@ -297,23 +755,220 @@ export default function AssessmentPage() {
                 A measured view of governance, security, access, automation, and platform adoption.
               </p>
             </div>
-            <div className="flex items-center gap-2">
+            <div className="flex flex-wrap items-center gap-2">
+              {activeRun && !assessmentCanResume && !assessmentIsCancelling && (
+                <button
+                  type="button"
+                  onClick={() => void controlAssessment('pause')}
+                  disabled={
+                    executionAction !== null
+                    || assessmentIsPausing
+                    || activeRun.controlState !== 'running'
+                  }
+                  className="px-3 py-2 border border-border bg-surface text-text-primary text-sm font-medium rounded-md hover:bg-panel disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  {assessmentIsPausing || executionAction === 'pause'
+                    ? 'Pausing...'
+                    : 'Pause safely'}
+                </button>
+              )}
+              {activeRun && (
+                <button
+                  type="button"
+                  onClick={() => void controlAssessment('cancel')}
+                  disabled={executionAction !== null || assessmentIsCancelling}
+                  className="px-3 py-2 border border-warning/60 text-warning text-sm font-medium rounded-md hover:bg-warning/10 disabled:opacity-50 disabled:cursor-not-allowed"
+                >
+                  {assessmentIsCancelling || executionAction === 'cancel'
+                    ? 'Cancelling...'
+                    : 'Cancel run'}
+                </button>
+              )}
               <button
                 type="button"
-                onClick={runAssessment}
-                disabled={!activeEnv || isRunning}
+                onClick={() => void runAssessment(assessmentCanResume ? activeRun : null)}
+                disabled={!activeEnv || assessmentIsRunning}
                 className="px-4 py-2 bg-accent-emphasis text-white text-sm font-medium rounded-md hover:opacity-90 disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
               >
-                {isRunning && (
+                {assessmentIsRunning && (
                   <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24" aria-hidden="true">
                     <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" />
                     <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
                   </svg>
                 )}
-                {isRunning ? 'Collecting evidence...' : snapshot ? 'Run again' : 'Run assessment'}
+                {assessmentIsRunning
+                  ? 'Collecting evidence...'
+                  : assessmentCanResume
+                    ? `Resume · ${effectivePacingLabel}`
+                    : `${snapshot ? 'Run again' : 'Run assessment'} · ${effectivePacingLabel}`}
               </button>
             </div>
           </header>
+
+          {assessmentCanResume && activeRun && (
+            <section
+              aria-label={assessmentIsPaused
+                ? 'Paused assessment recovery'
+                : 'Interrupted assessment recovery'}
+              className="border border-warning bg-panel rounded-lg px-4 py-3 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between"
+            >
+              <div>
+                <p className="text-sm font-medium text-warning">
+                  {assessmentIsPaused
+                    ? '|| Assessment paused safely'
+                    : '! Assessment execution was interrupted'}
+                </p>
+                <p className="text-xs text-text-secondary mt-0.5">
+                  {activeRun.completedCollectorCount} of {ASSESSMENT_COLLECTOR_KEYS.length} collector checkpoints {activeRun.completedCollectorCount === 1 ? 'is' : 'are'} durable.
+                  {activeRun.currentCollector
+                    ? ` Last active step: ${formatCollectorKey(activeRun.currentCollector)}; ${
+                        activeRun.currentCheckpoint
+                          ? 'resume continues from the latest saved page or batch.'
+                          : 'an unfinished step restarts safely.'
+                      }`
+                    : ' Resume starts with the first unfinished collector.'}
+                  {activeRun.currentCheckpoint
+                    ? ` Saved progress: ${formatCheckpointProgress(activeRun.currentCheckpoint)}.`
+                    : ''}
+                </p>
+              </div>
+              <span className="text-[11px] text-text-muted whitespace-nowrap">
+                {activeRun.resumeCount === 0
+                  ? 'Not resumed yet'
+                  : `Resumed ${activeRun.resumeCount} ${activeRun.resumeCount === 1 ? 'time' : 'times'}`}
+              </span>
+            </section>
+          )}
+
+          {activeEnv && (
+            <section
+              aria-labelledby="assessment-readiness-heading"
+              className="border border-border bg-panel rounded-lg overflow-hidden"
+            >
+              <div className="px-4 py-3 border-b border-border flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                <div>
+                  <h2 id="assessment-readiness-heading" className="text-sm font-semibold text-text-primary">
+                    Assessment readiness
+                  </h2>
+                  <p className="text-xs text-text-muted mt-0.5">
+                    Projected API demand compared with GitHub&apos;s currently available allowance.
+                  </p>
+                </div>
+                {isLoadingReadiness ? (
+                  <span className="text-xs text-text-muted" role="status">Checking allowance...</span>
+                ) : readinessError ? (
+                  <span className="text-xs font-medium text-danger">✘ Readiness unavailable</span>
+                ) : readinessLabel ? (
+                  <span className={`text-xs font-medium ${readinessProfile === 'immediate' ? 'text-success' : 'text-warning'}`}>
+                    {readinessProfile === 'immediate' ? '✔' : '!'} {readinessLabel} recommended
+                  </span>
+                ) : (
+                  <span className="text-xs font-medium text-warning">! Calibration needed</span>
+                )}
+              </div>
+
+              {readinessError ? (
+                <div className="px-4 py-4" role="alert">
+                  <p className="text-sm font-medium text-danger">GitHub allowance could not be checked</p>
+                  <p className="text-xs text-text-secondary mt-1">{readinessError}</p>
+                </div>
+              ) : isLoadingReadiness || !readiness ? (
+                <div className="px-4 py-5 text-xs text-text-secondary" role="status">
+                  Reading the current REST and GraphQL rate windows...
+                </div>
+              ) : (
+                <>
+                  <div
+                    className="grid grid-cols-2 lg:grid-cols-4 gap-px bg-border"
+                    role="radiogroup"
+                    aria-label="Assessment pacing profile"
+                  >
+                    {PACING_PROFILES.map(profile => {
+                      const selected = profile.key === effectivePacingProfile;
+                      const recommended = profile.key === readinessProfile;
+                      return (
+                        <button
+                          type="button"
+                          key={profile.key}
+                          role="radio"
+                          aria-checked={selected}
+                          disabled={assessmentIsRunning && !assessmentIsPaused}
+                          onClick={() => setSelectedPacingProfile(profile.key)}
+                          className={`px-3 py-2.5 ${selected ? 'bg-accent-emphasis text-white' : 'bg-surface text-text-secondary'}`}
+                        >
+                          <span className="block text-xs font-semibold">
+                            {selected ? '✔ ' : ''}{profile.label}
+                            {recommended ? ' · Recommended' : ''}
+                          </span>
+                          <span className={`block text-[10px] mt-0.5 ${selected ? 'text-white/80' : 'text-text-muted'}`}>
+                            {profile.range} of one usable window
+                          </span>
+                          <span className={`block text-[10px] mt-0.5 ${selected ? 'text-white/80' : 'text-text-muted'}`}>
+                            {profile.cadence}
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
+
+                  <div className="grid grid-cols-2 xl:grid-cols-4 gap-px bg-border">
+                    <ReadinessSignal
+                      label="Projected demand"
+                      value={readiness.estimatedTotalRequests === null
+                        ? 'Calibration needed'
+                        : `~${readiness.estimatedTotalRequests.toLocaleString()} requests`}
+                      detail={readiness.estimatedRestRequests === null
+                        ? 'No completed inventory is available'
+                        : `REST ${readiness.estimatedRestRequests.toLocaleString()} · GraphQL ${(readiness.estimatedGraphqlRequests ?? 0).toLocaleString()}`}
+                    />
+                    <ReadinessSignal
+                      label="Usable now"
+                      value={currentRestCapacity === null
+                        ? 'REST unavailable'
+                        : `${currentRestCapacity.toLocaleString()} REST requests`}
+                      detail={currentGraphqlCapacity === null
+                        ? `${readiness.restRateLimit?.reserve.toLocaleString() ?? 0} REST reserved`
+                        : `${currentGraphqlCapacity.toLocaleString()} GraphQL · ${readiness.restRateLimit?.reserve.toLocaleString() ?? 0} REST reserved`}
+                    />
+                    <ReadinessSignal
+                      label="Expected runtime"
+                      value={formatEstimatedDuration(selectedEstimatedDurationMs)}
+                      detail={readiness.estimatedRateWindows === null
+                        ? 'Rate windows unknown'
+                        : `${effectivePacingLabel} profile · ${readiness.estimatedRateWindows} estimated rate ${readiness.estimatedRateWindows === 1 ? 'window' : 'windows'}`}
+                    />
+                    <ReadinessSignal
+                      label="Start guidance"
+                      value={readiness.currentWindowFits === false
+                        ? '! Reset pause possible'
+                        : readiness.currentWindowFits === true
+                          ? '✔ Fits current window'
+                          : 'Allowance unconfirmed'}
+                      detail={readiness.windowLoadPercent === null
+                        ? 'Run once to calibrate'
+                        : `${readiness.windowLoadPercent}% of one full usable window`}
+                      caution={readiness.currentWindowFits === false}
+                    />
+                  </div>
+
+                  <div className="px-4 py-3 border-t border-border bg-surface">
+                    <p className="text-xs text-text-secondary">{readiness.rationale}</p>
+                    <details className="mt-2">
+                      <summary className="text-[11px] text-accent cursor-pointer">How this recommendation is calculated</summary>
+                      <p className="text-[11px] text-text-muted mt-2 max-w-4xl">
+                        {readiness.estimateSource === 'previous-run'
+                          ? 'Projected requests use the latest completed run plus a 15% growth and pagination buffer.'
+                          : readiness.estimateSource === 'inventory'
+                            ? 'Projected requests use stored organization, repository, and member counts plus a 25% uncertainty buffer.'
+                            : 'No prior request or inventory evidence is available yet.'}
+                        {' '}The recommended band compares that projection with the full REST and GraphQL windows after preserving the safety reserve. Your selected profile is enforced between requests, while the request governor independently enforces GitHub reset waits.
+                      </p>
+                    </details>
+                  </div>
+                </>
+              )}
+            </section>
+          )}
 
           {pageError && (
             <div role="alert" className="border border-danger/50 bg-danger/10 rounded-md px-4 py-3 flex items-start gap-2">
@@ -322,6 +977,12 @@ export default function AssessmentPage() {
                 <p className="text-sm font-medium text-danger">Assessment could not complete</p>
                 <p className="text-xs text-text-secondary mt-0.5">{pageError}</p>
               </div>
+            </div>
+          )}
+
+          {executionMessage && (
+            <div role="status" className="border border-border bg-panel rounded-md px-4 py-3">
+              <p className="text-sm font-medium text-text-primary">✔ {executionMessage}</p>
             </div>
           )}
 
@@ -365,6 +1026,62 @@ export default function AssessmentPage() {
                 </div>
               </details>
             </div>
+          )}
+
+          {(assessmentHasActiveRun || requestTotal > 0) && (
+            <section
+              aria-labelledby="api-usage-heading"
+              aria-live={assessmentHasActiveRun ? 'polite' : 'off'}
+              className="border border-border bg-panel rounded-lg overflow-hidden"
+            >
+              <div className="px-4 py-3 border-b border-border flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
+                <div>
+                  <h2 id="api-usage-heading" className="text-sm font-semibold text-text-primary">
+                    API request ledger
+                  </h2>
+                  <p className="text-xs text-text-muted mt-0.5">
+                    Every assessment request passes through the rate-limit safety governor.
+                  </p>
+                </div>
+                <span className={`text-xs font-medium ${assessmentHasActiveRun ? 'text-warning' : 'text-success'}`}>
+                  {assessmentCanResume
+                    ? assessmentIsPaused
+                      ? '|| Paused · checkpoint saved'
+                      : '! Interrupted · checkpoint saved'
+                    : assessmentIsRunning
+                      ? activeRun?.currentCheckpoint && activeRun.currentCollector
+                        ? `Running · ${formatCollectorKey(activeRun.currentCollector)} ${formatCheckpointProgress(activeRun.currentCheckpoint)}`
+                        : 'Running · safeguards active'
+                      : '✔ Request accounting complete'}
+                </span>
+              </div>
+              <div className="grid sm:grid-cols-2 xl:grid-cols-4 divide-y sm:divide-y-0 sm:divide-x divide-border">
+                <div className="px-4 py-3">
+                  <p className="text-[10px] uppercase tracking-wide text-text-muted">Outbound requests</p>
+                  <p className="text-xl font-semibold tabular-nums text-text-primary mt-1">{requestTotal}</p>
+                  <p className="text-[11px] text-text-secondary mt-0.5">
+                    REST {apiUsage?.restRequests ?? 0} · GraphQL {apiUsage?.graphqlRequests ?? 0}
+                  </p>
+                </div>
+                <RateLimitSignal label="REST allowance" rateLimit={restRateLimit} />
+                <RateLimitSignal label="GraphQL allowance" rateLimit={graphqlRateLimit} />
+                <div className="px-4 py-3">
+                  <p className="text-[10px] uppercase tracking-wide text-text-muted">Throttle protection</p>
+                  <p className={`text-sm font-semibold mt-1 ${(apiUsage?.throttleCount ?? 0) > 0 ? 'text-warning' : 'text-text-primary'}`}>
+                    {(apiUsage?.throttleCount ?? 0) > 0
+                      ? `${apiUsage?.throttleCount} ${apiUsage?.throttleCount === 1 ? 'wait' : 'waits'} enforced`
+                      : 'No waits required'}
+                  </p>
+                  <p className="text-[11px] text-text-secondary mt-1">
+                    {apiUsage?.retryCount ?? 0} retries
+                    {' · '}
+                    {formatElapsedTime(apiUsage?.throttleWaitMs ?? 0)} GitHub-limit wait
+                    {' · '}
+                    {formatElapsedTime(apiUsage?.pacingWaitMs ?? 0)} intentional pacing
+                  </p>
+                </div>
+              </div>
+            </section>
           )}
 
           <section aria-labelledby="posture-heading" className="grid gap-4 lg:grid-cols-[minmax(0,1.35fr)_minmax(280px,0.65fr)]">
@@ -483,6 +1200,288 @@ export default function AssessmentPage() {
                 );
               })}
             </div>
+          </section>
+
+          <section aria-labelledby="comparison-heading" className="border border-border bg-panel rounded-lg overflow-hidden">
+            <div className="px-4 py-3 border-b border-border flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
+              <div>
+                <h2 id="comparison-heading" className="text-sm font-semibold text-text-primary">
+                  Assessment movement
+                </h2>
+                <p className="text-xs text-text-muted mt-0.5">
+                  Compare the latest evidence with an earlier completed run. Apparent resolutions require complete current collection evidence.
+                </p>
+              </div>
+              {comparisonOptions.length > 0 && (
+                <label className="block w-full lg:w-96">
+                  <span className="block text-[11px] font-medium text-text-secondary mb-1">Comparison baseline</span>
+                  <select
+                    value={comparisonRunId}
+                    onChange={event => setComparisonRunId(event.target.value)}
+                    className="w-full border border-border bg-surface text-text-primary text-xs rounded-md px-3 py-2 focus:outline-none focus:ring-2 focus:ring-accent"
+                  >
+                    {comparisonOptions.map(run => (
+                      <option key={run.id} value={run.id}>
+                        {formatAssessmentDate(run.completedAt)} · Score {run.healthScore ?? '--'} · {run.successfulCollectorCount}/{run.collectorCount} collectors
+                      </option>
+                    ))}
+                  </select>
+                </label>
+              )}
+            </div>
+
+            {comparisonOptions.length === 0 ? (
+              <div className="px-4 py-5">
+                <p className="text-sm font-medium text-text-primary">A second completed run is needed</p>
+                <p className="text-xs text-text-secondary mt-1">
+                  Run the assessment again after a governance change to establish movement from this baseline.
+                </p>
+              </div>
+            ) : isLoadingComparison ? (
+              <div className="px-4 py-5 text-xs text-text-secondary" role="status">
+                Loading comparison evidence...
+              </div>
+            ) : comparisonError ? (
+              <div className="px-4 py-5" role="alert">
+                <p className="text-sm font-medium text-danger">Comparison could not load</p>
+                <p className="text-xs text-text-secondary mt-1">{comparisonError}</p>
+              </div>
+            ) : comparison ? (
+              <>
+                <div className="grid lg:grid-cols-[260px_1fr] border-b border-border">
+                  <div className="p-4 border-b lg:border-b-0 lg:border-r border-border">
+                    <p className="text-[11px] uppercase tracking-wide text-text-muted">Overall score ledger</p>
+                    <div className="mt-3 flex items-baseline gap-3">
+                      <span className="text-xl font-semibold tabular-nums text-text-secondary">
+                        {comparison.previousScore ?? '--'}
+                      </span>
+                      <span className="text-text-muted" aria-hidden="true">→</span>
+                      <span className="text-3xl font-semibold tabular-nums text-text-primary">
+                        {comparison.currentScore ?? '--'}
+                      </span>
+                      <DeltaBadge delta={comparison.scoreDelta} />
+                    </div>
+                    <p className="text-[11px] text-text-muted mt-2">
+                      Since {formatAssessmentDate(selectedComparisonRun?.completedAt ?? null)}
+                    </p>
+                    {!comparison.scoreComparable && (
+                      <p className="text-xs text-warning mt-3">
+                        Not directly comparable: assessed domain coverage changed.
+                      </p>
+                    )}
+                  </div>
+                  <div className="grid grid-cols-2 sm:grid-cols-3 xl:grid-cols-6 divide-x divide-y sm:divide-y-0 divide-border">
+                    {comparison.domainChanges.map(change => (
+                      <div key={change.domain} className="p-4 min-h-24">
+                        <p className="text-[11px] text-text-secondary capitalize">{change.domain}</p>
+                        <div className="mt-2 flex items-baseline gap-2">
+                          <span className="text-lg font-semibold tabular-nums text-text-primary">
+                            {change.currentScore ?? '--'}
+                          </span>
+                          <DeltaBadge delta={change.delta} compact />
+                        </div>
+                        <p className="text-[10px] text-text-muted mt-1">
+                          from {change.previousScore ?? '--'}
+                        </p>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+
+                <div className="p-4">
+                  <div className="grid grid-cols-2 sm:grid-cols-4 xl:grid-cols-7 gap-2">
+                    {([
+                      ['New', comparisonCounts.new, 'new'],
+                      ['Worsened', comparisonCounts.worsened, 'worsened'],
+                      ['Improved', comparisonCounts.improved, 'improved'],
+                      ['Resolved', comparisonCounts.resolved, 'resolved'],
+                      ['Unverified', comparisonCounts.unverified, 'unverified'],
+                      ['Changed', comparisonCounts.changed, 'changed'],
+                      ['Unchanged', comparisonCounts.unchanged, 'unchanged'],
+                    ] as const).map(([label, count, status]) => (
+                      <div key={status} className="border border-border bg-surface rounded-md px-3 py-2">
+                        <p className={`text-[11px] font-medium ${findingChangeClass(status)}`}>{label}</p>
+                        <p className="text-lg font-semibold tabular-nums text-text-primary mt-0.5">{count}</p>
+                      </div>
+                    ))}
+                  </div>
+
+                  {comparison.notes.length > 0 && (
+                    <ul className="mt-3 space-y-1" aria-label="Comparison confidence notes">
+                      {comparison.notes.map(note => (
+                        <li key={note} className="text-xs text-warning flex gap-2">
+                          <span aria-hidden="true">!</span>
+                          <span>{note}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+
+                  <details className="mt-4 border border-border rounded-md overflow-hidden" open={comparisonChanges.length > 0}>
+                    <summary className="px-3 py-2.5 bg-surface text-xs font-medium text-text-primary cursor-pointer">
+                      Review {comparisonChanges.length} finding {comparisonChanges.length === 1 ? 'change' : 'changes'}
+                    </summary>
+                    {comparisonChanges.length === 0 ? (
+                      <p className="px-3 py-4 text-xs text-text-secondary">
+                        No finding lifecycle or affected-resource changes were detected.
+                      </p>
+                    ) : (
+                      <div className="divide-y divide-border">
+                        {comparisonChanges.map(change => (
+                          <div key={change.ruleKey} className="px-3 py-3">
+                            <div className="flex flex-col gap-1 sm:flex-row sm:items-start sm:justify-between">
+                              <div>
+                                <div className="flex flex-wrap items-center gap-2">
+                                  <span className={`text-[11px] font-semibold ${findingChangeClass(change.status)}`}>
+                                    {findingChangeLabel(change.status)}
+                                  </span>
+                                  <span className="text-[10px] uppercase text-text-muted">{change.finding.severity}</span>
+                                  {change.evidenceConfidence !== 'complete' && (
+                                    <span className="text-[10px] text-warning">
+                                      Evidence {change.evidenceConfidence}
+                                    </span>
+                                  )}
+                                </div>
+                                <p className="text-sm font-medium text-text-primary mt-1">{change.finding.title}</p>
+                              </div>
+                              {change.previousFinding && change.previousFinding.severity !== change.finding.severity && (
+                                <span className="text-[11px] text-text-secondary">
+                                  Severity {change.previousFinding.severity} → {change.finding.severity}
+                                </span>
+                              )}
+                            </div>
+                            {(change.addedResources.length > 0 || change.removedResources.length > 0) && (
+                              <div className="mt-2 grid gap-2 md:grid-cols-2">
+                                {change.addedResources.length > 0 && (
+                                  <div>
+                                    <p className="text-[10px] font-medium text-warning">Added to finding</p>
+                                    <ul className="mt-1 space-y-0.5">
+                                      {change.addedResources.map(resource => (
+                                        <li key={resource} className="text-[11px] font-mono text-text-secondary break-all">
+                                          + {resource}
+                                        </li>
+                                      ))}
+                                    </ul>
+                                  </div>
+                                )}
+                                {change.removedResources.length > 0 && (
+                                  <div>
+                                    <p className="text-[10px] font-medium text-success">Removed from finding</p>
+                                    <ul className="mt-1 space-y-0.5">
+                                      {change.removedResources.map(resource => (
+                                        <li key={resource} className="text-[11px] font-mono text-text-secondary break-all">
+                                          − {resource}
+                                        </li>
+                                      ))}
+                                    </ul>
+                                  </div>
+                                )}
+                              </div>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </details>
+                </div>
+              </>
+            ) : null}
+
+            {runHistory.length > 0 && (
+              <details className="border-t border-border">
+                <summary className="px-4 py-3 text-xs font-medium text-accent cursor-pointer">
+                  Manage saved runs ({runHistory.length})
+                </summary>
+                <div className="border-t border-border">
+                  <div className="px-4 py-3 bg-surface flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                    <div>
+                      <p className="text-xs text-text-secondary">
+                        The latest 50 completed runs are retained. Failed runs older than 7 days are removed when an assessment finishes.
+                      </p>
+                      <p className="text-[11px] text-text-muted mt-1">
+                        Protected runs remain indefinitely and must be unprotected before deletion.
+                      </p>
+                    </div>
+                    {runHistory.length > 1 && (
+                      <button
+                        type="button"
+                        onClick={clearPreviousRuns}
+                        disabled={runActionId !== null}
+                        className="shrink-0 px-3 py-1.5 text-xs font-medium text-warning border border-border rounded-md hover:bg-panel disabled:opacity-50 disabled:cursor-not-allowed"
+                      >
+                        {runActionId === 'clear-previous' ? 'Clearing...' : 'Clear previous runs'}
+                      </button>
+                    )}
+                  </div>
+
+                  {(runManagementError || runManagementMessage) && (
+                    <div
+                      className="px-4 py-2 border-t border-border"
+                      role={runManagementError ? 'alert' : 'status'}
+                    >
+                      <p className={`text-xs ${runManagementError ? 'text-danger' : 'text-success'}`}>
+                        {runManagementError ? `✘ ${runManagementError}` : `✔ ${runManagementMessage}`}
+                      </p>
+                    </div>
+                  )}
+
+                  <div className="divide-y divide-border max-h-screen overflow-y-auto">
+                    {runHistory.map(run => {
+                      const isLatest = run.id === snapshot?.id;
+                      const isPending = runActionId === run.id;
+                      return (
+                        <div
+                          key={run.id}
+                          className="px-4 py-3 flex flex-col gap-3 md:flex-row md:items-center md:justify-between"
+                        >
+                          <div className="min-w-0">
+                            <div className="flex flex-wrap items-center gap-2">
+                              <span className="text-xs font-medium text-text-primary">
+                                {formatAssessmentDate(run.completedAt)}
+                              </span>
+                              {isLatest && (
+                                <span className="text-[10px] font-medium text-accent">Latest</span>
+                              )}
+                              {run.protectedAt && (
+                                <span className="text-[10px] font-medium text-success">✔ Protected</span>
+                              )}
+                            </div>
+                            <p className="text-[11px] text-text-muted mt-1">
+                              Score {run.healthScore ?? '--'} · {run.successfulCollectorCount}/{run.collectorCount} collectors
+                              {run.warningCount > 0 ? ` · ${run.warningCount} incomplete` : ''}
+                              {` · ${run.apiUsage.restRequests + run.apiUsage.graphqlRequests} API requests`}
+                              {' · '}
+                              <span className="font-mono">{run.id}</span>
+                            </p>
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <button
+                              type="button"
+                              onClick={() => updateRunProtection(run)}
+                              disabled={runActionId !== null}
+                              className="px-3 py-1.5 text-xs border border-border rounded-md text-text-secondary hover:bg-surface disabled:opacity-50 disabled:cursor-not-allowed"
+                            >
+                              {isPending
+                                ? 'Saving...'
+                                : run.protectedAt ? 'Unprotect' : 'Protect'}
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => removeAssessmentRun(run)}
+                              disabled={runActionId !== null || Boolean(run.protectedAt)}
+                              title={run.protectedAt ? 'Unprotect this run before deleting it' : 'Delete this assessment run'}
+                              className="px-3 py-1.5 text-xs border border-border rounded-md text-warning hover:bg-surface disabled:opacity-50 disabled:cursor-not-allowed"
+                            >
+                              Delete
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              </details>
+            )}
           </section>
 
           <section aria-labelledby="identity-governance-heading" className="border border-border bg-panel rounded-lg overflow-hidden">
@@ -1606,6 +2605,33 @@ export default function AssessmentPage() {
   );
 }
 
+function RateLimitSignal({
+  label,
+  rateLimit,
+}: {
+  label: string;
+  rateLimit: AssessmentRateLimitBucket | undefined;
+}) {
+  return (
+    <div className="px-4 py-3">
+      <p className="text-[10px] uppercase tracking-wide text-text-muted">{label}</p>
+      <p className="text-sm font-semibold tabular-nums text-text-primary mt-1">
+        {rateLimit ? `${rateLimit.remaining.toLocaleString()} remaining` : 'Awaiting response'}
+      </p>
+      <p className="text-[11px] text-text-secondary mt-1">
+        {rateLimit
+          ? `${rateLimit.limit.toLocaleString()} limit · ${rateLimit.reserve.toLocaleString()} reserved`
+          : 'Rate headers not received yet'}
+      </p>
+      {rateLimit && (
+        <p className="text-[10px] text-text-muted mt-0.5">
+          Resets {formatRateLimitReset(rateLimit.reset)}
+        </p>
+      )}
+    </div>
+  );
+}
+
 function FindingDrillDown({
   finding,
   collectors,
@@ -1723,10 +2749,69 @@ function FindingDrillDown({
               )}
             </div>
             <div>
-              <h4 className="text-xs font-semibold text-text-primary">Recommended action</h4>
+              <h4 className="text-xs font-semibold text-text-primary">Recommended outcome</h4>
               <p className="mt-1 text-xs text-text-secondary">{finding.recommendation}</p>
             </div>
           </div>
+
+          {finding.remediation && (
+            <details className="mt-3 rounded-md border border-accent/40 bg-surface">
+              <summary className="cursor-pointer px-3 py-2.5 focus:outline-none focus-visible:ring-2 focus-visible:ring-accent">
+                <span className="ml-1 text-xs font-semibold text-text-primary">
+                  Remediation playbook
+                </span>
+                <span className="ml-2 text-[10px] text-text-muted">
+                  Advisory only · {finding.remediation.controlLevel} · {finding.remediation.effort} effort
+                </span>
+              </summary>
+              <div className="border-t border-border px-3 py-3">
+                <p className="text-[11px] text-text-muted">
+                  This playbook does not change GitHub configuration. Review and approve each step
+                  through your normal change process.
+                </p>
+
+                <div className="mt-3 grid gap-3 lg:grid-cols-2">
+                  <div>
+                    <p className="text-[10px] font-semibold uppercase tracking-wide text-text-muted">
+                      GitHub settings
+                    </p>
+                    <p className="mt-1 text-xs text-text-primary">
+                      {finding.remediation.settingsPath}
+                    </p>
+                  </div>
+                  <div>
+                    <p className="text-[10px] font-semibold uppercase tracking-wide text-text-muted">
+                      Applicable API
+                    </p>
+                    <p className="mt-1 break-all font-mono text-[11px] text-text-secondary">
+                      {finding.remediation.apiEndpoint
+                        ?? 'No supported write API is listed; use GitHub settings.'}
+                    </p>
+                  </div>
+                </div>
+
+                <div className="mt-3">
+                  <h5 className="text-xs font-semibold text-text-primary">Change sequence</h5>
+                  <ol className="mt-2 list-decimal space-y-1.5 pl-5 text-xs text-text-secondary">
+                    {finding.remediation.steps.map(step => (
+                      <li key={step} className="pl-1">{step}</li>
+                    ))}
+                  </ol>
+                </div>
+
+                <div className="mt-3 grid gap-3 border-t border-border pt-3 lg:grid-cols-2">
+                  <div>
+                    <h5 className="text-xs font-semibold text-text-primary">Rollback consideration</h5>
+                    <p className="mt-1 text-xs text-text-secondary">{finding.remediation.rollback}</p>
+                  </div>
+                  <div>
+                    <h5 className="text-xs font-semibold text-text-primary">Verification signal</h5>
+                    <p className="mt-1 text-xs text-text-secondary">{finding.remediation.verification}</p>
+                  </div>
+                </div>
+              </div>
+            </details>
+          )}
 
           <p className="mt-4 border-t border-border pt-3 text-[10px] text-text-muted">
             Collected {formatAssessmentDate(completedAt)}
@@ -1760,6 +2845,28 @@ function CollectorEvidenceStatus({
     <span className="shrink-0 text-right text-[11px] font-medium text-success">
       ✔ Complete · {collector.item_count.toLocaleString()} records · {collector.duration_ms.toLocaleString()} ms
     </span>
+  );
+}
+
+function ReadinessSignal({
+  label,
+  value,
+  detail,
+  caution = false,
+}: {
+  label: string;
+  value: string;
+  detail: string;
+  caution?: boolean;
+}) {
+  return (
+    <div className="px-4 py-3 min-w-0 bg-panel">
+      <p className="text-[10px] uppercase tracking-wide text-text-muted">{label}</p>
+      <p className={`text-sm font-semibold mt-1 tabular-nums ${caution ? 'text-warning' : 'text-text-primary'}`}>
+        {value}
+      </p>
+      <p className="text-[10px] text-text-muted mt-0.5">{detail}</p>
+    </div>
   );
 }
 
@@ -2279,10 +3386,87 @@ function ConfigurationState({ repository }: { repository: AssessmentRepositorySe
   return <span className="text-text-secondary">{repository.configurationStatus}</span>;
 }
 
+function DeltaBadge({ delta, compact = false }: { delta: number | null; compact?: boolean }) {
+  if (delta === null) {
+    return <span className="text-[10px] text-text-muted">Not comparable</span>;
+  }
+  if (delta === 0) {
+    return <span className={`${compact ? 'text-[10px]' : 'text-xs'} text-text-muted`}>No change</span>;
+  }
+  const direction = delta > 0 ? 'Improved' : 'Declined';
+  return (
+    <span
+      className={`${compact ? 'text-[10px]' : 'text-xs'} font-medium tabular-nums ${delta > 0 ? 'text-success' : 'text-warning'}`}
+      aria-label={`${direction} by ${Math.abs(delta)} points`}
+    >
+      {delta > 0 ? '+' : ''}{delta}
+    </span>
+  );
+}
+
+function findingChangeLabel(status: AssessmentFindingChangeStatus): string {
+  const labels: Record<AssessmentFindingChangeStatus, string> = {
+    new: 'New finding',
+    resolved: 'Resolved',
+    unverified: 'Resolution unverified',
+    worsened: 'Worsened',
+    improved: 'Improved',
+    changed: 'Changed',
+    unchanged: 'Unchanged',
+  };
+  return labels[status];
+}
+
+function findingChangeClass(status: AssessmentFindingChangeStatus): string {
+  if (status === 'resolved' || status === 'improved') return 'text-success';
+  if (status === 'new' || status === 'worsened' || status === 'unverified') return 'text-warning';
+  if (status === 'changed') return 'text-accent';
+  return 'text-text-muted';
+}
+
 function formatAssessmentDate(value: string | null | undefined): string {
   if (!value) return 'Never';
   const date = new Date(value.endsWith('Z') ? value : `${value}Z`);
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString();
+}
+
+function formatElapsedTime(milliseconds: number): string {
+  if (milliseconds < 1_000) return `${milliseconds} ms`;
+  const totalSeconds = Math.round(milliseconds / 1_000);
+  if (totalSeconds < 60) return `${totalSeconds} sec`;
+  const hours = Math.floor(totalSeconds / 3_600);
+  const minutes = Math.round((totalSeconds % 3_600) / 60);
+  return hours > 0 ? `${hours} hr ${minutes} min` : `${minutes} min`;
+}
+
+function formatEstimatedDuration(milliseconds: number | null): string {
+  if (milliseconds === null) return 'Calibration needed';
+  if (milliseconds < 60_000) return `About ${Math.max(1, Math.ceil(milliseconds / 1_000))} sec`;
+  if (milliseconds < 3_600_000) return `About ${Math.ceil(milliseconds / 60_000)} min`;
+  const hours = milliseconds / 3_600_000;
+  return `About ${hours < 10 ? hours.toFixed(1) : Math.ceil(hours)} hr`;
+}
+
+function formatCollectorKey(value: string): string {
+  return value
+    .replace(/([a-z])([A-Z])/g, '$1 $2')
+    .replace(/^./, character => character.toUpperCase());
+}
+
+function formatCheckpointProgress(
+  checkpoint: NonNullable<ActiveAssessmentRun['currentCheckpoint']>
+): string {
+  const processed = checkpoint.processedItems.toLocaleString();
+  return checkpoint.totalItems === null
+    ? `${processed} processed`
+    : `${processed} of ${checkpoint.totalItems.toLocaleString()}`;
+}
+
+function formatRateLimitReset(reset: number): string {
+  const date = new Date(reset * 1_000);
+  return Number.isNaN(date.getTime())
+    ? 'at the next GitHub window'
+    : date.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
 }
 
 function severityClass(severity: AssessmentFinding['severity']): string {

@@ -12,18 +12,160 @@ test('persists and reloads repository security and Actions evidence', async () =
   try {
     process.chdir(temporaryDirectory);
     const {
+      acquireAssessmentRunLease,
+      assertAssessmentRunExecution,
+      beginAssessmentCollector,
+      cancelAssessmentRun,
       completeAssessment,
       createAssessmentRun,
+      clearPreviousAssessmentRuns,
+      deleteAssessmentRun,
+      getActiveAssessmentRun,
       getAssessmentById,
+      getAssessmentCheckpoints,
       getDb,
+      listAssessmentRuns,
+      pruneAssessmentRuns,
+      markAssessmentRunPaused,
+      requestAssessmentRunCancellation,
+      requestAssessmentRunPause,
+      renewAssessmentRunLease,
+      saveAssessmentCheckpoint,
+      setAssessmentRunProtection,
+      updateAssessmentApiUsage,
     } = await import('../src/lib/db');
+    const {
+      getAssessmentFindingRemediation,
+    } = await import('../src/lib/assessment');
     const db = getDb();
+    const persistedRemediation = getAssessmentFindingRemediation(
+      'repository-security-configuration-unassigned'
+    );
     closeDatabase = () => db.close();
     db.prepare(`
       INSERT INTO environments (id, name, base_url, enterprise_slug, auth_method, is_active)
       VALUES ('environment-1', 'Test', 'https://api.github.com', 'acme', 'pat', 1)
     `).run();
-    createAssessmentRun('run-1', 'environment-1');
+    assert.equal(
+      createAssessmentRun('run-1', 'environment-1', 'lease-1', 'measured'),
+      true
+    );
+    assert.equal(createAssessmentRun('run-overlap', 'environment-1'), false);
+    updateAssessmentApiUsage('run-1', {
+      restRequests: 47,
+      graphqlRequests: 6,
+      retryCount: 2,
+      throttleCount: 1,
+      throttleWaitMs: 2_000,
+      pacingWaitCount: 2,
+      pacingWaitMs: 3_000,
+      lastRequestAt: '2026-09-11T20:00:00.000Z',
+      rateLimits: {
+        core: {
+          resource: 'core',
+          limit: 5000,
+          remaining: 4953,
+          used: 47,
+          reset: 1789164000,
+          reserve: 500,
+        },
+      },
+    });
+    assert.equal(beginAssessmentCollector('run-1', 'lease-1', 'organizations'), true);
+    assert.equal(saveAssessmentCheckpoint('run-1', 'lease-1', {
+      collectorKey: 'organizations',
+      output: [{ login: 'acme' }],
+      durationMs: 25,
+    }), true);
+    assert.equal(renewAssessmentRunLease('run-1', 'lease-1'), true);
+    assert.equal(
+      acquireAssessmentRunLease('run-1', 'environment-1', 'lease-2'),
+      false
+    );
+    const initiallyActive = getActiveAssessmentRun('environment-1');
+    assert.deepEqual(initiallyActive, {
+      id: 'run-1',
+      environmentId: 'environment-1',
+      status: 'running',
+      startedAt: initiallyActive?.startedAt,
+      apiUsage: {
+        restRequests: 47,
+        graphqlRequests: 6,
+        retryCount: 2,
+        throttleCount: 1,
+        throttleWaitMs: 2_000,
+        pacingWaitCount: 2,
+        pacingWaitMs: 3_000,
+        lastRequestAt: '2026-09-11T20:00:00.000Z',
+        rateLimits: {
+          core: {
+            resource: 'core',
+            limit: 5000,
+            remaining: 4953,
+            used: 47,
+            reset: 1789164000,
+            reserve: 500,
+          },
+        },
+      },
+      currentCollector: 'organizations',
+      completedCollectorCount: 1,
+      currentCheckpoint: null,
+      lastHeartbeatAt: initiallyActive?.lastHeartbeatAt,
+      resumeCount: 0,
+      pacingProfile: 'measured',
+      controlState: 'running',
+      resumable: false,
+    });
+    assert.deepEqual(getAssessmentCheckpoints('run-1'), {
+      organizations: {
+        collectorKey: 'organizations',
+        output: [{ login: 'acme' }],
+        durationMs: 25,
+        cursor: 0,
+        totalItems: 0,
+        completed: true,
+        completedAt: getAssessmentCheckpoints('run-1').organizations.completedAt,
+      },
+    });
+    assert.equal(requestAssessmentRunPause('environment-1', 'run-1'), 'requested');
+    assert.throws(
+      () => assertAssessmentRunExecution('run-1', 'lease-1'),
+      /pause requested/i
+    );
+    assert.equal(markAssessmentRunPaused('run-1', 'lease-1'), true);
+    assert.equal(getActiveAssessmentRun('environment-1')?.controlState, 'paused');
+    assert.equal(getActiveAssessmentRun('environment-1')?.resumable, true);
+    assert.equal(
+      acquireAssessmentRunLease('run-1', 'environment-1', 'lease-2', 'overnight'),
+      true
+    );
+    assert.equal(getActiveAssessmentRun('environment-1')?.resumeCount, 1);
+    assert.equal(getActiveAssessmentRun('environment-1')?.pacingProfile, 'overnight');
+    assert.equal(getActiveAssessmentRun('environment-1')?.controlState, 'running');
+    assert.equal(beginAssessmentCollector('run-1', 'lease-2', 'repositories'), true);
+    assert.equal(saveAssessmentCheckpoint('run-1', 'lease-2', {
+      collectorKey: 'repositories',
+      output: { items: [{ nameWithOwner: 'acme/one' }], failures: [] },
+      durationMs: 50,
+      cursor: 25,
+      totalItems: 100,
+      completed: false,
+    }), true);
+    assert.deepEqual(getAssessmentCheckpoints('run-1').repositories, {
+      collectorKey: 'repositories',
+      output: { items: [{ nameWithOwner: 'acme/one' }], failures: [] },
+      durationMs: 50,
+      cursor: 25,
+      totalItems: 100,
+      completed: false,
+      completedAt: getAssessmentCheckpoints('run-1').repositories.completedAt,
+    });
+    assert.equal(getActiveAssessmentRun('environment-1')?.completedCollectorCount, 1);
+    assert.deepEqual(getActiveAssessmentRun('environment-1')?.currentCheckpoint, {
+      processedItems: 25,
+      totalItems: 100,
+    });
 
     completeAssessment({
       runId: 'run-1',
@@ -324,7 +466,7 @@ test('persists and reloads repository security and Actions evidence', async () =
           security: 95,
         },
         findings: [{
-          ruleKey: 'persisted-evidence-test',
+          ruleKey: 'repository-security-configuration-unassigned',
           domain: 'security',
           severity: 'low',
           title: 'Persisted evidence finding',
@@ -337,6 +479,7 @@ test('persists and reloads repository security and Actions evidence', async () =
             label: 'Persisted evidence source',
             endpoint: 'REST GET /repos/{owner}/{repo}',
           }],
+          remediation: persistedRemediation,
         }],
         metrics: {
           codeScanningDefaultSetupRepositories: 1,
@@ -351,6 +494,32 @@ test('persists and reloads repository security and Actions evidence', async () =
 
     const snapshot = getAssessmentById('run-1');
     assert.ok(snapshot);
+    assert.equal(getActiveAssessmentRun('environment-1'), null);
+    assert.deepEqual(getAssessmentCheckpoints('run-1'), {});
+    assert.equal(
+      (db.prepare('SELECT COUNT(*) AS count FROM assessment_run_state').get() as { count: number }).count,
+      0
+    );
+    assert.deepEqual(snapshot.apiUsage, {
+      restRequests: 47,
+      graphqlRequests: 6,
+      retryCount: 2,
+      throttleCount: 1,
+      throttleWaitMs: 2_000,
+      pacingWaitCount: 2,
+      pacingWaitMs: 3_000,
+      lastRequestAt: '2026-09-11T20:00:00.000Z',
+      rateLimits: {
+        core: {
+          resource: 'core',
+          limit: 5000,
+          remaining: 4953,
+          used: 47,
+          reset: 1789164000,
+          reserve: 500,
+        },
+      },
+    });
     assert.deepEqual(snapshot.organizationAccess, [{
       organizationLogin: 'acme',
       defaultRepositoryPermission: 'read',
@@ -452,7 +621,7 @@ test('persists and reloads repository security and Actions evidence', async () =
       security: 95,
     });
     assert.deepEqual(snapshot.findings, [{
-      ruleKey: 'persisted-evidence-test',
+      ruleKey: 'repository-security-configuration-unassigned',
       domain: 'security',
       severity: 'low',
       title: 'Persisted evidence finding',
@@ -465,6 +634,7 @@ test('persists and reloads repository security and Actions evidence', async () =
         label: 'Persisted evidence source',
         endpoint: 'REST GET /repos/{owner}/{repo}',
       }],
+      remediation: persistedRemediation,
     }]);
     assert.deepEqual(snapshot.actionsEvidence, {
       selectedActions: null,
@@ -600,6 +770,41 @@ test('persists and reloads repository security and Actions evidence', async () =
       error: 'Repository acme/partial [99]: Ruleset detail returned HTTP 403',
     });
 
+    assert.equal(
+      createAssessmentRun('run-cancel', 'environment-1', 'cancel-lease'),
+      true
+    );
+    assert.equal(saveAssessmentCheckpoint('run-cancel', 'cancel-lease', {
+      collectorKey: 'organizations',
+      output: [{ login: 'partial' }],
+      durationMs: 5,
+      cursor: 1,
+      totalItems: 2,
+      completed: false,
+    }), true);
+    assert.equal(
+      requestAssessmentRunCancellation('environment-1', 'run-cancel'),
+      'requested'
+    );
+    assert.throws(
+      () => assertAssessmentRunExecution('run-cancel', 'cancel-lease'),
+      /cancellation requested/i
+    );
+    assert.equal(cancelAssessmentRun('run-cancel'), true);
+    assert.equal(getActiveAssessmentRun('environment-1'), null);
+    assert.deepEqual(
+      db.prepare('SELECT COUNT(*) AS count FROM assessment_checkpoints WHERE run_id = ?')
+        .get('run-cancel') as { count: number },
+      { count: 0 }
+    );
+
+    assert.equal(createAssessmentRun('run-cancel-idle', 'environment-1'), true);
+    assert.equal(
+      requestAssessmentRunCancellation('environment-1', 'run-cancel-idle'),
+      'cancelled'
+    );
+    assert.equal(getActiveAssessmentRun('environment-1'), null);
+
     createAssessmentRun('run-legacy', 'environment-1');
     db.prepare(`
       UPDATE assessment_runs
@@ -623,6 +828,17 @@ test('persists and reloads repository security and Actions evidence', async () =
     const legacySnapshot = getAssessmentById('run-legacy');
     assert.ok(legacySnapshot);
     assert.equal(legacySnapshot.metrics.healthScore, 90);
+    assert.deepEqual(legacySnapshot.apiUsage, {
+      restRequests: 0,
+      graphqlRequests: 0,
+      retryCount: 0,
+      throttleCount: 0,
+      throttleWaitMs: 0,
+      pacingWaitCount: 0,
+      pacingWaitMs: 0,
+      lastRequestAt: null,
+      rateLimits: {},
+    });
     assert.deepEqual(legacySnapshot.domainScores, {
       identity: 100,
       repositories: 80,
@@ -636,6 +852,105 @@ test('persists and reloads repository security and Actions evidence', async () =
       label: 'Effective default-branch controls',
       endpoint: 'REST GET /repos/{owner}/{repo}/rules/branches/{branch} and /branches/{branch}/protection',
     }]);
+    assert.equal(legacySnapshot.findings[0].remediation.controlLevel, 'Multiple scopes');
+    assert.equal(
+      legacySnapshot.findings[0].remediation.settingsPath,
+      'Enterprise or organization settings > Policies > Rulesets'
+    );
+    assert.match(
+      legacySnapshot.findings[0].remediation.verification,
+      /every existing default branch reports active protection/
+    );
+
+    db.prepare(`
+      INSERT INTO environments (id, name, base_url, enterprise_slug, auth_method, is_active)
+      VALUES ('environment-2', 'Other', 'https://api.github.com', 'other', 'pat', 0)
+    `).run();
+    createAssessmentRun('other-run', 'environment-2');
+    db.prepare(`
+      UPDATE assessment_runs
+      SET status = 'completed', completed_at = datetime('now'), duration_ms = 1
+      WHERE id = 'other-run'
+    `).run();
+
+    const runHistory = listAssessmentRuns('environment-1', 20);
+    assert.deepEqual(runHistory.map(run => run.id), ['run-legacy', 'run-1']);
+    assert.ok(runHistory.every(run => run.environmentId === 'environment-1'));
+    assert.equal(runHistory[0].healthScore, 90);
+    assert.equal(
+      runHistory.find(run => run.id === 'run-1')?.apiUsage.restRequests,
+      47
+    );
+    assert.deepEqual(listAssessmentRuns('environment-1', 1).map(run => run.id), ['run-legacy']);
+
+    assert.equal(setAssessmentRunProtection('environment-1', 'run-1', true), true);
+    assert.ok(listAssessmentRuns('environment-1', 20).find(run => run.id === 'run-1')?.protectedAt);
+    assert.equal(deleteAssessmentRun('environment-1', 'run-1'), 'protected');
+
+    createAssessmentRun('run-old', 'environment-1');
+    db.prepare(`
+      UPDATE assessment_runs
+      SET status = 'completed', completed_at = datetime('now'), started_at = datetime('now', '-1 day')
+      WHERE id = 'run-old'
+    `).run();
+    assert.equal(clearPreviousAssessmentRuns('environment-1'), 1);
+    assert.equal(getAssessmentById('run-old'), null);
+    assert.ok(getAssessmentById('run-legacy'));
+    assert.ok(getAssessmentById('run-1'));
+
+    db.prepare(`
+      INSERT INTO environments (id, name, base_url, enterprise_slug, auth_method, is_active)
+      VALUES ('environment-3', 'Retention', 'https://api.github.com', 'retention', 'pat', 0)
+    `).run();
+    const insertCompletedRun = db.prepare(`
+      INSERT INTO assessment_runs
+        (id, environment_id, status, started_at, completed_at, protected_at)
+      VALUES (?, 'environment-3', 'completed', datetime('now', ?), datetime('now', ?), ?)
+    `);
+    for (let index = 0; index < 5; index += 1) {
+      const age = `-${5 - index} hours`;
+      insertCompletedRun.run(
+        `retained-${index}`,
+        age,
+        age,
+        index === 0 ? '2026-09-01 00:00:00' : null
+      );
+    }
+    db.prepare(`
+      INSERT INTO assessment_runs
+        (id, environment_id, status, started_at, completed_at)
+      VALUES
+        ('failed-old', 'environment-3', 'failed', datetime('now', '-9 days'), datetime('now', '-8 days')),
+        ('failed-recent', 'environment-3', 'failed', datetime('now', '-2 days'), datetime('now', '-1 day'))
+    `).run();
+
+    assert.deepEqual(pruneAssessmentRuns('environment-3', 3, 7), {
+      completedDeleted: 1,
+      failedDeleted: 1,
+    });
+    const retainedRunIds = db.prepare(`
+      SELECT id FROM assessment_runs
+      WHERE environment_id = 'environment-3'
+      ORDER BY id
+    `).all() as Array<{ id: string }>;
+    assert.deepEqual(retainedRunIds.map(run => run.id), [
+      'failed-recent',
+      'retained-0',
+      'retained-2',
+      'retained-3',
+      'retained-4',
+    ]);
+
+    assert.equal(setAssessmentRunProtection('environment-1', 'run-1', false), true);
+    assert.equal(deleteAssessmentRun('environment-1', 'run-1'), 'deleted');
+    assert.equal(getAssessmentById('run-1'), null);
+    const deletedFindingCount = db.prepare(
+      "SELECT COUNT(*) AS count FROM assessment_findings WHERE run_id = 'run-1'"
+    ).get() as { count: number };
+    assert.equal(
+      deletedFindingCount.count,
+      0
+    );
   } finally {
     closeDatabase?.();
     process.chdir(originalWorkingDirectory);

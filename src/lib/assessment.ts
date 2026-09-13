@@ -1,3 +1,27 @@
+import { isFatalAssessmentRequestError } from './assessment-request-governor';
+
+export const ASSESSMENT_COLLECTOR_KEYS = [
+  'organizations',
+  'identity',
+  'organizationAccess',
+  'repositories',
+  'repositoryAccess',
+  'teams',
+  'security',
+  'repositorySecurity',
+  'repositoryRules',
+  'rulesetDetails',
+  'actions',
+  'actionsDepth',
+  'copilot',
+  'copilotDepth',
+  'billing',
+  'billingDepth',
+  'scim',
+] as const;
+
+export type AssessmentCollectorKey = (typeof ASSESSMENT_COLLECTOR_KEYS)[number];
+
 export interface AssessmentOrganization {
   githubId: number;
   nodeId: string;
@@ -266,6 +290,16 @@ export interface AssessmentRulesetDetailCollection {
   failures: AssessmentRulesetDetailFailure[];
 }
 
+export interface AssessmentRulesetDetailPlanItem {
+  reference: AssessmentRulesetReference;
+  appliedRepositories: string[];
+}
+
+export interface AssessmentRulesetDetailPlan {
+  items: AssessmentRulesetDetailPlanItem[];
+  failures: AssessmentRulesetDetailFailure[];
+}
+
 export type AssessmentRulesetDetailRequest = (
   reference: AssessmentRulesetReference
 ) => Promise<AssessmentRestResponse>;
@@ -505,6 +539,18 @@ export interface AssessmentFindingEvidenceSource {
   endpoint: string;
 }
 
+export type AssessmentRemediationEffort = 'Low' | 'Moderate' | 'High';
+
+export interface AssessmentRemediationPlaybook {
+  controlLevel: string;
+  effort: AssessmentRemediationEffort;
+  settingsPath: string;
+  apiEndpoint: string | null;
+  steps: string[];
+  rollback: string;
+  verification: string;
+}
+
 export interface AssessmentFinding {
   ruleKey: string;
   domain: AssessmentDomain;
@@ -515,6 +561,7 @@ export interface AssessmentFinding {
   affectedResources: string[];
   expectedState: string;
   evidenceSources: AssessmentFindingEvidenceSource[];
+  remediation: AssessmentRemediationPlaybook;
 }
 
 export interface AssessmentEvaluation {
@@ -525,10 +572,69 @@ export interface AssessmentEvaluation {
   metrics: Record<string, number>;
 }
 
+export type AssessmentFindingChangeStatus =
+  | 'new'
+  | 'resolved'
+  | 'unverified'
+  | 'worsened'
+  | 'improved'
+  | 'changed'
+  | 'unchanged';
+
+export type AssessmentEvidenceConfidence = 'complete' | 'partial' | 'unavailable';
+
+export interface AssessmentComparisonCollector {
+  collector_key: string;
+  status: 'completed' | 'partial' | 'failed';
+}
+
+export interface AssessmentComparisonSnapshot {
+  id: string;
+  metrics: Record<string, number>;
+  domainScores: AssessmentDomainScores;
+  collectors: AssessmentComparisonCollector[];
+  findings: AssessmentFinding[];
+}
+
+export interface AssessmentFindingChange {
+  ruleKey: string;
+  status: AssessmentFindingChangeStatus;
+  finding: AssessmentFinding;
+  previousFinding: AssessmentFinding | null;
+  addedResources: string[];
+  removedResources: string[];
+  evidenceConfidence: AssessmentEvidenceConfidence;
+}
+
+export interface AssessmentDomainChange {
+  domain: AssessmentDomain;
+  previousScore: number | null;
+  currentScore: number | null;
+  delta: number | null;
+}
+
+export interface AssessmentComparison {
+  previousRunId: string;
+  currentRunId: string;
+  previousScore: number | null;
+  currentScore: number | null;
+  scoreDelta: number | null;
+  scoreComparable: boolean;
+  domainChanges: AssessmentDomainChange[];
+  findingChanges: AssessmentFindingChange[];
+  notes: string[];
+}
+
 export type AssessmentGraphqlRequest = (
   query: string,
   variables: Record<string, unknown>
 ) => Promise<unknown>;
+
+export type AssessmentProgressCallback<State> = (
+  state: State,
+  processedItems: number,
+  totalItems?: number
+) => void;
 
 export type AssessmentRestRequest = () => Promise<unknown>;
 export type AssessmentPagedRestRequest = (page: number, perPage: number) => Promise<unknown>;
@@ -725,7 +831,7 @@ interface AssessmentFindingEvidenceDefinition {
   evidenceSources: AssessmentFindingEvidenceSource[];
 }
 
-const FINDING_EVIDENCE_DEFINITIONS: Record<string, AssessmentFindingEvidenceDefinition> = {
+const FINDING_EVIDENCE_DEFINITIONS = {
   'enterprise-owner-inventory-empty': {
     expectedState: 'At least two active enterprise owners are discoverable to the assessment credential.',
     evidenceSources: [EVIDENCE_SOURCES.identity],
@@ -894,6 +1000,434 @@ const FINDING_EVIDENCE_DEFINITIONS: Record<string, AssessmentFindingEvidenceDefi
     expectedState: 'Every cost-center budget references a cost center in the active inventory.',
     evidenceSources: [EVIDENCE_SOURCES.budgets, EVIDENCE_SOURCES.costCenters],
   },
+} satisfies Record<string, AssessmentFindingEvidenceDefinition>;
+
+const REMEDIATION_PLAYBOOKS = {
+  enterpriseOwners: {
+    controlLevel: 'Enterprise',
+    effort: 'Moderate',
+    settingsPath: 'Enterprise settings > People > Enterprise owners',
+    apiEndpoint: null,
+    steps: [
+      'Confirm the assessment credential can enumerate enterprise owners.',
+      'Assign at least one additional separately managed owner account.',
+      'Test administrative access and document the owner review cadence.',
+    ],
+    rollback: 'Remove the added owner if access validation identifies an unintended privilege assignment.',
+    verification: 'Run the assessment again and confirm that at least two enterprise owners are discovered.',
+  },
+  organizationBasePermission: {
+    controlLevel: 'Organization',
+    effort: 'Moderate',
+    settingsPath: 'Organization settings > Access > Member privileges > Base permissions',
+    apiEndpoint: 'REST PATCH /orgs/{org}',
+    steps: [
+      'Record the current base permission and identify workflows that rely on inherited write or admin access.',
+      'Set the base repository permission to read or none.',
+      'Restore required access through governed teams and validate critical workflows.',
+    ],
+    rollback: 'Restore the recorded base permission while missing team grants are corrected.',
+    verification: 'Run the assessment again and confirm that no organization reports write or admin as its base permission.',
+  },
+  publicRepositoryCreation: {
+    controlLevel: 'Organization',
+    effort: 'Low',
+    settingsPath: 'Organization settings > Access > Member privileges > Repository creation',
+    apiEndpoint: 'REST PATCH /orgs/{org}',
+    steps: [
+      'Confirm which teams have an approved need to create public repositories.',
+      'Disable public repository creation for general members or document the disclosure review.',
+      'Publish the approved request and ownership process.',
+    ],
+    rollback: 'Restore the previous creation policy if a documented publishing workflow is blocked.',
+    verification: 'Run the assessment again and confirm that public creation is restricted or retain the approved exception.',
+  },
+  outsideCollaborators: {
+    controlLevel: 'Organization',
+    effort: 'Moderate',
+    settingsPath: 'Organization settings > Access > People > Outside collaborators',
+    apiEndpoint: 'REST GET /orgs/{org}/outside_collaborators and DELETE /orgs/{org}/outside_collaborators/{username}',
+    steps: [
+      'Assign a sponsor and review date to every outside collaborator.',
+      'Remove accounts without a current business need.',
+      'Reduce retained access to the minimum repositories and roles required.',
+    ],
+    rollback: 'Reinvite a removed collaborator only after the sponsor reconfirms the business need.',
+    verification: 'Review the affected collaborator list and confirm every retained account has current ownership and scope.',
+  },
+  outsidePrivilegedAccess: {
+    controlLevel: 'Repository',
+    effort: 'High',
+    settingsPath: 'Repository settings > Access > Collaborators and teams',
+    apiEndpoint: 'REST DELETE /repos/{owner}/{repo}/collaborators/{username}',
+    steps: [
+      'Validate each privileged outside-collaborator grant with the repository owner.',
+      'Replace direct admin or maintain access with a lower role or narrowly scoped team.',
+      'Remove the original direct grant after replacement access is tested.',
+    ],
+    rollback: 'Restore the prior direct role only for a verified access interruption and time-box the exception.',
+    verification: 'Run the assessment again and confirm that no outside collaborator has direct admin or maintain access.',
+  },
+  directRepositoryAccess: {
+    controlLevel: 'Repository',
+    effort: 'Moderate',
+    settingsPath: 'Repository settings > Access > Collaborators and teams',
+    apiEndpoint: 'REST DELETE /repos/{owner}/{repo}/collaborators/{username}',
+    steps: [
+      'Confirm the business purpose and owner for each direct grant.',
+      'Add the user to a governed team with the minimum required role.',
+      'Test team access, then remove the direct collaborator grant.',
+    ],
+    rollback: 'Restore the direct grant temporarily if team access does not provide the required capability.',
+    verification: 'Run the assessment again and confirm that durable write, maintain, and admin access is team-based.',
+  },
+  staleRepositories: {
+    controlLevel: 'Repository',
+    effort: 'Moderate',
+    settingsPath: 'Repository settings > General > Danger Zone > Archive this repository',
+    apiEndpoint: 'REST PATCH /repos/{owner}/{repo}',
+    steps: [
+      'Confirm ownership, retention requirements, and active dependencies for each stale repository.',
+      'Archive or transfer repositories that no longer require active development.',
+      'Document an owner and review date for repositories that remain active.',
+    ],
+    rollback: 'Unarchive the repository if a validated dependency requires active maintenance.',
+    verification: `Run the assessment again and confirm that retained active repositories have activity within ${STALE_REPOSITORY_DAYS} days or an approved exception.`,
+  },
+  publicRepositories: {
+    controlLevel: 'Repository',
+    effort: 'Moderate',
+    settingsPath: 'Repository settings > General > Danger Zone > Change repository visibility',
+    apiEndpoint: 'REST PATCH /repos/{owner}/{repo}',
+    steps: [
+      'Confirm the repository owner and public-disclosure approval.',
+      'Review history, releases, and documentation for sensitive content.',
+      'Change visibility or record the approved public posture and review date.',
+    ],
+    rollback: 'Restore public visibility only after the repository owner reconfirms disclosure approval.',
+    verification: 'Confirm that every public repository has an active owner and documented disclosure decision.',
+  },
+  branchProtection: {
+    controlLevel: 'Multiple scopes',
+    effort: 'High',
+    settingsPath: 'Enterprise or organization settings > Policies > Rulesets',
+    apiEndpoint: 'REST POST or PUT /enterprises/{enterprise}/rulesets or /orgs/{org}/rulesets/{ruleset_id}',
+    steps: [
+      'Group affected repositories by the controls and exceptions they require.',
+      'Create or update an active ruleset targeting default branches.',
+      'Require pull requests and block force pushes and branch deletion before broad enforcement.',
+    ],
+    rollback: 'Return the ruleset to evaluate or disabled mode if enforcement blocks a critical workflow.',
+    verification: 'Run the assessment again and confirm every existing default branch reports active protection.',
+  },
+  branchReviewControls: {
+    controlLevel: 'Multiple scopes',
+    effort: 'Moderate',
+    settingsPath: 'Enterprise, organization, or repository settings > Rules > Rulesets',
+    apiEndpoint: 'REST PUT ruleset endpoint for the applicable scope',
+    steps: [
+      'Identify the active ruleset or classic protection governing each affected branch.',
+      'Require pull requests and at least one approving review.',
+      'Validate merge queues, automation, and emergency procedures before enforcement.',
+    ],
+    rollback: 'Restore the previous review count or ruleset mode while the blocked workflow is corrected.',
+    verification: 'Run the assessment again and confirm affected default branches require pull requests and an approval.',
+  },
+  branchStatusChecks: {
+    controlLevel: 'Multiple scopes',
+    effort: 'Moderate',
+    settingsPath: 'Enterprise, organization, or repository settings > Rules > Rulesets',
+    apiEndpoint: 'REST PUT ruleset endpoint for the applicable scope',
+    steps: [
+      'Identify the minimum trusted build, test, and security checks for each repository class.',
+      'Add those checks to the applicable ruleset or classic branch protection.',
+      'Validate check names and merge behavior on a test pull request.',
+    ],
+    rollback: 'Remove or correct only the failing required check while preserving the remaining branch controls.',
+    verification: 'Run the assessment again and confirm affected protected branches report required status checks.',
+  },
+  branchHistoryControls: {
+    controlLevel: 'Multiple scopes',
+    effort: 'Low',
+    settingsPath: 'Enterprise, organization, or repository settings > Rules > Rulesets',
+    apiEndpoint: 'REST PUT ruleset endpoint for the applicable scope',
+    steps: [
+      'Update the governing ruleset or classic protection for each affected branch.',
+      'Block force pushes and branch deletion.',
+      'Document the controlled recovery path for exceptional history repair.',
+    ],
+    rollback: 'Temporarily allow only the required recovery action, then immediately restore both controls.',
+    verification: 'Run the assessment again and confirm affected default branches block force pushes and deletion.',
+  },
+  rulesetBypass: {
+    controlLevel: 'Multiple scopes',
+    effort: 'High',
+    settingsPath: 'Enterprise, organization, or repository settings > Rules > Rulesets > Bypass list',
+    apiEndpoint: 'REST PUT /enterprises/{enterprise}/rulesets/{ruleset_id}, /orgs/{org}/rulesets/{ruleset_id}, or /repos/{owner}/{repo}/rulesets/{ruleset_id}',
+    steps: [
+      'Identify the owner and use case for every bypass actor.',
+      'Remove unused actors and convert remaining exceptions to pull-request-only where possible.',
+      'Test the emergency path and record an expiration or review date.',
+    ],
+    rollback: 'Restore a removed actor only for a verified operational requirement and time-box the exception.',
+    verification: 'Run the assessment again and confirm that unconditional bypass is removed or explicitly approved.',
+  },
+  securityDefaults: {
+    controlLevel: 'Enterprise',
+    effort: 'High',
+    settingsPath: 'Enterprise settings > Code security > Configurations',
+    apiEndpoint: 'REST POST/PATCH /enterprises/{enterprise}/code-security/configurations and PUT /configurations/{configuration_id}/defaults',
+    steps: [
+      'Select or create the approved security configuration for each repository visibility.',
+      'Enable dependency graph, Dependabot alerts, code scanning, secret scanning, and push protection as applicable.',
+      'Assign the configuration as the default and validate rollout on a representative repository.',
+    ],
+    rollback: 'Restore the prior default assignment or configuration version if rollout causes an unsupported repository failure.',
+    verification: 'Run the assessment again and confirm defaults cover all intended visibilities with core protections enabled.',
+  },
+  repositorySecurity: {
+    controlLevel: 'Repository',
+    effort: 'High',
+    settingsPath: 'Repository settings > Security > Code security and analysis',
+    apiEndpoint: 'REST POST /enterprises/{enterprise}/code-security/configurations/{configuration_id}/attach',
+    steps: [
+      'Review each affected repository for language, licensing, and feature eligibility.',
+      'Attach the approved code security configuration or enable the applicable features directly.',
+      'Document any repository-specific exception with an owner and review date.',
+    ],
+    rollback: 'Detach the configuration only if it causes a validated incompatibility, then apply an approved reduced control set.',
+    verification: 'Run the assessment again and confirm applicable protections are enabled and repositories are attached.',
+  },
+  actionsSources: {
+    controlLevel: 'Enterprise',
+    effort: 'High',
+    settingsPath: 'Enterprise settings > Policies > Actions > General > Actions permissions',
+    apiEndpoint: 'REST PUT /enterprises/{enterprise}/actions/permissions and /actions/permissions/selected-actions',
+    steps: [
+      'Inventory third-party actions and reusable workflows currently in use.',
+      'Replace global access or wildcard patterns with enterprise-owned and explicitly approved sources.',
+      'Test representative workflows before enforcing the reduced allow list.',
+    ],
+    rollback: 'Restore only the required source pattern while an approved dependency is migrated or reviewed.',
+    verification: 'Run the assessment again and confirm the enterprise policy no longer allows unrestricted sources or global wildcards.',
+  },
+  actionsWorkflowPermissions: {
+    controlLevel: 'Enterprise',
+    effort: 'Moderate',
+    settingsPath: 'Enterprise settings > Policies > Actions > General > Workflow permissions',
+    apiEndpoint: 'REST PUT /enterprises/{enterprise}/actions/permissions/workflow',
+    steps: [
+      'Identify workflows that rely on implicit write permission or automated pull-request approval.',
+      'Set the default GITHUB_TOKEN permission to read and disable workflow approvals unless approved.',
+      'Add explicit least-privilege permissions to affected workflows and retest them.',
+    ],
+    rollback: 'Restore the previous enterprise setting only while blocked workflows are updated with explicit permissions.',
+    verification: 'Run the assessment again and confirm read is the default and workflow approvals are disabled.',
+  },
+  actionsForks: {
+    controlLevel: 'Enterprise',
+    effort: 'Moderate',
+    settingsPath: 'Enterprise settings > Policies > Actions > General > Fork pull request workflows',
+    apiEndpoint: 'REST PUT /enterprises/{enterprise}/actions/permissions/fork-pr-workflows-private-repos',
+    steps: [
+      'Identify private-fork workflows and the data they require.',
+      'Require approval and disable write-token, secret, and variable delivery to untrusted fork workflows.',
+      'Move privileged work into narrowly scoped trusted workflows.',
+    ],
+    rollback: 'Restore only the minimum required capability for a documented trusted-fork workflow.',
+    verification: 'Run the assessment again and confirm fork workflows require approval and receive no privileged data.',
+  },
+  actionsRunners: {
+    controlLevel: 'Enterprise',
+    effort: 'High',
+    settingsPath: 'Enterprise settings > Policies > Actions > Runner groups',
+    apiEndpoint: 'REST runner-group and self-hosted-runner endpoints under /enterprises/{enterprise}/actions',
+    steps: [
+      'Map runner groups to their approved organizations, repositories, and reusable workflows.',
+      'Disable public repository access and narrow broad organization or workflow reach.',
+      'Remove retired offline runners or restore and monitor runner services that remain required.',
+    ],
+    rollback: 'Restore the prior group assignment only for a validated scheduling outage and retain the narrowest scope.',
+    verification: 'Run the assessment again and confirm runner groups exclude public repositories and persistent runners are healthy.',
+  },
+  copilotSeats: {
+    controlLevel: 'User',
+    effort: 'Moderate',
+    settingsPath: 'Enterprise settings > Billing and licensing > Licensing > Copilot',
+    apiEndpoint: 'REST DELETE /enterprises/{enterprise}/copilot/billing/selected_users',
+    steps: [
+      'Confirm employment status, assignment source, and adoption need for each inactive seat.',
+      'Contact the user or sponsor to resolve adoption barriers.',
+      'Retain with a review date or remove the unused assignment.',
+    ],
+    rollback: 'Reassign the seat if the user confirms an active business need after removal.',
+    verification: `Run the assessment after the reporting delay and confirm retained seats show activity within ${COPILOT_ACTIVITY_DAYS} days.`,
+  },
+  copilotAssignment: {
+    controlLevel: 'Organization',
+    effort: 'Moderate',
+    settingsPath: 'Organization settings > Copilot > Access',
+    apiEndpoint: 'REST POST/DELETE /orgs/{org}/copilot/billing/selected_users or /selected_teams',
+    steps: [
+      'Confirm whether universal assignment is an approved licensing strategy.',
+      'If not, change access to selected users and teams.',
+      'Establish a recurring seat review based on assignment source and activity.',
+    ],
+    rollback: 'Return to universal assignment if selective access unexpectedly blocks an approved population.',
+    verification: 'Run the assessment again and confirm universal assignment is removed or the approved exception remains documented.',
+  },
+  copilotPublicCode: {
+    controlLevel: 'Organization',
+    effort: 'Low',
+    settingsPath: 'Organization settings > Copilot > Policies > Suggestions matching public code',
+    apiEndpoint: null,
+    steps: [
+      'Confirm the approved policy with legal, security, and engineering stakeholders.',
+      'Block matching suggestions if the approved position requires it.',
+      'Document the decision and developer guidance.',
+    ],
+    rollback: 'Restore the prior policy only after stakeholder approval.',
+    verification: 'Run the assessment again and confirm the observed setting matches the documented policy.',
+  },
+  copilotCodingAgent: {
+    controlLevel: 'Organization',
+    effort: 'Moderate',
+    settingsPath: 'Organization settings > Copilot > Coding agent > Repository access',
+    apiEndpoint: 'REST PUT /orgs/{org}/copilot/coding-agent/permissions and /permissions/repositories',
+    steps: [
+      'Define the repository classes approved for coding-agent access.',
+      'Change access from all repositories to selected repositories where required.',
+      'Validate agent workflows in the approved repository set.',
+    ],
+    rollback: 'Restore a repository to the approved list if a required agent workflow is interrupted.',
+    verification: 'Run the assessment again and confirm broad access is removed or explicitly approved.',
+  },
+  budgetsCreate: {
+    controlLevel: 'Enterprise',
+    effort: 'High',
+    settingsPath: 'Enterprise settings > Billing and licensing > Budgets and alerts',
+    apiEndpoint: 'REST POST /enterprises/{enterprise}/settings/billing/budgets',
+    steps: [
+      'Identify material metered products, owners, and populations that require controls.',
+      'Create shared or per-user budgets with intentional amounts and enforcement behavior.',
+      'Assign alert recipients and document escalation ownership.',
+    ],
+    rollback: 'Disable or remove a new budget if it blocks approved usage before the limit is corrected.',
+    verification: 'Run the assessment again and confirm the expected enterprise budget controls are discovered.',
+  },
+  budgetsEnforcement: {
+    controlLevel: 'Budget',
+    effort: 'Moderate',
+    settingsPath: 'Enterprise settings > Billing and licensing > Budgets and alerts',
+    apiEndpoint: 'REST PATCH /enterprises/{enterprise}/settings/billing/budgets/{budget_id}',
+    steps: [
+      'Confirm the owner, limit, and operational consequence for each affected budget.',
+      'Enable usage prevention or document the approved non-enforcing exception.',
+      'Notify affected users and test the escalation path.',
+    ],
+    rollback: 'Disable enforcement temporarily if the configured amount incorrectly blocks approved usage.',
+    verification: 'Run the assessment again and confirm affected budgets enforce limits or have approved exceptions.',
+  },
+  budgetsAlerting: {
+    controlLevel: 'Budget',
+    effort: 'Low',
+    settingsPath: 'Enterprise settings > Billing and licensing > Budgets and alerts',
+    apiEndpoint: 'REST PATCH /enterprises/{enterprise}/settings/billing/budgets/{budget_id}',
+    steps: [
+      'Identify the accountable owner for each shared budget.',
+      'Enable alerting and assign at least one monitored recipient.',
+      'Confirm the recipient understands the response and escalation process.',
+    ],
+    rollback: 'Restore the prior recipient list if the new route is invalid, then correct it immediately.',
+    verification: 'Run the assessment again and confirm shared budgets report alerting with accountable recipients.',
+  },
+  costCenters: {
+    controlLevel: 'Enterprise',
+    effort: 'Moderate',
+    settingsPath: 'Enterprise settings > Billing and licensing > Cost centers',
+    apiEndpoint: 'REST POST/DELETE /enterprises/{enterprise}/settings/billing/cost-centers/{cost_center_id}/resource',
+    steps: [
+      'Confirm the owner and intended allocation boundary for each empty cost center.',
+      'Assign the intended users, teams, organizations, or repositories, or remove the unused cost center.',
+      'Validate that related budgets point to the retained cost center.',
+    ],
+    rollback: 'Remove an incorrectly assigned resource or recreate a deleted cost center from the recorded configuration.',
+    verification: 'Run the assessment again and confirm every active cost center has its intended resource membership.',
+  },
+  budgetCostCenterMatch: {
+    controlLevel: 'Budget',
+    effort: 'Moderate',
+    settingsPath: 'Enterprise settings > Billing and licensing > Budgets and alerts',
+    apiEndpoint: 'REST PATCH /enterprises/{enterprise}/settings/billing/budgets/{budget_id}',
+    steps: [
+      'Compare the affected budget entity name with the active cost-center inventory.',
+      'Update the budget to the intended active cost center or remove the stale budget.',
+      'Confirm resource membership and ownership on the matched cost center.',
+    ],
+    rollback: 'Restore the prior budget association if validation identifies the wrong active cost center.',
+    verification: 'Run the assessment again and confirm every cost-center budget matches an active inventory record.',
+  },
+} satisfies Record<string, AssessmentRemediationPlaybook>;
+
+type AssessmentFindingRuleKey = keyof typeof FINDING_EVIDENCE_DEFINITIONS;
+
+const FINDING_REMEDIATION_PLAYBOOKS = {
+  'enterprise-owner-inventory-empty': REMEDIATION_PLAYBOOKS.enterpriseOwners,
+  'enterprise-owner-single-point-of-failure': REMEDIATION_PLAYBOOKS.enterpriseOwners,
+  'organization-default-repository-admin': REMEDIATION_PLAYBOOKS.organizationBasePermission,
+  'organization-default-repository-write': REMEDIATION_PLAYBOOKS.organizationBasePermission,
+  'organization-public-repository-creation-enabled': REMEDIATION_PLAYBOOKS.publicRepositoryCreation,
+  'outside-collaborator-review': REMEDIATION_PLAYBOOKS.outsideCollaborators,
+  'outside-collaborator-privileged-repository-access': REMEDIATION_PLAYBOOKS.outsidePrivilegedAccess,
+  'direct-privileged-repository-access': REMEDIATION_PLAYBOOKS.directRepositoryAccess,
+  'direct-write-repository-access-review': REMEDIATION_PLAYBOOKS.directRepositoryAccess,
+  'stale-active-repositories': REMEDIATION_PLAYBOOKS.staleRepositories,
+  'public-repository-review': REMEDIATION_PLAYBOOKS.publicRepositories,
+  'default-branch-protection-missing': REMEDIATION_PLAYBOOKS.branchProtection,
+  'default-branch-review-controls-incomplete': REMEDIATION_PLAYBOOKS.branchReviewControls,
+  'default-branch-status-checks-missing': REMEDIATION_PLAYBOOKS.branchStatusChecks,
+  'default-branch-history-controls-incomplete': REMEDIATION_PLAYBOOKS.branchHistoryControls,
+  'ruleset-broad-unconditional-bypass': REMEDIATION_PLAYBOOKS.rulesetBypass,
+  'ruleset-scoped-unconditional-bypass-review': REMEDIATION_PLAYBOOKS.rulesetBypass,
+  'security-defaults-missing': REMEDIATION_PLAYBOOKS.securityDefaults,
+  'security-defaults-incomplete-visibility-coverage': REMEDIATION_PLAYBOOKS.securityDefaults,
+  'security-defaults-core-features-disabled': REMEDIATION_PLAYBOOKS.securityDefaults,
+  'repository-security-core-features-disabled': REMEDIATION_PLAYBOOKS.repositorySecurity,
+  'repository-security-configuration-unassigned': REMEDIATION_PLAYBOOKS.repositorySecurity,
+  'actions-unrestricted-sources': REMEDIATION_PLAYBOOKS.actionsSources,
+  'actions-sha-pinning-not-required': REMEDIATION_PLAYBOOKS.actionsSources,
+  'actions-selected-policy-broad-patterns': REMEDIATION_PLAYBOOKS.actionsSources,
+  'actions-default-workflow-write-permissions': REMEDIATION_PLAYBOOKS.actionsWorkflowPermissions,
+  'actions-workflows-can-approve-pull-requests': REMEDIATION_PLAYBOOKS.actionsWorkflowPermissions,
+  'actions-private-fork-workflows-receive-privileged-data': REMEDIATION_PLAYBOOKS.actionsForks,
+  'actions-private-fork-workflows-run-without-approval': REMEDIATION_PLAYBOOKS.actionsForks,
+  'actions-runner-groups-allow-public-repositories': REMEDIATION_PLAYBOOKS.actionsRunners,
+  'actions-runner-groups-broadly-accessible': REMEDIATION_PLAYBOOKS.actionsRunners,
+  'actions-self-hosted-runners-offline': REMEDIATION_PLAYBOOKS.actionsRunners,
+  'copilot-inactive-seats': REMEDIATION_PLAYBOOKS.copilotSeats,
+  'copilot-assign-all-seat-management': REMEDIATION_PLAYBOOKS.copilotAssignment,
+  'copilot-public-code-suggestions-review': REMEDIATION_PLAYBOOKS.copilotPublicCode,
+  'copilot-coding-agent-all-repositories': REMEDIATION_PLAYBOOKS.copilotCodingAgent,
+  'billing-budgets-missing': REMEDIATION_PLAYBOOKS.budgetsCreate,
+  'billing-budget-enforcement-disabled': REMEDIATION_PLAYBOOKS.budgetsEnforcement,
+  'billing-budget-alerting-disabled': REMEDIATION_PLAYBOOKS.budgetsAlerting,
+  'billing-budget-alert-recipients-missing': REMEDIATION_PLAYBOOKS.budgetsAlerting,
+  'billing-empty-active-cost-centers': REMEDIATION_PLAYBOOKS.costCenters,
+  'billing-budget-cost-center-not-found': REMEDIATION_PLAYBOOKS.budgetCostCenterMatch,
+} satisfies Record<AssessmentFindingRuleKey, AssessmentRemediationPlaybook>;
+
+const DEFAULT_REMEDIATION_PLAYBOOK: AssessmentRemediationPlaybook = {
+  controlLevel: 'Multiple scopes',
+  effort: 'Moderate',
+  settingsPath: 'Review the affected GitHub settings area.',
+  apiEndpoint: null,
+  steps: [
+    'Confirm the observed condition and affected scope with the control owner.',
+    'Apply the recommended action through a controlled change.',
+    'Document retained exceptions with an owner and review date.',
+  ],
+  rollback: 'Restore the recorded prior configuration if validation identifies an unintended impact.',
+  verification: 'Run the assessment again and confirm that the finding is resolved or documented as an approved exception.',
 };
 
 const DEFAULT_FINDING_EXPECTED_STATE =
@@ -902,10 +1436,21 @@ const DEFAULT_FINDING_EXPECTED_STATE =
 export function getAssessmentFindingEvidence(
   ruleKey: string
 ): AssessmentFindingEvidenceDefinition {
-  const definition = FINDING_EVIDENCE_DEFINITIONS[ruleKey];
+  const definition = FINDING_EVIDENCE_DEFINITIONS[ruleKey as AssessmentFindingRuleKey];
   return {
     expectedState: definition?.expectedState ?? DEFAULT_FINDING_EXPECTED_STATE,
     evidenceSources: (definition?.evidenceSources ?? []).map(source => ({ ...source })),
+  };
+}
+
+export function getAssessmentFindingRemediation(
+  ruleKey: string
+): AssessmentRemediationPlaybook {
+  const playbook = FINDING_REMEDIATION_PLAYBOOKS[ruleKey as AssessmentFindingRuleKey]
+    ?? DEFAULT_REMEDIATION_PLAYBOOK;
+  return {
+    ...playbook,
+    steps: [...playbook.steps],
   };
 }
 
@@ -929,6 +1474,206 @@ export function calculateAssessmentScores(
         / uniqueDomains.length
     );
   return { healthScore, domainScores };
+}
+
+const ASSESSMENT_DOMAIN_ORDER: AssessmentDomain[] = [
+  'identity',
+  'repositories',
+  'security',
+  'actions',
+  'copilot',
+  'billing',
+];
+
+const SEVERITY_RANK: Record<AssessmentSeverity, number> = {
+  critical: 4,
+  high: 3,
+  medium: 2,
+  low: 1,
+};
+
+const FINDING_CHANGE_ORDER: Record<AssessmentFindingChangeStatus, number> = {
+  new: 1,
+  worsened: 2,
+  changed: 3,
+  improved: 4,
+  resolved: 5,
+  unverified: 6,
+  unchanged: 7,
+};
+
+export function compareAssessmentSnapshots(
+  previous: AssessmentComparisonSnapshot,
+  current: AssessmentComparisonSnapshot
+): AssessmentComparison {
+  const previousDomains = new Set(Object.keys(previous.domainScores) as AssessmentDomain[]);
+  const currentDomains = new Set(Object.keys(current.domainScores) as AssessmentDomain[]);
+  const scoreComparable = (
+    previousDomains.size === currentDomains.size
+    && [...previousDomains].every(domain => currentDomains.has(domain))
+  );
+  const previousScore = Number.isFinite(previous.metrics.healthScore)
+    ? previous.metrics.healthScore
+    : null;
+  const currentScore = Number.isFinite(current.metrics.healthScore)
+    ? current.metrics.healthScore
+    : null;
+  const domainChanges = ASSESSMENT_DOMAIN_ORDER
+    .filter(domain => previousDomains.has(domain) || currentDomains.has(domain))
+    .map(domain => {
+      const previousDomainScore = previous.domainScores[domain] ?? null;
+      const currentDomainScore = current.domainScores[domain] ?? null;
+      return {
+        domain,
+        previousScore: previousDomainScore,
+        currentScore: currentDomainScore,
+        delta: previousDomainScore !== null && currentDomainScore !== null
+          ? currentDomainScore - previousDomainScore
+          : null,
+      };
+    });
+  const previousFindings = new Map(
+    previous.findings.map(finding => [finding.ruleKey, finding])
+  );
+  const currentFindings = new Map(
+    current.findings.map(finding => [finding.ruleKey, finding])
+  );
+  const ruleKeys = new Set([...previousFindings.keys(), ...currentFindings.keys()]);
+  const findingChanges: AssessmentFindingChange[] = [];
+
+  for (const ruleKey of ruleKeys) {
+    const previousFinding = previousFindings.get(ruleKey) ?? null;
+    const currentFinding = currentFindings.get(ruleKey) ?? null;
+    if (!previousFinding && currentFinding) {
+      findingChanges.push({
+        ruleKey,
+        status: 'new',
+        finding: currentFinding,
+        previousFinding: null,
+        addedResources: [...currentFinding.affectedResources],
+        removedResources: [],
+        evidenceConfidence: getFindingEvidenceConfidence(
+          currentFinding,
+          current.collectors
+        ),
+      });
+      continue;
+    }
+    if (previousFinding && !currentFinding) {
+      const evidenceConfidence = getFindingEvidenceConfidence(
+        previousFinding,
+        current.collectors
+      );
+      findingChanges.push({
+        ruleKey,
+        status: evidenceConfidence === 'complete' ? 'resolved' : 'unverified',
+        finding: previousFinding,
+        previousFinding,
+        addedResources: [],
+        removedResources: [...previousFinding.affectedResources],
+        evidenceConfidence,
+      });
+      continue;
+    }
+    if (!previousFinding || !currentFinding) continue;
+
+    const previousResources = new Set(previousFinding.affectedResources);
+    const currentResources = new Set(currentFinding.affectedResources);
+    const addedResources = currentFinding.affectedResources.filter(
+      resource => !previousResources.has(resource)
+    );
+    const removedResources = previousFinding.affectedResources.filter(
+      resource => !currentResources.has(resource)
+    );
+    findingChanges.push({
+      ruleKey,
+      status: classifyFindingChange(
+        previousFinding,
+        currentFinding,
+        addedResources,
+        removedResources
+      ),
+      finding: currentFinding,
+      previousFinding,
+      addedResources,
+      removedResources,
+      evidenceConfidence: getFindingEvidenceConfidence(
+        currentFinding,
+        current.collectors
+      ),
+    });
+  }
+
+  findingChanges.sort((left, right) => (
+    FINDING_CHANGE_ORDER[left.status] - FINDING_CHANGE_ORDER[right.status]
+    || SEVERITY_RANK[right.finding.severity] - SEVERITY_RANK[left.finding.severity]
+    || left.finding.title.localeCompare(right.finding.title)
+  ));
+
+  const notes: string[] = [];
+  if (!scoreComparable) {
+    notes.push('Overall score movement is not comparable because assessed domain coverage changed.');
+  }
+  if (current.collectors.some(collector => collector.status !== 'completed')) {
+    notes.push('The current run has partial or unavailable collection evidence.');
+  }
+  if (previous.collectors.some(collector => collector.status !== 'completed')) {
+    notes.push('The baseline run has partial or unavailable collection evidence.');
+  }
+  if (findingChanges.some(change => change.status === 'unverified')) {
+    notes.push('Some apparent resolutions could not be verified with complete current evidence.');
+  }
+
+  return {
+    previousRunId: previous.id,
+    currentRunId: current.id,
+    previousScore,
+    currentScore,
+    scoreDelta: scoreComparable && previousScore !== null && currentScore !== null
+      ? currentScore - previousScore
+      : null,
+    scoreComparable,
+    domainChanges,
+    findingChanges,
+    notes,
+  };
+}
+
+function classifyFindingChange(
+  previous: AssessmentFinding,
+  current: AssessmentFinding,
+  addedResources: string[],
+  removedResources: string[]
+): AssessmentFindingChangeStatus {
+  const severityDelta = SEVERITY_RANK[current.severity] - SEVERITY_RANK[previous.severity];
+  if (severityDelta > 0) return 'worsened';
+  if (severityDelta < 0) return 'improved';
+  if (addedResources.length === 0 && removedResources.length === 0) {
+    return current.summary === previous.summary ? 'unchanged' : 'changed';
+  }
+  if (addedResources.length > 0 && removedResources.length === 0) return 'worsened';
+  if (removedResources.length > 0 && addedResources.length === 0) return 'improved';
+  if (current.affectedResources.length > previous.affectedResources.length) return 'worsened';
+  if (current.affectedResources.length < previous.affectedResources.length) return 'improved';
+  return 'changed';
+}
+
+function getFindingEvidenceConfidence(
+  finding: AssessmentFinding,
+  collectors: AssessmentComparisonCollector[]
+): AssessmentEvidenceConfidence {
+  const collectorKeys = [...new Set(
+    finding.evidenceSources.map(source => source.collectorKey)
+  )];
+  if (collectorKeys.length === 0) return 'unavailable';
+  const statuses = collectorKeys.map(key => (
+    collectors.find(collector => collector.collector_key === key)?.status
+  ));
+  if (statuses.some(status => status === undefined || status === 'failed')) {
+    return 'unavailable';
+  }
+  if (statuses.some(status => status === 'partial')) return 'partial';
+  return 'complete';
 }
 
 const SCIM_ROLE_LABELS: Readonly<Record<string, string>> = {
@@ -1062,36 +1807,105 @@ export async function collectEnterpriseIdentity(
   request: AssessmentGraphqlRequest,
   enterprise: string
 ): Promise<AssessmentIdentity> {
-  const memberRecords = await collectConnection(
+  return collectEnterpriseIdentityProgressively(
     request,
-    ENTERPRISE_MEMBERS_QUERY,
     enterprise,
-    response => readNestedConnection(response, ['enterprise', 'members'], 'member inventory')
+    createAssessmentIdentityProgress(),
+    () => undefined
   );
-  const ownerRecords = await collectConnection(
-    request,
-    ENTERPRISE_OWNERS_QUERY,
-    enterprise,
-    response => readNestedConnection(response, ['enterprise', 'ownerInfo', 'admins'], 'owner inventory')
-  );
-  const ownerLogins = ownerRecords.map(record => readLogin(record, 'owner'));
-  const owners = new Set(ownerLogins.map(login => login.toLowerCase()));
-  const members = memberRecords.map(value => {
-    if (!value || typeof value !== 'object') {
-      throw new Error('GitHub returned an invalid enterprise member record');
-    }
-    const member = value as Record<string, unknown>;
-    if (typeof member.login !== 'string') {
-      throw new Error('GitHub returned an incomplete enterprise member record');
-    }
-    return {
-      login: member.login,
-      name: typeof member.name === 'string' ? member.name : null,
-      isOwner: owners.has(member.login.toLowerCase()),
-    };
-  });
+}
 
-  return { members, ownerLogins };
+interface AssessmentIdentityMemberRecord {
+  login: string;
+  name: string | null;
+}
+
+export interface AssessmentIdentityProgress {
+  phase: 'members' | 'owners' | 'complete';
+  cursor: string | null;
+  members: AssessmentIdentityMemberRecord[];
+  ownerLogins: string[];
+}
+
+export function createAssessmentIdentityProgress(): AssessmentIdentityProgress {
+  return {
+    phase: 'members',
+    cursor: null,
+    members: [],
+    ownerLogins: [],
+  };
+}
+
+export async function collectEnterpriseIdentityProgressively(
+  request: AssessmentGraphqlRequest,
+  enterprise: string,
+  initialState: AssessmentIdentityProgress,
+  saveProgress: AssessmentProgressCallback<AssessmentIdentityProgress>
+): Promise<AssessmentIdentity> {
+  const state = structuredClone(initialState);
+
+  while (state.phase !== 'complete') {
+    if (state.phase === 'members') {
+      const response = await request(ENTERPRISE_MEMBERS_QUERY, {
+        slug: enterprise,
+        cursor: state.cursor,
+      });
+      const connection = readNestedConnection(
+        response,
+        ['enterprise', 'members'],
+        'member inventory'
+      );
+      state.members.push(...connection.nodes.map(value => {
+        const member = readAssessmentObject(value);
+        if (!member || typeof member.login !== 'string') {
+          throw new Error('GitHub returned an incomplete enterprise member record');
+        }
+        return {
+          login: member.login,
+          name: typeof member.name === 'string' ? member.name : null,
+        };
+      }));
+      if (connection.pageInfo.hasNextPage) {
+        if (!connection.pageInfo.endCursor) {
+          throw new Error('GitHub returned an invalid member inventory response');
+        }
+        state.cursor = connection.pageInfo.endCursor;
+      } else {
+        state.phase = 'owners';
+        state.cursor = null;
+      }
+    } else {
+      const response = await request(ENTERPRISE_OWNERS_QUERY, {
+        slug: enterprise,
+        cursor: state.cursor,
+      });
+      const connection = readNestedConnection(
+        response,
+        ['enterprise', 'ownerInfo', 'admins'],
+        'owner inventory'
+      );
+      state.ownerLogins.push(...connection.nodes.map(record => readLogin(record, 'owner')));
+      if (connection.pageInfo.hasNextPage) {
+        if (!connection.pageInfo.endCursor) {
+          throw new Error('GitHub returned an invalid owner inventory response');
+        }
+        state.cursor = connection.pageInfo.endCursor;
+      } else {
+        state.phase = 'complete';
+        state.cursor = null;
+      }
+    }
+    saveProgress(state, state.members.length + state.ownerLogins.length);
+  }
+
+  const owners = new Set(state.ownerLogins.map(login => login.toLowerCase()));
+  return {
+    members: state.members.map(member => ({
+      ...member,
+      isOwner: owners.has(member.login.toLowerCase()),
+    })),
+    ownerLogins: state.ownerLogins,
+  };
 }
 
 export async function collectOrganizationAccess(
@@ -1225,12 +2039,37 @@ export async function collectRepositoryAccess(
 export async function collectEnterpriseScim(
   request: AssessmentScimRequest
 ): Promise<AssessmentScimInventory> {
-  const identities = new Map<string, AssessmentScimIdentity>();
-  let startIndex = 1;
-  let totalResults: number | null = null;
+  return collectEnterpriseScimProgressively(
+    request,
+    createAssessmentScimProgress(),
+    () => undefined
+  );
+}
 
-  while (true) {
-    const response = await request(startIndex, REST_PAGE_SIZE);
+export interface AssessmentScimProgress {
+  startIndex: number;
+  totalResults: number | null;
+  identities: AssessmentScimIdentity[];
+}
+
+export function createAssessmentScimProgress(): AssessmentScimProgress {
+  return {
+    startIndex: 1,
+    totalResults: null,
+    identities: [],
+  };
+}
+
+export async function collectEnterpriseScimProgressively(
+  request: AssessmentScimRequest,
+  initialState: AssessmentScimProgress,
+  saveProgress: AssessmentProgressCallback<AssessmentScimProgress>
+): Promise<AssessmentScimInventory> {
+  const state = structuredClone(initialState);
+  const identityIds = new Set(state.identities.map(identity => identity.scimId));
+
+  while (state.totalResults === null || state.identities.length < state.totalResults) {
+    const response = await request(state.startIndex, REST_PAGE_SIZE);
     if (response.status !== 200) {
       throw new Error(describeRestFailure('enterprise SCIM users', response));
     }
@@ -1242,28 +2081,29 @@ export async function collectEnterpriseScim(
     ) {
       throw new Error('GitHub returned an invalid enterprise SCIM response');
     }
-    if (totalResults !== null && totalResults !== page.totalResults) {
+    if (state.totalResults !== null && state.totalResults !== page.totalResults) {
       throw new Error('GitHub returned inconsistent enterprise SCIM totals');
     }
-    totalResults = page.totalResults as number;
+    state.totalResults = page.totalResults as number;
 
     for (const value of page.Resources) {
       const identity = normalizeScimIdentity(value);
-      if (identities.has(identity.scimId)) {
+      if (identityIds.has(identity.scimId)) {
         throw new Error(`GitHub returned duplicate SCIM identity ${identity.scimId}`);
       }
-      identities.set(identity.scimId, identity);
+      identityIds.add(identity.scimId);
+      state.identities.push(identity);
     }
-    if (identities.size >= totalResults) break;
-    if (page.Resources.length === 0) {
+    if (state.identities.length < state.totalResults && page.Resources.length === 0) {
       throw new Error('GitHub returned an incomplete enterprise SCIM page');
     }
-    startIndex += page.Resources.length;
+    state.startIndex += page.Resources.length;
+    saveProgress(state, state.identities.length, state.totalResults);
   }
 
   return {
-    totalResults: totalResults ?? 0,
-    identities: [...identities.values()].sort(
+    totalResults: state.totalResults ?? 0,
+    identities: state.identities.sort(
       (left, right) => left.userName.localeCompare(right.userName)
     ),
   };
@@ -1446,7 +2286,7 @@ export async function collectOrganizationRepositories(
     } catch (error) {
       failures.push({
         organizationLogin,
-        error: error instanceof Error ? error.message : 'Repository collection failed',
+        error: normalizeAssessmentError(error),
       });
     }
   }
@@ -1472,7 +2312,7 @@ export async function collectOrganizationTeams(
     } catch (error) {
       failures.push({
         organizationLogin,
-        error: error instanceof Error ? error.message : 'Team collection failed',
+        error: normalizeAssessmentError(error),
       });
     }
   }
@@ -1512,6 +2352,7 @@ export async function collectEnterpriseActionsPolicy(
 }
 
 function normalizeAssessmentError(error: unknown): string {
+  if (isFatalAssessmentRequestError(error)) throw error;
   const message = error instanceof Error
     ? error.message
     : typeof error === 'string' ? error : 'Assessment collection failed';
@@ -1576,56 +2417,59 @@ function requireSuccessfulAssessmentResponse(
   return data;
 }
 
-async function collectPagedActionsResources<T>(
-  request: (page: number, perPage: number) => Promise<AssessmentRestResponse>,
-  arrayKey: 'runner_groups' | 'runners',
-  context: string,
-  normalize: (item: Record<string, unknown>) => T
-): Promise<T[]> {
-  const resources: T[] = [];
-  let page = 1;
-  let expectedTotal: number | null = null;
-
-  while (true) {
-    const data = requireSuccessfulAssessmentResponse(
-      await request(page, REST_PAGE_SIZE),
-      context
-    );
-    const totalCount = data.total_count;
-    const items = data[arrayKey];
-    if (!Number.isInteger(totalCount) || (totalCount as number) < 0 || !Array.isArray(items)) {
-      throw new Error(`${context} returned an invalid paginated response`);
-    }
-
-    if (expectedTotal === null) {
-      expectedTotal = totalCount as number;
-    } else if (totalCount !== expectedTotal) {
-      throw new Error(`${context} total_count changed while paging`);
-    }
-
-    resources.push(...items.map(item => {
-      const object = readAssessmentObject(item);
-      if (!object) {
-        throw new Error(`${context} returned an invalid resource`);
-      }
-      return normalize(object);
-    }));
-
-    if (resources.length >= expectedTotal || items.length < REST_PAGE_SIZE) {
-      break;
-    }
-    page += 1;
-  }
-
-  return resources;
-}
-
 export async function collectEnterpriseActionsEvidence(
   requests: AssessmentActionsRequests,
   allowedActions: string | null
 ): Promise<AssessmentActionsEvidence> {
-  const failures: AssessmentActionsFailure[] = [];
+  return collectEnterpriseActionsEvidenceProgressively(
+    requests,
+    createAssessmentActionsProgress(allowedActions),
+    () => undefined
+  );
+}
 
+type AssessmentActionsProgressPhase =
+  | 'selected-actions'
+  | 'workflow-permissions'
+  | 'fork-pull-request-workflows'
+  | 'self-hosted-runner-policy'
+  | 'runner-groups'
+  | 'self-hosted-runners'
+  | 'complete';
+
+export interface AssessmentActionsProgress extends AssessmentActionsEvidence {
+  phase: AssessmentActionsProgressPhase;
+  runnerGroupPage: number;
+  runnerGroupTotal: number | null;
+  runnerPage: number;
+  runnerTotal: number | null;
+}
+
+export function createAssessmentActionsProgress(
+  allowedActions: string | null
+): AssessmentActionsProgress {
+  return {
+    phase: allowedActions === 'selected' ? 'selected-actions' : 'workflow-permissions',
+    selectedActions: null,
+    workflowPermissions: null,
+    forkPullRequestPolicy: null,
+    selfHostedRunnerPolicy: null,
+    runnerGroups: [],
+    runners: [],
+    failures: [],
+    runnerGroupPage: 1,
+    runnerGroupTotal: null,
+    runnerPage: 1,
+    runnerTotal: null,
+  };
+}
+
+export async function collectEnterpriseActionsEvidenceProgressively(
+  requests: AssessmentActionsRequests,
+  initialState: AssessmentActionsProgress,
+  saveProgress: AssessmentProgressCallback<AssessmentActionsProgress>
+): Promise<AssessmentActionsEvidence> {
+  const state = structuredClone(initialState);
   const collectCheck = async <T>(
     check: AssessmentActionsCheck,
     request: () => Promise<AssessmentRestResponse>,
@@ -1635,199 +2479,296 @@ export async function collectEnterpriseActionsEvidence(
     try {
       return normalize(requireSuccessfulAssessmentResponse(await request(), context));
     } catch (error) {
-      failures.push({ check, error: normalizeAssessmentError(error) });
+      state.failures.push({ check, error: normalizeAssessmentError(error) });
       return null;
     }
   };
 
-  const selectedActions =
-    allowedActions === 'selected'
-      ? await collectCheck(
+  while (state.phase !== 'complete') {
+    switch (state.phase) {
+      case 'selected-actions':
+        state.selectedActions = await collectCheck(
           'selected-actions',
           requests.getSelectedActions,
           'Selected Actions policy',
-          data => {
-            const patternsAllowed = data.patterns_allowed;
-            if (
-              patternsAllowed !== undefined
-              && (
-                !Array.isArray(patternsAllowed)
-                || patternsAllowed.some(item => typeof item !== 'string')
-              )
-            ) {
-              throw new Error('Selected Actions policy did not include valid patterns_allowed');
-            }
-            return {
-              githubOwnedAllowed: readOptionalAssessmentBoolean(
-                data,
-                'github_owned_allowed',
-                'Selected Actions policy'
-              ),
-              verifiedAllowed: readOptionalAssessmentBoolean(
-                data,
-                'verified_allowed',
-                'Selected Actions policy'
-              ),
-              patternsAllowed: (patternsAllowed as string[] | undefined) ?? null,
-            };
+          normalizeSelectedActions
+        );
+        state.phase = 'workflow-permissions';
+        break;
+      case 'workflow-permissions':
+        state.workflowPermissions = await collectCheck(
+          'workflow-permissions',
+          requests.getWorkflowPermissions,
+          'Workflow permissions policy',
+          normalizeActionsWorkflowPermissions
+        );
+        state.phase = 'fork-pull-request-workflows';
+        break;
+      case 'fork-pull-request-workflows':
+        state.forkPullRequestPolicy = await collectCheck(
+          'fork-pull-request-workflows',
+          requests.getForkPullRequestPolicy,
+          'Private fork pull-request policy',
+          normalizeActionsForkPullRequestPolicy
+        );
+        state.phase = 'self-hosted-runner-policy';
+        break;
+      case 'self-hosted-runner-policy':
+        state.selfHostedRunnerPolicy = await collectCheck(
+          'self-hosted-runner-policy',
+          requests.getSelfHostedRunnerPolicy,
+          'Self-hosted runner policy',
+          data => ({
+            disabledForAllOrganizations: requireAssessmentBoolean(
+              data,
+              'disable_self_hosted_runners_for_all_orgs',
+              'Self-hosted runner policy'
+            ),
+          })
+        );
+        state.phase = 'runner-groups';
+        break;
+      case 'runner-groups':
+        try {
+          const page = readActionsResourcePage(
+            await requests.getRunnerGroups(state.runnerGroupPage, REST_PAGE_SIZE),
+            'runner_groups',
+            'Runner groups',
+            normalizeRunnerGroup
+          );
+          if (
+            state.runnerGroupTotal !== null
+            && state.runnerGroupTotal !== page.totalCount
+          ) {
+            throw new Error('Runner groups total_count changed while paging');
           }
-        )
-      : null;
-
-  const workflowPermissions = await collectCheck(
-    'workflow-permissions',
-    requests.getWorkflowPermissions,
-    'Workflow permissions policy',
-    data => ({
-      defaultWorkflowPermissions: requireAssessmentString(
-        data,
-        'default_workflow_permissions',
-        'Workflow permissions policy'
-      ),
-      canApprovePullRequestReviews: requireAssessmentBoolean(
-        data,
-        'can_approve_pull_request_reviews',
-        'Workflow permissions policy'
-      ),
-    })
-  );
-
-  const forkPullRequestPolicy = await collectCheck(
-    'fork-pull-request-workflows',
-    requests.getForkPullRequestPolicy,
-    'Private fork pull-request policy',
-    data => ({
-      runWorkflowsFromForkPullRequests: requireAssessmentBoolean(
-        data,
-        'run_workflows_from_fork_pull_requests',
-        'Private fork pull-request policy'
-      ),
-      sendWriteTokensToWorkflows: requireAssessmentBoolean(
-        data,
-        'send_write_tokens_to_workflows',
-        'Private fork pull-request policy'
-      ),
-      sendSecretsAndVariables: requireAssessmentBoolean(
-        data,
-        'send_secrets_and_variables',
-        'Private fork pull-request policy'
-      ),
-      requireApprovalForForkPullRequestWorkflows: requireAssessmentBoolean(
-        data,
-        'require_approval_for_fork_pr_workflows',
-        'Private fork pull-request policy'
-      ),
-    })
-  );
-
-  const selfHostedRunnerPolicy = await collectCheck(
-    'self-hosted-runner-policy',
-    requests.getSelfHostedRunnerPolicy,
-    'Self-hosted runner policy',
-    data => ({
-      disabledForAllOrganizations: requireAssessmentBoolean(
-        data,
-        'disable_self_hosted_runners_for_all_orgs',
-        'Self-hosted runner policy'
-      ),
-    })
-  );
-
-  let runnerGroups: AssessmentRunnerGroup[] | null = null;
-  try {
-    runnerGroups = await collectPagedActionsResources(
-      requests.getRunnerGroups,
-      'runner_groups',
-      'Runner groups',
-      data => {
-        const selectedWorkflows = data.selected_workflows;
-        if (
-          selectedWorkflows !== undefined
-          && (
-            !Array.isArray(selectedWorkflows)
-            || selectedWorkflows.some(item => typeof item !== 'string')
-          )
-        ) {
-          throw new Error('Runner group included invalid selected_workflows');
-        }
-        if (!Number.isInteger(data.id)) {
-          throw new Error('Runner group did not include a valid id');
-        }
-        return {
-          githubId: data.id as number,
-          name: requireAssessmentString(data, 'name', 'Runner group'),
-          visibility: requireAssessmentString(data, 'visibility', 'Runner group'),
-          isDefault: requireAssessmentBoolean(data, 'default', 'Runner group'),
-          allowsPublicRepositories: requireAssessmentBoolean(
-            data,
-            'allows_public_repositories',
-            'Runner group'
-          ),
-          restrictedToWorkflows: readOptionalAssessmentBoolean(
-            data,
-            'restricted_to_workflows',
-            'Runner group'
-          ),
-          selectedWorkflows: (selectedWorkflows as string[] | undefined) ?? null,
-        };
-      }
-    );
-  } catch (error) {
-    failures.push({ check: 'runner-groups', error: normalizeAssessmentError(error) });
-  }
-
-  let runners: AssessmentRunner[] | null = null;
-  try {
-    runners = await collectPagedActionsResources(
-      requests.getRunners,
-      'runners',
-      'Self-hosted runners',
-      data => {
-        if (!Number.isInteger(data.id)) {
-          throw new Error('Self-hosted runner did not include a valid id');
-        }
-        if (
-          data.runner_group_id !== undefined
-          && data.runner_group_id !== null
-          && !Number.isInteger(data.runner_group_id)
-        ) {
-          throw new Error('Self-hosted runner included an invalid runner_group_id');
-        }
-        if (!Array.isArray(data.labels)) {
-          throw new Error('Self-hosted runner did not include valid labels');
-        }
-        const labels = data.labels.map(label => {
-          const object = readAssessmentObject(label);
-          if (!object || typeof object.name !== 'string') {
-            throw new Error('Self-hosted runner included an invalid label');
+          state.runnerGroupTotal = page.totalCount;
+          state.runnerGroups?.push(...page.items);
+          if (
+            (state.runnerGroups?.length ?? 0) >= page.totalCount
+            || page.items.length < REST_PAGE_SIZE
+          ) {
+            state.phase = 'self-hosted-runners';
+          } else {
+            state.runnerGroupPage += 1;
           }
-          return object.name;
-        });
-        return {
-          githubId: data.id as number,
-          runnerGroupId: (data.runner_group_id as number | null) ?? null,
-          name: requireAssessmentString(data, 'name', 'Self-hosted runner'),
-          os: requireAssessmentString(data, 'os', 'Self-hosted runner'),
-          status: requireAssessmentString(data, 'status', 'Self-hosted runner'),
-          busy: requireAssessmentBoolean(data, 'busy', 'Self-hosted runner'),
-          ephemeral: data.ephemeral === true,
-          version: typeof data.version === 'string' ? data.version : null,
-          labels,
-        };
-      }
-    );
-  } catch (error) {
-    failures.push({ check: 'self-hosted-runners', error: normalizeAssessmentError(error) });
+        } catch (error) {
+          state.failures.push({
+            check: 'runner-groups',
+            error: normalizeAssessmentError(error),
+          });
+          state.runnerGroups = null;
+          state.phase = 'self-hosted-runners';
+        }
+        break;
+      case 'self-hosted-runners':
+        try {
+          const page = readActionsResourcePage(
+            await requests.getRunners(state.runnerPage, REST_PAGE_SIZE),
+            'runners',
+            'Self-hosted runners',
+            normalizeRunner
+          );
+          if (state.runnerTotal !== null && state.runnerTotal !== page.totalCount) {
+            throw new Error('Self-hosted runners total_count changed while paging');
+          }
+          state.runnerTotal = page.totalCount;
+          state.runners?.push(...page.items);
+          if (
+            (state.runners?.length ?? 0) >= page.totalCount
+            || page.items.length < REST_PAGE_SIZE
+          ) {
+            state.phase = 'complete';
+          } else {
+            state.runnerPage += 1;
+          }
+        } catch (error) {
+          state.failures.push({
+            check: 'self-hosted-runners',
+            error: normalizeAssessmentError(error),
+          });
+          state.runners = null;
+          state.phase = 'complete';
+        }
+        break;
+    }
+    const processedItems =
+      (state.runnerGroups?.length ?? 0) + (state.runners?.length ?? 0);
+    const totalItems = state.runnerGroupTotal !== null && state.runnerTotal !== null
+      ? state.runnerGroupTotal + state.runnerTotal
+      : 0;
+    saveProgress(state, processedItems, totalItems);
   }
 
   return {
-    selectedActions,
-    workflowPermissions,
-    forkPullRequestPolicy,
-    selfHostedRunnerPolicy,
-    runnerGroups,
-    runners,
-    failures,
+    selectedActions: state.selectedActions,
+    workflowPermissions: state.workflowPermissions,
+    forkPullRequestPolicy: state.forkPullRequestPolicy,
+    selfHostedRunnerPolicy: state.selfHostedRunnerPolicy,
+    runnerGroups: state.runnerGroups,
+    runners: state.runners,
+    failures: state.failures,
+  };
+}
+
+function normalizeSelectedActions(
+  data: Record<string, unknown>
+): AssessmentActionsSelectedPolicy {
+  const patternsAllowed = data.patterns_allowed;
+  if (
+    patternsAllowed !== undefined
+    && (
+      !Array.isArray(patternsAllowed)
+      || patternsAllowed.some(item => typeof item !== 'string')
+    )
+  ) {
+    throw new Error('Selected Actions policy did not include valid patterns_allowed');
+  }
+  return {
+    githubOwnedAllowed: readOptionalAssessmentBoolean(
+      data,
+      'github_owned_allowed',
+      'Selected Actions policy'
+    ),
+    verifiedAllowed: readOptionalAssessmentBoolean(
+      data,
+      'verified_allowed',
+      'Selected Actions policy'
+    ),
+    patternsAllowed: (patternsAllowed as string[] | undefined) ?? null,
+  };
+}
+
+function normalizeActionsWorkflowPermissions(
+  data: Record<string, unknown>
+): AssessmentActionsWorkflowPermissions {
+  return {
+    defaultWorkflowPermissions: requireAssessmentString(
+      data,
+      'default_workflow_permissions',
+      'Workflow permissions policy'
+    ),
+    canApprovePullRequestReviews: requireAssessmentBoolean(
+      data,
+      'can_approve_pull_request_reviews',
+      'Workflow permissions policy'
+    ),
+  };
+}
+
+function normalizeActionsForkPullRequestPolicy(
+  data: Record<string, unknown>
+): AssessmentActionsForkPullRequestPolicy {
+  return {
+    runWorkflowsFromForkPullRequests: requireAssessmentBoolean(
+      data,
+      'run_workflows_from_fork_pull_requests',
+      'Private fork pull-request policy'
+    ),
+    sendWriteTokensToWorkflows: requireAssessmentBoolean(
+      data,
+      'send_write_tokens_to_workflows',
+      'Private fork pull-request policy'
+    ),
+    sendSecretsAndVariables: requireAssessmentBoolean(
+      data,
+      'send_secrets_and_variables',
+      'Private fork pull-request policy'
+    ),
+    requireApprovalForForkPullRequestWorkflows: requireAssessmentBoolean(
+      data,
+      'require_approval_for_fork_pr_workflows',
+      'Private fork pull-request policy'
+    ),
+  };
+}
+
+function readActionsResourcePage<T>(
+  response: AssessmentRestResponse,
+  arrayKey: 'runner_groups' | 'runners',
+  context: string,
+  normalize: (item: Record<string, unknown>) => T
+): { totalCount: number; items: T[] } {
+  const data = requireSuccessfulAssessmentResponse(response, context);
+  const totalCount = data.total_count;
+  const items = data[arrayKey];
+  if (!Number.isInteger(totalCount) || (totalCount as number) < 0 || !Array.isArray(items)) {
+    throw new Error(`${context} returned an invalid paginated response`);
+  }
+  return {
+    totalCount: totalCount as number,
+    items: items.map(item => {
+      const object = readAssessmentObject(item);
+      if (!object) throw new Error(`${context} returned an invalid resource`);
+      return normalize(object);
+    }),
+  };
+}
+
+function normalizeRunnerGroup(data: Record<string, unknown>): AssessmentRunnerGroup {
+  const selectedWorkflows = data.selected_workflows;
+  if (
+    selectedWorkflows !== undefined
+    && (
+      !Array.isArray(selectedWorkflows)
+      || selectedWorkflows.some(item => typeof item !== 'string')
+    )
+  ) {
+    throw new Error('Runner group included invalid selected_workflows');
+  }
+  if (!Number.isInteger(data.id)) {
+    throw new Error('Runner group did not include a valid id');
+  }
+  return {
+    githubId: data.id as number,
+    name: requireAssessmentString(data, 'name', 'Runner group'),
+    visibility: requireAssessmentString(data, 'visibility', 'Runner group'),
+    isDefault: requireAssessmentBoolean(data, 'default', 'Runner group'),
+    allowsPublicRepositories: requireAssessmentBoolean(
+      data,
+      'allows_public_repositories',
+      'Runner group'
+    ),
+    restrictedToWorkflows: readOptionalAssessmentBoolean(
+      data,
+      'restricted_to_workflows',
+      'Runner group'
+    ),
+    selectedWorkflows: (selectedWorkflows as string[] | undefined) ?? null,
+  };
+}
+
+function normalizeRunner(data: Record<string, unknown>): AssessmentRunner {
+  if (!Number.isInteger(data.id)) {
+    throw new Error('Self-hosted runner did not include a valid id');
+  }
+  if (
+    data.runner_group_id !== undefined
+    && data.runner_group_id !== null
+    && !Number.isInteger(data.runner_group_id)
+  ) {
+    throw new Error('Self-hosted runner included an invalid runner_group_id');
+  }
+  if (!Array.isArray(data.labels)) {
+    throw new Error('Self-hosted runner did not include valid labels');
+  }
+  const labels = data.labels.map(label => {
+    const object = readAssessmentObject(label);
+    if (!object || typeof object.name !== 'string') {
+      throw new Error('Self-hosted runner included an invalid label');
+    }
+    return object.name;
+  });
+  return {
+    githubId: data.id as number,
+    runnerGroupId: (data.runner_group_id as number | null) ?? null,
+    name: requireAssessmentString(data, 'name', 'Self-hosted runner'),
+    os: requireAssessmentString(data, 'os', 'Self-hosted runner'),
+    status: requireAssessmentString(data, 'status', 'Self-hosted runner'),
+    busy: requireAssessmentBoolean(data, 'busy', 'Self-hosted runner'),
+    ephemeral: data.ephemeral === true,
+    version: typeof data.version === 'string' ? data.version : null,
+    labels,
   };
 }
 
@@ -1875,7 +2816,7 @@ export async function collectRepositorySecurity(
       failures.push({
         nameWithOwner: repository.nameWithOwner,
         check: 'features',
-        error: error instanceof Error ? error.message : 'Repository security feature collection failed',
+        error: normalizeAssessmentError(error),
       });
     }
 
@@ -1897,7 +2838,7 @@ export async function collectRepositorySecurity(
       failures.push({
         nameWithOwner: repository.nameWithOwner,
         check: 'code-scanning-default-setup',
-        error: error instanceof Error ? error.message : 'Code scanning default setup collection failed',
+        error: normalizeAssessmentError(error),
       });
     }
 
@@ -1917,7 +2858,7 @@ export async function collectRepositorySecurity(
       failures.push({
         nameWithOwner: repository.nameWithOwner,
         check: 'dependabot-alerts',
-        error: error instanceof Error ? error.message : 'Dependabot alert status collection failed',
+        error: normalizeAssessmentError(error),
       });
     }
 
@@ -1934,7 +2875,7 @@ export async function collectRepositorySecurity(
       failures.push({
         nameWithOwner: repository.nameWithOwner,
         check: 'configuration',
-        error: error instanceof Error ? error.message : 'Code security configuration collection failed',
+        error: normalizeAssessmentError(error),
       });
     }
 
@@ -2224,6 +3165,17 @@ export async function collectRulesetDetails(
   request: AssessmentRulesetDetailRequest,
   repositories: AssessmentRepositoryRules[]
 ): Promise<AssessmentRulesetDetailCollection> {
+  const plan = createAssessmentRulesetDetailPlan(repositories);
+  const collected = await collectRulesetDetailPlanItems(request, plan.items);
+  return {
+    items: collected.items.sort((left, right) => left.name.localeCompare(right.name)),
+    failures: [...plan.failures, ...collected.failures],
+  };
+}
+
+export function createAssessmentRulesetDetailPlan(
+  repositories: AssessmentRepositoryRules[]
+): AssessmentRulesetDetailPlan {
   const references = new Map<number, {
     reference: AssessmentRulesetReference;
     repositories: Set<string>;
@@ -2289,8 +3241,24 @@ export async function collectRulesetDetails(
     }
   }
 
+  return {
+    items: [...references.values()]
+      .map(({ reference, repositories: appliedRepositories }) => ({
+        reference,
+        appliedRepositories: [...appliedRepositories].sort(),
+      }))
+      .sort((left, right) => left.reference.githubId - right.reference.githubId),
+    failures,
+  };
+}
+
+export async function collectRulesetDetailPlanItems(
+  request: AssessmentRulesetDetailRequest,
+  planItems: AssessmentRulesetDetailPlanItem[]
+): Promise<AssessmentRulesetDetailCollection> {
   const items: AssessmentRulesetDetail[] = [];
-  for (const { reference, repositories: appliedRepositories } of references.values()) {
+  const failures: AssessmentRulesetDetailFailure[] = [];
+  for (const { reference, appliedRepositories } of planItems) {
     try {
       const response = await request(reference);
       if (response.status !== 200) {
@@ -2299,7 +3267,7 @@ export async function collectRulesetDetails(
       items.push(normalizeRulesetDetail(
         response.data,
         reference,
-        [...appliedRepositories].sort()
+        appliedRepositories
       ));
     } catch (error) {
       failures.push({
@@ -2310,7 +3278,7 @@ export async function collectRulesetDetails(
   }
 
   return {
-    items: items.sort((left, right) => left.name.localeCompare(right.name)),
+    items,
     failures,
   };
 }
@@ -2458,12 +3426,38 @@ function combineProtectionControl(
 export async function collectEnterpriseCopilotSeats(
   request: AssessmentPagedRestRequest
 ): Promise<AssessmentCopilotSeatInventory> {
-  const assignments: AssessmentCopilotSeat[] = [];
-  let page = 1;
-  let totalSeats: number | null = null;
+  return collectEnterpriseCopilotSeatsProgressively(
+    request,
+    createAssessmentCopilotSeatProgress(),
+    () => undefined
+  );
+}
 
-  while (true) {
-    const response = await request(page, REST_PAGE_SIZE);
+export interface AssessmentCopilotSeatProgress {
+  page: number;
+  totalSeats: number | null;
+  assignments: AssessmentCopilotSeat[];
+  completed: boolean;
+}
+
+export function createAssessmentCopilotSeatProgress(): AssessmentCopilotSeatProgress {
+  return {
+    page: 1,
+    totalSeats: null,
+    assignments: [],
+    completed: false,
+  };
+}
+
+export async function collectEnterpriseCopilotSeatsProgressively(
+  request: AssessmentPagedRestRequest,
+  initialState: AssessmentCopilotSeatProgress,
+  saveProgress: AssessmentProgressCallback<AssessmentCopilotSeatProgress>
+): Promise<AssessmentCopilotSeatInventory> {
+  const state = structuredClone(initialState);
+
+  while (!state.completed) {
+    const response = await request(state.page, REST_PAGE_SIZE);
     if (!response || typeof response !== 'object' || Array.isArray(response)) {
       throw new Error('GitHub returned an invalid enterprise Copilot seats response');
     }
@@ -2471,15 +3465,23 @@ export async function collectEnterpriseCopilotSeats(
     if (!Number.isInteger(result.total_seats) || !Array.isArray(result.seats)) {
       throw new Error('GitHub returned an incomplete enterprise Copilot seats response');
     }
-    if (totalSeats !== null && totalSeats !== result.total_seats) {
+    if (state.totalSeats !== null && state.totalSeats !== result.total_seats) {
       throw new Error('GitHub returned inconsistent enterprise Copilot seat totals');
     }
-    totalSeats = result.total_seats as number;
-    assignments.push(...result.seats.map(normalizeCopilotSeat));
-    if (result.seats.length < REST_PAGE_SIZE) break;
-    page += 1;
+    state.totalSeats = result.total_seats as number;
+    state.assignments.push(...result.seats.map(normalizeCopilotSeat));
+    state.completed = result.seats.length < REST_PAGE_SIZE;
+    state.page += 1;
+    saveProgress(state, state.assignments.length, state.totalSeats);
   }
 
+  return normalizeCopilotSeatInventory(state.assignments, state.totalSeats ?? 0);
+}
+
+function normalizeCopilotSeatInventory(
+  assignments: AssessmentCopilotSeat[],
+  totalSeats: number
+): AssessmentCopilotSeatInventory {
   const seatsByLogin = new Map<string, AssessmentCopilotSeat>();
   for (const assignment of assignments) {
     const key = assignment.login.toLowerCase();
@@ -2519,7 +3521,7 @@ export async function collectEnterpriseCopilotSeats(
   }
 
   return {
-    totalSeats: totalSeats ?? 0,
+    totalSeats,
     rawAssignmentCount: assignments.length,
     seats: [...seatsByLogin.values()].sort((left, right) => left.login.localeCompare(right.login)),
   };
@@ -2528,11 +3530,39 @@ export async function collectEnterpriseCopilotSeats(
 export async function collectEnterpriseBudgets(
   request: AssessmentPagedRestRequest
 ): Promise<AssessmentBudget[]> {
-  const budgetsById = new Map<string, AssessmentBudget>();
-  let page = 1;
+  return collectEnterpriseBudgetsProgressively(
+    request,
+    createAssessmentBudgetProgress(),
+    () => undefined
+  );
+}
 
-  while (true) {
-    const response = await request(page, REST_PAGE_SIZE);
+export interface AssessmentBudgetProgress {
+  page: number;
+  totalCount: number | null;
+  budgets: AssessmentBudget[];
+  completed: boolean;
+}
+
+export function createAssessmentBudgetProgress(): AssessmentBudgetProgress {
+  return {
+    page: 1,
+    totalCount: null,
+    budgets: [],
+    completed: false,
+  };
+}
+
+export async function collectEnterpriseBudgetsProgressively(
+  request: AssessmentPagedRestRequest,
+  initialState: AssessmentBudgetProgress,
+  saveProgress: AssessmentProgressCallback<AssessmentBudgetProgress>
+): Promise<AssessmentBudget[]> {
+  const state = structuredClone(initialState);
+  const budgetIds = new Set(state.budgets.map(budget => budget.id));
+
+  while (!state.completed) {
+    const response = await request(state.page, REST_PAGE_SIZE);
     if (!response || typeof response !== 'object' || Array.isArray(response)) {
       throw new Error('GitHub returned an invalid enterprise budgets response');
     }
@@ -2540,96 +3570,170 @@ export async function collectEnterpriseBudgets(
     if (!Array.isArray(result.budgets) || typeof result.has_next_page !== 'boolean') {
       throw new Error('GitHub returned an incomplete enterprise budgets response');
     }
+    if (
+      result.total_count !== undefined
+      && (!Number.isInteger(result.total_count) || (result.total_count as number) < 0)
+    ) {
+      throw new Error('GitHub returned an invalid enterprise budget total');
+    }
+    if (
+      state.totalCount !== null
+      && result.total_count !== undefined
+      && state.totalCount !== result.total_count
+    ) {
+      throw new Error('GitHub returned inconsistent enterprise budget totals');
+    }
+    state.totalCount ??= typeof result.total_count === 'number' ? result.total_count : null;
     for (const value of result.budgets) {
       const budget = normalizeBudget(value);
-      if (budgetsById.has(budget.id)) {
+      if (budgetIds.has(budget.id)) {
         throw new Error(`GitHub returned duplicate enterprise budget ${budget.id}`);
       }
-      budgetsById.set(budget.id, budget);
+      budgetIds.add(budget.id);
+      state.budgets.push(budget);
     }
-    if (!result.has_next_page) break;
-    page += 1;
+    state.completed = !result.has_next_page;
+    state.page += 1;
+    saveProgress(state, state.budgets.length, state.totalCount ?? 0);
   }
 
-  return [...budgetsById.values()];
+  return state.budgets;
 }
 
 export async function collectCopilotGovernance(
   requests: AssessmentCopilotRequests,
   organizationLogins: string[]
 ): Promise<AssessmentCopilotEvidence> {
-  const failures: AssessmentCopilotFailure[] = [];
-  let contentExclusionRuleCount: number | null = null;
+  return collectCopilotGovernanceProgressively(
+    requests,
+    organizationLogins,
+    createAssessmentCopilotGovernanceProgress(),
+    () => undefined
+  );
+}
 
-  try {
-    const response = await requests.getContentExclusion();
-    if (response.status !== 200) {
-      throw new Error(describeRestFailure('enterprise Copilot content exclusion', response));
+export interface AssessmentCopilotGovernanceProgress extends AssessmentCopilotEvidence {
+  phase: 'content-exclusion' | 'organization-settings' | 'coding-agent' | 'complete';
+  organizationIndex: number;
+  currentOrganization: AssessmentCopilotOrganization | null;
+}
+
+export function createAssessmentCopilotGovernanceProgress():
+AssessmentCopilotGovernanceProgress {
+  return {
+    phase: 'content-exclusion',
+    organizationIndex: 0,
+    currentOrganization: null,
+    contentExclusionRuleCount: null,
+    organizations: [],
+    failures: [],
+  };
+}
+
+export async function collectCopilotGovernanceProgressively(
+  requests: AssessmentCopilotRequests,
+  organizationLogins: string[],
+  initialState: AssessmentCopilotGovernanceProgress,
+  saveProgress: AssessmentProgressCallback<AssessmentCopilotGovernanceProgress>
+): Promise<AssessmentCopilotEvidence> {
+  const state = structuredClone(initialState);
+
+  while (state.phase !== 'complete') {
+    if (state.phase === 'content-exclusion') {
+      try {
+        const response = await requests.getContentExclusion();
+        if (response.status !== 200) {
+          throw new Error(describeRestFailure('enterprise Copilot content exclusion', response));
+        }
+        state.contentExclusionRuleCount = countCopilotContentExclusionRules(response.data);
+      } catch (error) {
+        state.failures.push({
+          scope: 'enterprise',
+          check: 'content-exclusion',
+          error: normalizeAssessmentError(error),
+        });
+      }
+      state.phase = organizationLogins.length > 0 ? 'organization-settings' : 'complete';
+    } else {
+      const organizationLogin = organizationLogins[state.organizationIndex];
+      if (!organizationLogin) {
+        state.phase = 'complete';
+      } else if (state.phase === 'organization-settings') {
+        const organization = createEmptyCopilotOrganization(organizationLogin);
+        try {
+          const response = await requests.getOrganizationSettings(organizationLogin);
+          if (response.status !== 200) {
+            throw new Error(describeRestFailure('organization Copilot settings', response));
+          }
+          Object.assign(organization, normalizeCopilotOrganization(response.data));
+        } catch (error) {
+          state.failures.push({
+            scope: organizationLogin,
+            check: 'organization-settings',
+            error: normalizeAssessmentError(error),
+          });
+        }
+        state.currentOrganization = organization;
+        state.phase = 'coding-agent';
+      } else {
+        const organization =
+          state.currentOrganization ?? createEmptyCopilotOrganization(organizationLogin);
+        try {
+          const response = await requests.getCodingAgentPermissions(organizationLogin);
+          if (response.status !== 200) {
+            throw new Error(
+              describeRestFailure('organization Copilot coding agent policy', response)
+            );
+          }
+          const permissions = readAssessmentObject(response.data);
+          if (!permissions || typeof permissions.enabled_repositories !== 'string') {
+            throw new Error('GitHub returned invalid organization Copilot coding agent policy');
+          }
+          organization.codingAgentRepositoryScope = permissions.enabled_repositories;
+        } catch (error) {
+          state.failures.push({
+            scope: organizationLogin,
+            check: 'coding-agent',
+            error: normalizeAssessmentError(error),
+          });
+        }
+        state.organizations.push(organization);
+        state.currentOrganization = null;
+        state.organizationIndex += 1;
+        state.phase = state.organizationIndex < organizationLogins.length
+          ? 'organization-settings'
+          : 'complete';
+      }
     }
-    contentExclusionRuleCount = countCopilotContentExclusionRules(response.data);
-  } catch (error) {
-    failures.push({
-      scope: 'enterprise',
-      check: 'content-exclusion',
-      error: normalizeAssessmentError(error),
-    });
+    saveProgress(state, state.organizationIndex, organizationLogins.length);
   }
 
-  const organizations: AssessmentCopilotOrganization[] = [];
-  for (const organizationLogin of organizationLogins) {
-    const organization: AssessmentCopilotOrganization = {
-      organizationLogin,
-      seatTotal: null,
-      seatsAddedThisCycle: null,
-      seatsPendingCancellation: null,
-      seatsPendingInvitation: null,
-      activeSeatsThisCycle: null,
-      inactiveSeatsThisCycle: null,
-      planType: null,
-      seatManagementSetting: null,
-      publicCodeSuggestions: null,
-      ideChat: null,
-      platformChat: null,
-      cli: null,
-      codingAgentRepositoryScope: null,
-    };
+  return {
+    contentExclusionRuleCount: state.contentExclusionRuleCount,
+    organizations: state.organizations,
+    failures: state.failures,
+  };
+}
 
-    try {
-      const response = await requests.getOrganizationSettings(organizationLogin);
-      if (response.status !== 200) {
-        throw new Error(describeRestFailure('organization Copilot settings', response));
-      }
-      Object.assign(organization, normalizeCopilotOrganization(response.data));
-    } catch (error) {
-      failures.push({
-        scope: organizationLogin,
-        check: 'organization-settings',
-        error: normalizeAssessmentError(error),
-      });
-    }
-
-    try {
-      const response = await requests.getCodingAgentPermissions(organizationLogin);
-      if (response.status !== 200) {
-        throw new Error(describeRestFailure('organization Copilot coding agent policy', response));
-      }
-      const permissions = readAssessmentObject(response.data);
-      if (!permissions || typeof permissions.enabled_repositories !== 'string') {
-        throw new Error('GitHub returned invalid organization Copilot coding agent policy');
-      }
-      organization.codingAgentRepositoryScope = permissions.enabled_repositories;
-    } catch (error) {
-      failures.push({
-        scope: organizationLogin,
-        check: 'coding-agent',
-        error: normalizeAssessmentError(error),
-      });
-    }
-
-    organizations.push(organization);
-  }
-
-  return { contentExclusionRuleCount, organizations, failures };
+function createEmptyCopilotOrganization(
+  organizationLogin: string
+): AssessmentCopilotOrganization {
+  return {
+    organizationLogin,
+    seatTotal: null,
+    seatsAddedThisCycle: null,
+    seatsPendingCancellation: null,
+    seatsPendingInvitation: null,
+    activeSeatsThisCycle: null,
+    inactiveSeatsThisCycle: null,
+    planType: null,
+    seatManagementSetting: null,
+    publicCodeSuggestions: null,
+    ideChat: null,
+    platformChat: null,
+    cli: null,
+    codingAgentRepositoryScope: null,
+  };
 }
 
 export async function collectBillingGovernance(
@@ -2637,93 +3741,345 @@ export async function collectBillingGovernance(
   budgets: AssessmentBudget[],
   userLogins: string[]
 ): Promise<AssessmentBillingEvidence> {
-  const failures: AssessmentBillingFailure[] = [];
-  const costCenters: AssessmentCostCenter[] = [];
+  return collectBillingGovernanceProgressively(
+    requests,
+    budgets,
+    userLogins,
+    createAssessmentBillingProgress(),
+    () => undefined
+  );
+}
 
-  try {
-    const response = await requests.getCostCenters();
-    if (response.status !== 200) {
-      throw new Error(describeRestFailure('enterprise billing cost centers', response));
-    }
-    const result = readAssessmentObject(response.data);
-    if (!result || !Array.isArray(result.costCenters)) {
-      throw new Error('GitHub returned invalid enterprise billing cost centers');
-    }
+type AssessmentBillingProgressPhase =
+  | 'cost-centers'
+  | 'cost-center-details'
+  | 'effective-budgets'
+  | 'multi-user-budget-states'
+  | 'usage-summary'
+  | 'complete';
 
-    for (const value of result.costCenters) {
-      const summary = normalizeCostCenter(value, null);
-      try {
-        const details = await collectCostCenterDetails(requests, summary.id);
-        costCenters.push(details);
-      } catch (error) {
-        failures.push({
-          scope: summary.name,
-          check: 'cost-center-resources',
-          error: normalizeAssessmentError(error),
-        });
-        costCenters.push({ ...summary, resources: null });
-      }
-    }
-  } catch (error) {
-    failures.push({
-      scope: 'enterprise',
-      check: 'cost-centers',
-      error: normalizeAssessmentError(error),
-    });
-  }
+interface AssessmentCostCenterProgress {
+  page: number;
+  value: AssessmentCostCenter | null;
+  resources: AssessmentCostCenterResource[];
+}
 
-  const effectiveBudgets: AssessmentEffectiveBudget[] = [];
-  for (const user of uniqueSortedStrings(userLogins)) {
-    try {
-      effectiveBudgets.push(await collectEffectiveBudget(requests, user));
-    } catch (error) {
-      failures.push({
-        scope: user,
-        check: 'effective-budget',
-        error: normalizeAssessmentError(error),
-      });
-    }
-  }
+interface AssessmentEffectiveBudgetProgress {
+  page: number;
+  user: string;
+  budgetId: string | null;
+  amount: number | null;
+  consumedAmount: number | null;
+  applicableBudgetIds: string[];
+}
 
-  const multiUserBudgetStates: AssessmentBudgetUserState[] = [];
-  for (const budget of budgets.filter(
+interface AssessmentBudgetUserStateProgress {
+  page: number;
+  states: AssessmentBudgetUserState[];
+}
+
+export interface AssessmentBillingProgress extends AssessmentBillingEvidence {
+  phase: AssessmentBillingProgressPhase;
+  costCenterSummaries: AssessmentCostCenter[];
+  costCenterIndex: number;
+  currentCostCenter: AssessmentCostCenterProgress | null;
+  userIndex: number;
+  currentEffectiveBudget: AssessmentEffectiveBudgetProgress | null;
+  budgetIndex: number;
+  currentBudgetUserStates: AssessmentBudgetUserStateProgress | null;
+}
+
+export function createAssessmentBillingProgress(): AssessmentBillingProgress {
+  return {
+    phase: 'cost-centers',
+    costCenters: [],
+    effectiveBudgets: [],
+    multiUserBudgetStates: [],
+    usage: null,
+    failures: [],
+    costCenterSummaries: [],
+    costCenterIndex: 0,
+    currentCostCenter: null,
+    userIndex: 0,
+    currentEffectiveBudget: null,
+    budgetIndex: 0,
+    currentBudgetUserStates: null,
+  };
+}
+
+export async function collectBillingGovernanceProgressively(
+  requests: AssessmentBillingRequests,
+  budgets: AssessmentBudget[],
+  userLogins: string[],
+  initialState: AssessmentBillingProgress,
+  saveProgress: AssessmentProgressCallback<AssessmentBillingProgress>
+): Promise<AssessmentBillingEvidence> {
+  const state = structuredClone(initialState);
+  const users = uniqueSortedStrings(userLogins);
+  const multiUserBudgets = budgets.filter(
     value => value.scope === 'multi_user_customer' || value.scope === 'multi_user_cost_center'
-  )) {
-    try {
-      multiUserBudgetStates.push(...await collectBudgetUserStates(requests, budget.id));
-    } catch (error) {
-      failures.push({
-        scope: formatBudgetResource(budget),
-        check: 'multi-user-budget-states',
-        error: normalizeAssessmentError(error),
-      });
-    }
-  }
+  );
+  const totalItems = () => (
+    state.costCenterSummaries.length + users.length + multiUserBudgets.length + 1
+  );
+  const processedItems = () => (
+    state.costCenterIndex + state.userIndex + state.budgetIndex
+    + (state.phase === 'complete' ? 1 : 0)
+  );
 
-  let usage: AssessmentBillingUsage | null = null;
-  try {
-    const response = await requests.getUsageSummary();
-    if (response.status !== 200) {
-      throw new Error(describeRestFailure('enterprise billing usage summary', response));
+  while (state.phase !== 'complete') {
+    switch (state.phase) {
+      case 'cost-centers':
+        try {
+          const response = await requests.getCostCenters();
+          if (response.status !== 200) {
+            throw new Error(describeRestFailure('enterprise billing cost centers', response));
+          }
+          const result = readAssessmentObject(response.data);
+          if (!result || !Array.isArray(result.costCenters)) {
+            throw new Error('GitHub returned invalid enterprise billing cost centers');
+          }
+          state.costCenterSummaries = result.costCenters.map(value => (
+            normalizeCostCenter(value, null)
+          ));
+        } catch (error) {
+          state.failures.push({
+            scope: 'enterprise',
+            check: 'cost-centers',
+            error: normalizeAssessmentError(error),
+          });
+        }
+        state.phase = state.costCenterSummaries.length > 0
+          ? 'cost-center-details'
+          : 'effective-budgets';
+        break;
+      case 'cost-center-details':
+        await collectBillingCostCenterPage(requests, state);
+        if (state.costCenterIndex >= state.costCenterSummaries.length) {
+          state.phase = 'effective-budgets';
+        }
+        break;
+      case 'effective-budgets':
+        await collectBillingEffectiveBudgetPage(requests, users, state);
+        if (state.userIndex >= users.length) {
+          state.phase = 'multi-user-budget-states';
+        }
+        break;
+      case 'multi-user-budget-states':
+        await collectBillingBudgetStatePage(requests, multiUserBudgets, state);
+        if (state.budgetIndex >= multiUserBudgets.length) {
+          state.phase = 'usage-summary';
+        }
+        break;
+      case 'usage-summary':
+        try {
+          const response = await requests.getUsageSummary();
+          if (response.status !== 200) {
+            throw new Error(describeRestFailure('enterprise billing usage summary', response));
+          }
+          state.usage = normalizeBillingUsage(response.data);
+        } catch (error) {
+          state.failures.push({
+            scope: 'enterprise',
+            check: 'usage-summary',
+            error: normalizeAssessmentError(error),
+          });
+        }
+        state.phase = 'complete';
+        break;
     }
-    usage = normalizeBillingUsage(response.data);
-  } catch (error) {
-    failures.push({
-      scope: 'enterprise',
-      check: 'usage-summary',
-      error: normalizeAssessmentError(error),
-    });
+    saveProgress(state, processedItems(), totalItems());
   }
 
   return {
-    costCenters: costCenters.sort((left, right) => left.name.localeCompare(right.name)),
-    effectiveBudgets,
-    multiUserBudgetStates: multiUserBudgetStates.sort(
+    costCenters: state.costCenters.sort((left, right) => left.name.localeCompare(right.name)),
+    effectiveBudgets: state.effectiveBudgets,
+    multiUserBudgetStates: state.multiUserBudgetStates.sort(
       (left, right) => left.user.localeCompare(right.user)
     ),
-    usage,
-    failures,
+    usage: state.usage,
+    failures: state.failures,
   };
+}
+
+async function collectBillingCostCenterPage(
+  requests: AssessmentBillingRequests,
+  state: AssessmentBillingProgress
+) {
+  const summary = state.costCenterSummaries[state.costCenterIndex];
+  if (!summary) {
+    state.costCenterIndex = state.costCenterSummaries.length;
+    return;
+  }
+  const progress = state.currentCostCenter ?? { page: 1, value: null, resources: [] };
+  try {
+    const response = await requests.getCostCenter(summary.id, progress.page, REST_PAGE_SIZE);
+    if (response.status !== 200) {
+      throw new Error(describeRestFailure('billing cost center details', response));
+    }
+    const value = normalizeCostCenter(response.data, []);
+    if (value.id !== summary.id) {
+      throw new Error(`GitHub returned the wrong billing cost center ${value.id}`);
+    }
+    if (progress.value && (
+      progress.value.name !== value.name
+      || progress.value.state !== value.state
+      || progress.value.aiCreditPoolEnabled !== value.aiCreditPoolEnabled
+    )) {
+      throw new Error(`GitHub returned inconsistent billing cost center ${value.name}`);
+    }
+    progress.value = value;
+    progress.resources.push(...(value.resources ?? []));
+    const record = readAssessmentObject(response.data);
+    if (!record || typeof record.has_next_page !== 'boolean') {
+      throw new Error('GitHub returned incomplete billing cost center pagination');
+    }
+    if (record.has_next_page) {
+      progress.page += 1;
+      state.currentCostCenter = progress;
+      return;
+    }
+    state.costCenters.push({
+      ...value,
+      resources: deduplicateCostCenterResources(progress.resources),
+    });
+  } catch (error) {
+    state.failures.push({
+      scope: summary.name,
+      check: 'cost-center-resources',
+      error: normalizeAssessmentError(error),
+    });
+    state.costCenters.push({ ...summary, resources: null });
+  }
+  state.currentCostCenter = null;
+  state.costCenterIndex += 1;
+}
+
+async function collectBillingEffectiveBudgetPage(
+  requests: AssessmentBillingRequests,
+  users: string[],
+  state: AssessmentBillingProgress
+) {
+  const requestedUser = users[state.userIndex];
+  if (!requestedUser) {
+    state.userIndex = users.length;
+    return;
+  }
+  const progress = state.currentEffectiveBudget ?? {
+    page: 1,
+    user: requestedUser,
+    budgetId: null,
+    amount: null,
+    consumedAmount: null,
+    applicableBudgetIds: [],
+  };
+  try {
+    const response = await requests.getEffectiveBudget(
+      requestedUser,
+      progress.page,
+      REST_PAGE_SIZE
+    );
+    if (response.status !== 200) {
+      throw new Error(describeRestFailure('effective user budget', response));
+    }
+    const result = readAssessmentObject(response.data);
+    if (!result || !Array.isArray(result.budgets) || typeof result.has_next_page !== 'boolean') {
+      throw new Error('GitHub returned an invalid effective user budget response');
+    }
+    if (typeof result.user === 'string') progress.user = result.user;
+    const applicableBudgetIds = new Set(progress.applicableBudgetIds);
+    for (const budgetValue of result.budgets) {
+      const budget = readAssessmentObject(budgetValue);
+      if (!budget || typeof budget.id !== 'string') {
+        throw new Error('GitHub returned an invalid applicable user budget');
+      }
+      applicableBudgetIds.add(budget.id);
+    }
+    progress.applicableBudgetIds = [...applicableBudgetIds].sort();
+    const effectiveBudget = normalizeEffectiveBudget(result.effective_budget);
+    if (
+      progress.budgetId !== null
+      && effectiveBudget
+      && progress.budgetId !== effectiveBudget.budgetId
+    ) {
+      throw new Error(`GitHub returned inconsistent effective budgets for ${requestedUser}`);
+    }
+    if (effectiveBudget) {
+      progress.budgetId = effectiveBudget.budgetId;
+      progress.amount = effectiveBudget.amount;
+      progress.consumedAmount = effectiveBudget.consumedAmount;
+    }
+    if (result.has_next_page) {
+      progress.page += 1;
+      state.currentEffectiveBudget = progress;
+      return;
+    }
+    state.effectiveBudgets.push({
+      user: progress.user,
+      budgetId: progress.budgetId,
+      amount: progress.amount,
+      consumedAmount: progress.consumedAmount,
+      applicableBudgetIds: progress.applicableBudgetIds,
+    });
+  } catch (error) {
+    state.failures.push({
+      scope: requestedUser,
+      check: 'effective-budget',
+      error: normalizeAssessmentError(error),
+    });
+  }
+  state.currentEffectiveBudget = null;
+  state.userIndex += 1;
+}
+
+async function collectBillingBudgetStatePage(
+  requests: AssessmentBillingRequests,
+  budgets: AssessmentBudget[],
+  state: AssessmentBillingProgress
+) {
+  const budget = budgets[state.budgetIndex];
+  if (!budget) {
+    state.budgetIndex = budgets.length;
+    return;
+  }
+  const progress = state.currentBudgetUserStates ?? { page: 1, states: [] };
+  try {
+    const response = await requests.getBudgetUserStates(
+      budget.id,
+      progress.page,
+      REST_PAGE_SIZE
+    );
+    if (response.status !== 200) {
+      throw new Error(describeRestFailure('multi-user budget states', response));
+    }
+    const result = readAssessmentObject(response.data);
+    if (!result || !Array.isArray(result.user_states) || typeof result.has_next_page !== 'boolean') {
+      throw new Error('GitHub returned an invalid multi-user budget states response');
+    }
+    const stateUsers = new Set(progress.states.map(value => value.user.toLowerCase()));
+    for (const value of result.user_states) {
+      const userState = normalizeBudgetUserState(value, budget.id);
+      if (stateUsers.has(userState.user.toLowerCase())) {
+        throw new Error(`GitHub returned duplicate budget state for ${userState.user}`);
+      }
+      stateUsers.add(userState.user.toLowerCase());
+      progress.states.push(userState);
+    }
+    if (result.has_next_page) {
+      progress.page += 1;
+      state.currentBudgetUserStates = progress;
+      return;
+    }
+    state.multiUserBudgetStates.push(...progress.states);
+  } catch (error) {
+    state.failures.push({
+      scope: formatBudgetResource(budget),
+      check: 'multi-user-budget-states',
+      error: normalizeAssessmentError(error),
+    });
+  }
+  state.currentBudgetUserStates = null;
+  state.budgetIndex += 1;
 }
 
 export function evaluateAssessmentBaseline(input: {
@@ -2748,7 +4104,10 @@ export function evaluateAssessmentBaseline(input: {
   billingEvidence?: AssessmentBillingEvidence | null;
   now?: Date;
 }): AssessmentEvaluation {
-  const findings: Array<Omit<AssessmentFinding, 'expectedState' | 'evidenceSources'>> = [];
+  const findings: Array<Omit<
+    AssessmentFinding,
+    'expectedState' | 'evidenceSources' | 'remediation'
+  >> = [];
   const now = input.now ?? new Date();
   const staleThreshold = now.getTime() - STALE_REPOSITORY_DAYS * 24 * 60 * 60 * 1000;
   const activeRepositories = input.repositories.filter(repository => !repository.isArchived);
@@ -3740,6 +5099,7 @@ export function evaluateAssessmentBaseline(input: {
   const detailedFindings = findings.map(finding => ({
     ...finding,
     ...getAssessmentFindingEvidence(finding.ruleKey),
+    remediation: getAssessmentFindingRemediation(finding.ruleKey),
   }));
   const { healthScore, domainScores } = calculateAssessmentScores(
     detailedFindings,
@@ -4109,49 +5469,6 @@ function countCopilotContentExclusionRules(value: unknown): number {
   return Object.keys(rules).length;
 }
 
-async function collectCostCenterDetails(
-  requests: AssessmentBillingRequests,
-  costCenterId: string
-): Promise<AssessmentCostCenter> {
-  let page = 1;
-  let costCenter: AssessmentCostCenter | null = null;
-  const resources: AssessmentCostCenterResource[] = [];
-
-  while (true) {
-    const response = await requests.getCostCenter(costCenterId, page, REST_PAGE_SIZE);
-    if (response.status !== 200) {
-      throw new Error(describeRestFailure('billing cost center details', response));
-    }
-    const value = normalizeCostCenter(response.data, []);
-    if (value.id !== costCenterId) {
-      throw new Error(`GitHub returned the wrong billing cost center ${value.id}`);
-    }
-    if (costCenter && (
-      costCenter.name !== value.name
-      || costCenter.state !== value.state
-      || costCenter.aiCreditPoolEnabled !== value.aiCreditPoolEnabled
-    )) {
-      throw new Error(`GitHub returned inconsistent billing cost center ${value.name}`);
-    }
-    costCenter = value;
-    resources.push(...(value.resources ?? []));
-    const record = readAssessmentObject(response.data);
-    if (!record || typeof record.has_next_page !== 'boolean') {
-      throw new Error('GitHub returned incomplete billing cost center pagination');
-    }
-    if (!record.has_next_page) break;
-    page += 1;
-  }
-
-  if (!costCenter) {
-    throw new Error(`GitHub returned no details for billing cost center ${costCenterId}`);
-  }
-  return {
-    ...costCenter,
-    resources: deduplicateCostCenterResources(resources),
-  };
-}
-
 function normalizeCostCenter(
   value: unknown,
   unavailableResources: AssessmentCostCenterResource[] | null
@@ -4197,54 +5514,6 @@ function normalizeCostCenter(
   };
 }
 
-async function collectEffectiveBudget(
-  requests: AssessmentBillingRequests,
-  requestedUser: string
-): Promise<AssessmentEffectiveBudget> {
-  let page = 1;
-  let user = requestedUser;
-  let effectiveBudget: Omit<AssessmentEffectiveBudget, 'user' | 'applicableBudgetIds'> | null = null;
-  const applicableBudgetIds = new Set<string>();
-
-  while (true) {
-    const response = await requests.getEffectiveBudget(requestedUser, page, REST_PAGE_SIZE);
-    if (response.status !== 200) {
-      throw new Error(describeRestFailure('effective user budget', response));
-    }
-    const result = readAssessmentObject(response.data);
-    if (!result || !Array.isArray(result.budgets) || typeof result.has_next_page !== 'boolean') {
-      throw new Error('GitHub returned an invalid effective user budget response');
-    }
-    if (typeof result.user === 'string') user = result.user;
-    for (const budgetValue of result.budgets) {
-      const budget = readAssessmentObject(budgetValue);
-      if (!budget || typeof budget.id !== 'string') {
-        throw new Error('GitHub returned an invalid applicable user budget');
-      }
-      applicableBudgetIds.add(budget.id);
-    }
-    const normalizedEffectiveBudget = normalizeEffectiveBudget(result.effective_budget);
-    if (
-      effectiveBudget
-      && normalizedEffectiveBudget
-      && effectiveBudget.budgetId !== normalizedEffectiveBudget.budgetId
-    ) {
-      throw new Error(`GitHub returned inconsistent effective budgets for ${requestedUser}`);
-    }
-    effectiveBudget ??= normalizedEffectiveBudget;
-    if (!result.has_next_page) break;
-    page += 1;
-  }
-
-  return {
-    user,
-    budgetId: effectiveBudget?.budgetId ?? null,
-    amount: effectiveBudget?.amount ?? null,
-    consumedAmount: effectiveBudget?.consumedAmount ?? null,
-    applicableBudgetIds: [...applicableBudgetIds].sort(),
-  };
-}
-
 function normalizeEffectiveBudget(
   value: unknown
 ): Omit<AssessmentEffectiveBudget, 'user' | 'applicableBudgetIds'> | null {
@@ -4263,34 +5532,6 @@ function normalizeEffectiveBudget(
     amount: budget.budget_amount,
     consumedAmount: budget.consumed_amount,
   };
-}
-
-async function collectBudgetUserStates(
-  requests: AssessmentBillingRequests,
-  budgetId: string
-): Promise<AssessmentBudgetUserState[]> {
-  let page = 1;
-  const states = new Map<string, AssessmentBudgetUserState>();
-  while (true) {
-    const response = await requests.getBudgetUserStates(budgetId, page, REST_PAGE_SIZE);
-    if (response.status !== 200) {
-      throw new Error(describeRestFailure('multi-user budget states', response));
-    }
-    const result = readAssessmentObject(response.data);
-    if (!result || !Array.isArray(result.user_states) || typeof result.has_next_page !== 'boolean') {
-      throw new Error('GitHub returned an invalid multi-user budget states response');
-    }
-    for (const value of result.user_states) {
-      const state = normalizeBudgetUserState(value, budgetId);
-      if (states.has(state.user.toLowerCase())) {
-        throw new Error(`GitHub returned duplicate budget state for ${state.user}`);
-      }
-      states.set(state.user.toLowerCase(), state);
-    }
-    if (!result.has_next_page) break;
-    page += 1;
-  }
-  return [...states.values()];
 }
 
 function normalizeBudgetUserState(value: unknown, budgetId: string): AssessmentBudgetUserState {

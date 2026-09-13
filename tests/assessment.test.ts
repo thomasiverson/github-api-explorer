@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  compareAssessmentSnapshots,
   collectEnterpriseActionsEvidence,
   collectEnterpriseActionsPolicy,
   collectBillingGovernance,
@@ -20,6 +21,9 @@ import {
   collectRulesetDetails,
   evaluateAssessmentBaseline,
   formatScimRoleLabel,
+  type AssessmentDomain,
+  type AssessmentFinding,
+  type AssessmentSeverity,
 } from '../src/lib/assessment';
 
 test('collects and normalizes paginated enterprise organizations', async () => {
@@ -1269,6 +1273,10 @@ test('evaluates evidence-backed identity and repository baseline findings', () =
     label: 'Enterprise member and owner inventory',
     endpoint: 'GraphQL Enterprise.members',
   }]);
+  assert.equal(evaluation.findings[0].remediation.controlLevel, 'Enterprise');
+  assert.equal(evaluation.findings[0].remediation.effort, 'Moderate');
+  assert.equal(evaluation.findings[0].remediation.steps.length, 3);
+  assert.match(evaluation.findings[0].remediation.verification, /at least two enterprise owners/);
   assert.deepEqual(evaluation.metrics, {
     activeRepositories: 1,
     archivedRepositories: 1,
@@ -2035,3 +2043,149 @@ test('evaluates Copilot policy and billing ownership depth conservatively', () =
   assert.equal(evaluation.metrics.usersWithoutEffectiveBudgets, 1);
   assert.equal(evaluation.metrics.billingNetAmount, 38);
 });
+
+  test('compares scores, finding lifecycle, severity, and affected resources', () => {
+    const comparison = compareAssessmentSnapshots(
+      {
+        id: 'previous-run',
+        metrics: { healthScore: 70 },
+        domainScores: { identity: 70 },
+        collectors: [
+          { collector_key: 'identity', status: 'completed' },
+          { collector_key: 'security', status: 'completed' },
+          { collector_key: 'billing', status: 'completed' },
+        ],
+        findings: [
+          comparisonFinding('shared', 'high', ['alpha', 'beta'], 'identity'),
+          comparisonFinding('changed', 'low', ['stable-resource'], 'identity'),
+          comparisonFinding('resolved', 'medium', ['repository-one'], 'security'),
+          comparisonFinding('uncertain', 'low', ['budget-one'], 'billing'),
+        ],
+      },
+      {
+        id: 'current-run',
+        metrics: { healthScore: 80 },
+        domainScores: { identity: 80 },
+        collectors: [
+          { collector_key: 'identity', status: 'completed' },
+          { collector_key: 'security', status: 'completed' },
+          { collector_key: 'billing', status: 'failed' },
+        ],
+        findings: [
+          comparisonFinding('shared', 'medium', ['beta', 'gamma'], 'identity'),
+          {
+            ...comparisonFinding('changed', 'low', ['stable-resource'], 'identity'),
+            summary: 'Observed state changed.',
+          },
+          comparisonFinding('new', 'low', ['delta'], 'identity'),
+        ],
+      }
+    );
+
+    assert.equal(comparison.scoreComparable, true);
+    assert.equal(comparison.scoreDelta, 10);
+    assert.deepEqual(comparison.domainChanges, [{
+      domain: 'identity',
+      previousScore: 70,
+      currentScore: 80,
+      delta: 10,
+    }]);
+    assert.deepEqual(
+      Object.fromEntries(comparison.findingChanges.map(change => [change.ruleKey, change.status])),
+      {
+        new: 'new',
+        shared: 'improved',
+        changed: 'changed',
+        resolved: 'resolved',
+        uncertain: 'unverified',
+      }
+    );
+    const shared = comparison.findingChanges.find(change => change.ruleKey === 'shared');
+    assert.deepEqual(shared?.addedResources, ['gamma']);
+    assert.deepEqual(shared?.removedResources, ['alpha']);
+    assert.equal(shared?.previousFinding?.severity, 'high');
+    assert.equal(shared?.finding.severity, 'medium');
+    assert.ok(comparison.notes.some(note => note.includes('current run')));
+    assert.ok(comparison.notes.some(note => note.includes('could not be verified')));
+  });
+
+  test('does not report resolutions from partial, failed, or missing collector evidence', () => {
+    const previousFindings = [
+      comparisonFinding('partial-rule', 'medium', ['one'], 'partial-collector'),
+      comparisonFinding('failed-rule', 'medium', ['two'], 'failed-collector'),
+      comparisonFinding('missing-rule', 'medium', ['three'], 'missing-collector'),
+    ];
+    const comparison = compareAssessmentSnapshots(
+      {
+        id: 'previous-run',
+        metrics: { healthScore: 75 },
+        domainScores: { security: 75 },
+        collectors: [
+          { collector_key: 'partial-collector', status: 'completed' },
+          { collector_key: 'failed-collector', status: 'completed' },
+          { collector_key: 'missing-collector', status: 'completed' },
+        ],
+        findings: previousFindings,
+      },
+      {
+        id: 'current-run',
+        metrics: { healthScore: 100 },
+        domainScores: { security: 100, identity: 100 },
+        collectors: [
+          { collector_key: 'partial-collector', status: 'partial' },
+          { collector_key: 'failed-collector', status: 'failed' },
+        ],
+        findings: [],
+      }
+    );
+
+    assert.equal(comparison.scoreComparable, false);
+    assert.equal(comparison.scoreDelta, null);
+    assert.ok(comparison.findingChanges.every(change => change.status === 'unverified'));
+    assert.deepEqual(
+      Object.fromEntries(comparison.findingChanges.map(change => [change.ruleKey, change.evidenceConfidence])),
+      {
+        'partial-rule': 'partial',
+        'failed-rule': 'unavailable',
+        'missing-rule': 'unavailable',
+      }
+    );
+  });
+
+  function comparisonFinding(
+    ruleKey: string,
+    severity: AssessmentSeverity,
+    affectedResources: string[],
+    domainOrCollector: AssessmentDomain | string
+  ): AssessmentFinding {
+    const domain = (
+      ['identity', 'repositories', 'security', 'actions', 'copilot', 'billing'] as string[]
+    ).includes(domainOrCollector)
+      ? domainOrCollector as AssessmentDomain
+      : 'security';
+    const collectorKey = domainOrCollector;
+    return {
+      ruleKey,
+      domain,
+      severity,
+      title: `${ruleKey} finding`,
+      summary: 'Observed state',
+      recommendation: 'Recommended outcome',
+      affectedResources,
+      expectedState: 'Expected state',
+      evidenceSources: [{
+        collectorKey,
+        label: `${collectorKey} evidence`,
+        endpoint: 'GET /evidence',
+      }],
+      remediation: {
+        controlLevel: 'Enterprise',
+        effort: 'Low',
+        settingsPath: 'Enterprise settings',
+        apiEndpoint: null,
+        steps: ['Review the control.'],
+        rollback: 'Restore the prior state.',
+        verification: 'Run the assessment again.',
+      },
+    };
+  }
