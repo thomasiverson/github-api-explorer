@@ -42,12 +42,12 @@ const INVENTORY_METRICS = [
 ];
 
 const ASSESSMENT_DOMAINS = [
-  { key: 'identity', name: 'Identity & access', detail: 'Owners, organization defaults, access grants, and SCIM provisioning' },
-  { key: 'repositories', name: 'Repository governance', detail: 'Visibility, archival state, and repository activity' },
-  { key: 'security', name: 'Security posture', detail: 'Secret scanning, code scanning, Dependabot, security configurations' },
-  { key: 'actions', name: 'Actions & runners', detail: 'Workflow permissions, fork trust, runner groups, and runner health' },
-  { key: 'copilot', name: 'Copilot', detail: 'Billed seats and recent activity' },
-  { key: 'billing', name: 'Billing & licensing', detail: 'Budget coverage, enforcement, and alerting' },
+  { key: 'identity', name: 'Identity & access', detail: 'Owners, organization defaults, access grants, and SCIM provisioning', resultsHref: '#identity-governance-heading' },
+  { key: 'repositories', name: 'Repository governance', detail: 'Visibility, archival state, and repository activity', resultsHref: '#branch-governance-heading' },
+  { key: 'security', name: 'Security posture', detail: 'Secret scanning, code scanning, Dependabot, security configurations', resultsHref: '#repository-security-heading' },
+  { key: 'actions', name: 'Actions & runners', detail: 'Workflow permissions, fork trust, runner groups, and runner health', resultsHref: '#actions-trust-heading' },
+  { key: 'copilot', name: 'Copilot', detail: 'Billed seats and recent activity', resultsHref: '#copilot-governance-heading' },
+  { key: 'billing', name: 'Billing & licensing', detail: 'Budget coverage, enforcement, and alerting', resultsHref: '#billing-governance-heading' },
 ] as const;
 
 const PACING_PROFILES: Array<{
@@ -63,6 +63,71 @@ const PACING_PROFILES: Array<{
 ];
 
 type AssessmentDomainKey = (typeof ASSESSMENT_DOMAINS)[number]['key'];
+
+const ASSESSMENT_DOMAIN_STYLES: Record<AssessmentDomainKey, {
+  code: string;
+  fullName: string;
+  textClass: string;
+  borderClass: string;
+  topBorderClass: string;
+  surfaceClass: string;
+  barClass: string;
+}> = {
+  identity: {
+    code: 'ID',
+    fullName: 'Identity & access governance',
+    textClass: 'text-domain-identity',
+    borderClass: 'border-domain-identity/50',
+    topBorderClass: 'border-t-domain-identity',
+    surfaceClass: 'bg-domain-identity/10',
+    barClass: 'bg-domain-identity',
+  },
+  repositories: {
+    code: 'RE',
+    fullName: 'Repository governance',
+    textClass: 'text-domain-repositories',
+    borderClass: 'border-domain-repositories/50',
+    topBorderClass: 'border-t-domain-repositories',
+    surfaceClass: 'bg-domain-repositories/10',
+    barClass: 'bg-domain-repositories',
+  },
+  security: {
+    code: 'SE',
+    fullName: 'Repository security coverage',
+    textClass: 'text-domain-security',
+    borderClass: 'border-domain-security/50',
+    topBorderClass: 'border-t-domain-security',
+    surfaceClass: 'bg-domain-security/10',
+    barClass: 'bg-domain-security',
+  },
+  actions: {
+    code: 'AC',
+    fullName: 'Actions trust boundaries',
+    textClass: 'text-domain-actions',
+    borderClass: 'border-domain-actions/50',
+    topBorderClass: 'border-t-domain-actions',
+    surfaceClass: 'bg-domain-actions/10',
+    barClass: 'bg-domain-actions',
+  },
+  copilot: {
+    code: 'AI',
+    fullName: 'Copilot governance & adoption',
+    textClass: 'text-domain-copilot',
+    borderClass: 'border-domain-copilot/50',
+    topBorderClass: 'border-t-domain-copilot',
+    surfaceClass: 'bg-domain-copilot/10',
+    barClass: 'bg-domain-copilot',
+  },
+  billing: {
+    code: 'BI',
+    fullName: 'Billing ownership & budget hierarchy',
+    textClass: 'text-domain-billing',
+    borderClass: 'border-domain-billing/50',
+    topBorderClass: 'border-t-domain-billing',
+    surfaceClass: 'bg-domain-billing/10',
+    barClass: 'bg-domain-billing',
+  },
+};
 
 interface AssessmentCollectorResult {
   collector_key: string;
@@ -1220,6 +1285,11 @@ export default function AssessmentPage() {
                   Domain coverage: {baselineEvaluated ? `${assessedDomainCount} of ${ASSESSMENT_DOMAINS.length}` : '--'}
                 </span>
               </div>
+              <div className="grid h-1 grid-cols-6" aria-hidden="true">
+                {ASSESSMENT_DOMAINS.map(domain => (
+                  <span key={domain.key} className={ASSESSMENT_DOMAIN_STYLES[domain.key].barClass} />
+                ))}
+              </div>
               <div className="grid sm:grid-cols-[180px_1fr] min-h-48">
                 <div className="border-b sm:border-b-0 sm:border-r border-border flex flex-col items-center justify-center p-6">
                   <div className="relative w-28 h-28 rounded-full border-8 border-surface flex items-center justify-center">
@@ -1300,20 +1370,61 @@ export default function AssessmentPage() {
           <section aria-labelledby="domains-heading" className="border border-border bg-panel rounded-lg overflow-hidden">
             <div className="px-4 py-3 border-b border-border">
               <h2 id="domains-heading" className="text-sm font-semibold text-text-primary">Assessment domains</h2>
-              <p className="text-xs text-text-muted mt-0.5">Each assessed domain contributes equally to the overall score; collection coverage remains separate.</p>
+              <p className="text-xs text-text-muted mt-0.5">The posture map uses a consistent accent for each governance domain; every assessed domain contributes equally to the overall score.</p>
             </div>
-            <div className="divide-y divide-border">
+            <div className="grid gap-px bg-border sm:grid-cols-2 xl:grid-cols-3">
               {ASSESSMENT_DOMAINS.map(domain => {
                 const score = snapshot?.domainScores?.[domain.key];
+                const styles = ASSESSMENT_DOMAIN_STYLES[domain.key];
                 return (
-                  <div key={domain.name} className="px-4 py-3 grid gap-2 sm:grid-cols-[190px_1fr_120px_80px] sm:items-center">
-                    <span className="text-sm font-medium text-text-primary">{domain.name}</span>
-                    <span className="text-xs text-text-secondary">{domain.detail}</span>
-                    <span className="text-xs text-text-muted sm:text-right">{domainStatuses[domain.key]}</span>
-                    <span className="text-xs font-medium tabular-nums text-text-primary sm:text-right">
-                      {score === undefined ? '—' : `${score} / 100`}
+                  <a
+                    key={domain.name}
+                    href={domain.resultsHref}
+                    className={`group block border-t-2 bg-panel p-4 transition-colors hover:bg-surface/40 focus-visible:z-10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent ${styles.topBorderClass}`}
+                    aria-label={`View ${domain.name} assessment results`}
+                  >
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="flex min-w-0 items-center gap-2.5">
+                        <span
+                          aria-hidden="true"
+                          className={`inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md border font-mono text-[10px] font-semibold tracking-wide ${styles.borderClass} ${styles.surfaceClass} ${styles.textClass}`}
+                        >
+                          {styles.code}
+                        </span>
+                        <div className="min-w-0">
+                          <h3 className="text-sm font-semibold text-text-primary">{domain.name}</h3>
+                          <p className="mt-0.5 text-[10px] font-medium uppercase tracking-wide text-text-muted">
+                            {domainStatuses[domain.key]}
+                          </p>
+                        </div>
+                      </div>
+                      <span className={`shrink-0 font-mono text-xl font-semibold tabular-nums ${score === undefined ? 'text-text-muted' : styles.textClass}`}>
+                        {score === undefined ? '—' : score}
+                      </span>
+                    </div>
+                    {score === undefined ? (
+                      <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-surface" aria-label={`${domain.name} not assessed`} />
+                    ) : (
+                      <div
+                        role="progressbar"
+                        aria-label={`${domain.name} score`}
+                        aria-valuemin={0}
+                        aria-valuemax={100}
+                        aria-valuenow={score}
+                        className="mt-3 h-1.5 overflow-hidden rounded-full bg-surface"
+                      >
+                        <div
+                          className={`h-full rounded-full ${styles.barClass}`}
+                          style={{ width: `${Math.max(0, Math.min(score, 100))}%` }}
+                        />
+                      </div>
+                    )}
+                    <p className="mt-3 text-xs leading-relaxed text-text-secondary">{domain.detail}</p>
+                    <span className={`mt-3 inline-flex items-center gap-1 text-[11px] font-semibold ${styles.textClass}`}>
+                      View results
+                      <span aria-hidden="true" className="transition-transform group-hover:translate-y-0.5">↓</span>
                     </span>
-                  </div>
+                  </a>
                 );
               })}
             </div>
@@ -1601,16 +1712,14 @@ export default function AssessmentPage() {
             )}
           </section>
 
-          <section aria-labelledby="identity-governance-heading" className="border border-border bg-panel rounded-lg overflow-hidden">
+          <section aria-labelledby="identity-governance-heading" className="scroll-mt-24 border border-border bg-panel rounded-lg overflow-hidden">
             <div className="px-4 py-3 border-b border-border flex flex-col gap-2 md:flex-row md:items-end md:justify-between">
-              <div>
-                <h2 id="identity-governance-heading" className="text-sm font-semibold text-text-primary">
-                  Identity & access governance
-                </h2>
-                <p className="text-xs text-text-muted mt-0.5">
-                  Organization defaults, direct repository grants, team access, and managed-user provisioning.
-                </p>
-              </div>
+              <AssessmentSectionHeading
+                domainKey="identity"
+                headingId="identity-governance-heading"
+                title="Identity & access governance"
+                description="Organization defaults, direct repository grants, team access, and managed-user provisioning."
+              />
               <span className="text-xs text-text-muted">
                 {organizationAccess.length > 0
                   ? `${organizationAccess.length} organizations measured`
@@ -1794,16 +1903,14 @@ export default function AssessmentPage() {
             )}
           </section>
 
-          <section aria-labelledby="branch-governance-heading" className="border border-border bg-panel rounded-lg overflow-hidden">
+          <section aria-labelledby="branch-governance-heading" className="scroll-mt-24 border border-border bg-panel rounded-lg overflow-hidden">
             <div className="px-4 py-3 border-b border-border flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
-              <div>
-                <h2 id="branch-governance-heading" className="text-sm font-semibold text-text-primary">
-                  Default branch safeguards
-                </h2>
-                <p className="text-xs text-text-muted mt-0.5">
-                  Effective active rulesets and classic protection on existing default branches.
-                </p>
-              </div>
+              <AssessmentSectionHeading
+                domainKey="repositories"
+                headingId="branch-governance-heading"
+                title="Default branch safeguards"
+                description="Effective active rulesets and classic protection on existing default branches."
+              />
               <span className="text-xs text-text-muted">
                 {baselineEvaluated
                   ? `${snapshot?.metrics.protectedDefaultBranches ?? 0} of ${snapshot?.metrics.defaultBranchRepositories ?? 0} protected`
@@ -1980,16 +2087,14 @@ export default function AssessmentPage() {
             )}
           </section>
 
-          <section aria-labelledby="repository-security-heading" className="border border-border bg-panel rounded-lg overflow-hidden">
+          <section aria-labelledby="repository-security-heading" className="scroll-mt-24 border border-border bg-panel rounded-lg overflow-hidden">
             <div className="px-4 py-3 border-b border-border flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
-              <div>
-                <h2 id="repository-security-heading" className="text-sm font-semibold text-text-primary">
-                  Repository security coverage
-                </h2>
-                <p className="text-xs text-text-muted mt-0.5">
-                  Actual feature states for active, non-fork repositories. Unknown values are excluded from findings.
-                </p>
-              </div>
+              <AssessmentSectionHeading
+                domainKey="security"
+                headingId="repository-security-heading"
+                title="Repository security coverage"
+                description="Actual feature states for active, non-fork repositories. Unknown values are excluded from findings."
+              />
               <span className="text-xs text-text-muted">
                 {baselineEvaluated
                   ? `${snapshot?.metrics.repositorySecurityEvidence || 0} of ${snapshot?.metrics.eligibleSecurityRepositories || 0} repositories measured`
@@ -2080,16 +2185,14 @@ export default function AssessmentPage() {
             )}
           </section>
 
-          <section aria-labelledby="actions-trust-heading" className="border border-border bg-panel rounded-lg overflow-hidden">
+          <section aria-labelledby="actions-trust-heading" className="scroll-mt-24 border border-border bg-panel rounded-lg overflow-hidden">
             <div className="px-4 py-3 border-b border-border flex flex-col gap-2 md:flex-row md:items-end md:justify-between">
-              <div>
-                <h2 id="actions-trust-heading" className="text-sm font-semibold text-text-primary">
-                  Actions trust boundaries
-                </h2>
-                <p className="text-xs text-text-muted mt-0.5">
-                  Enterprise workflow privileges and the self-hosted compute they can reach.
-                </p>
-              </div>
+              <AssessmentSectionHeading
+                domainKey="actions"
+                headingId="actions-trust-heading"
+                title="Actions trust boundaries"
+                description="Enterprise workflow privileges and the self-hosted compute they can reach."
+              />
               <span className="text-xs text-text-muted">
                 {actionsEvidence
                   ? `${actionsEvidence.runners?.length ?? '--'} self-hosted runners`
@@ -2259,16 +2362,14 @@ export default function AssessmentPage() {
             )}
           </section>
 
-          <section aria-labelledby="copilot-governance-heading" className="border border-border bg-panel rounded-lg overflow-hidden">
+          <section aria-labelledby="copilot-governance-heading" className="scroll-mt-24 border border-border bg-panel rounded-lg overflow-hidden">
             <div className="px-4 py-3 border-b border-border flex flex-col gap-2 md:flex-row md:items-end md:justify-between">
-              <div>
-                <h2 id="copilot-governance-heading" className="text-sm font-semibold text-text-primary">
-                  Copilot governance & adoption
-                </h2>
-                <p className="text-xs text-text-muted mt-0.5">
-                  Paid-seat activity, assignment provenance, organization policy, and coding-agent reach.
-                </p>
-              </div>
+              <AssessmentSectionHeading
+                domainKey="copilot"
+                headingId="copilot-governance-heading"
+                title="Copilot governance & adoption"
+                description="Paid-seat activity, assignment provenance, organization policy, and coding-agent reach."
+              />
               <span className="text-xs text-text-muted">
                 {copilotDepthCollector
                   ? `${copilotEvidence?.organizations.length ?? 0} organizations measured`
@@ -2427,16 +2528,14 @@ export default function AssessmentPage() {
             )}
           </section>
 
-          <section aria-labelledby="billing-governance-heading" className="border border-border bg-panel rounded-lg overflow-hidden">
+          <section aria-labelledby="billing-governance-heading" className="scroll-mt-24 border border-border bg-panel rounded-lg overflow-hidden">
             <div className="px-4 py-3 border-b border-border flex flex-col gap-2 md:flex-row md:items-end md:justify-between">
-              <div>
-                <h2 id="billing-governance-heading" className="text-sm font-semibold text-text-primary">
-                  Billing ownership & budget hierarchy
-                </h2>
-                <p className="text-xs text-text-muted mt-0.5">
-                  Cost-center membership, shared pools, per-user allowances, alert ownership, and current-period usage.
-                </p>
-              </div>
+              <AssessmentSectionHeading
+                domainKey="billing"
+                headingId="billing-governance-heading"
+                title="Billing ownership & budget hierarchy"
+                description="Cost-center membership, shared pools, per-user allowances, alert ownership, and current-period usage."
+              />
               <span className="text-xs text-text-muted">
                 {billingDepthCollector
                   ? `${billingEvidence?.costCenters.length ?? 0} active cost centers`
@@ -2681,43 +2780,81 @@ export default function AssessmentPage() {
           </section>
 
           <section aria-labelledby="findings-heading">
-            <div className="border border-border bg-panel rounded-lg overflow-hidden">
-              <div className="px-4 py-3 border-b border-border">
-                <h2 id="findings-heading" className="text-sm font-semibold text-text-primary">Priority findings</h2>
-                <p className="text-xs text-text-muted mt-0.5">Highest-impact issues requiring attention.</p>
+            <details className="overflow-hidden rounded-lg border border-border bg-panel">
+              <summary className="cursor-pointer px-4 py-3 focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent">
+                <h2 id="findings-heading" className="ml-1 inline text-sm font-semibold text-text-primary">
+                  Priority findings
+                </h2>
+                <span className="ml-2 text-xs font-medium text-text-secondary">
+                  {findings.length === 1 ? '1 finding' : `${findings.length} findings`}
+                </span>
+                <span className="mt-0.5 block pl-4 text-xs text-text-muted">
+                  Highest-impact issues requiring attention.
+                </span>
+              </summary>
+              <div className="border-t border-border">
+                {findings.length > 0 ? (
+                  <div className="divide-y divide-border">
+                    {findings.map(finding => (
+                      <FindingDrillDown
+                        key={finding.ruleKey}
+                        finding={finding}
+                        collectors={snapshot?.collectors ?? []}
+                        completedAt={snapshot?.completedAt ?? null}
+                        runId={snapshot?.id ?? null}
+                      />
+                    ))}
+                  </div>
+                ) : (
+                  <div className="min-h-64 px-6 py-10 flex flex-col items-center justify-center text-center">
+                    <svg width="32" height="32" viewBox="0 0 16 16" fill="currentColor" className="text-text-muted mb-3" aria-hidden="true">
+                      <path d="M8.75 1.75a.75.75 0 0 0-1.5 0v6c0 .414.336.75.75.75h4.293l-1.147 1.146a.75.75 0 0 0 1.061 1.061l2.427-2.427a.75.75 0 0 0 0-1.06l-2.427-2.427a.75.75 0 0 0-1.06 1.06L12.292 7H8.75V1.75Z" />
+                      <path d="M3.5 3.75a.25.25 0 0 0-.25.25v8a.25.25 0 0 0 .25.25h6a.25.25 0 0 0 .25-.25v-.5a.75.75 0 0 1 1.5 0v.5c0 .966-.784 1.75-1.75 1.75h-6A1.75 1.75 0 0 1 1.75 12V4c0-.966.784-1.75 1.75-1.75H5a.75.75 0 0 1 0 1.5H3.5Z" />
+                    </svg>
+                    <p className="text-sm font-medium text-text-primary">
+                      {baselineEvaluated ? 'No baseline findings' : 'Baseline not evaluated'}
+                    </p>
+                    <p className="text-xs text-text-secondary mt-1 max-w-56">
+                      {baselineEvaluated
+                        ? 'The currently supported identity and repository checks passed.'
+                        : 'Run the assessment again to evaluate evidence-backed baseline checks.'}
+                    </p>
+                  </div>
+                )}
               </div>
-              {findings.length > 0 ? (
-                <div className="divide-y divide-border">
-                  {findings.map(finding => (
-                    <FindingDrillDown
-                      key={finding.ruleKey}
-                      finding={finding}
-                      collectors={snapshot?.collectors ?? []}
-                      completedAt={snapshot?.completedAt ?? null}
-                      runId={snapshot?.id ?? null}
-                    />
-                  ))}
-                </div>
-              ) : (
-                <div className="min-h-64 px-6 py-10 flex flex-col items-center justify-center text-center">
-                  <svg width="32" height="32" viewBox="0 0 16 16" fill="currentColor" className="text-text-muted mb-3" aria-hidden="true">
-                    <path d="M8.75 1.75a.75.75 0 0 0-1.5 0v6c0 .414.336.75.75.75h4.293l-1.147 1.146a.75.75 0 0 0 1.061 1.061l2.427-2.427a.75.75 0 0 0 0-1.06l-2.427-2.427a.75.75 0 0 0-1.06 1.06L12.292 7H8.75V1.75Z" />
-                    <path d="M3.5 3.75a.25.25 0 0 0-.25.25v8a.25.25 0 0 0 .25.25h6a.25.25 0 0 0 .25-.25v-.5a.75.75 0 0 1 1.5 0v.5c0 .966-.784 1.75-1.75 1.75h-6A1.75 1.75 0 0 1 1.75 12V4c0-.966.784-1.75 1.75-1.75H5a.75.75 0 0 1 0 1.5H3.5Z" />
-                  </svg>
-                  <p className="text-sm font-medium text-text-primary">
-                    {baselineEvaluated ? 'No baseline findings' : 'Baseline not evaluated'}
-                  </p>
-                  <p className="text-xs text-text-secondary mt-1 max-w-56">
-                    {baselineEvaluated
-                      ? 'The currently supported identity and repository checks passed.'
-                      : 'Run the assessment again to evaluate evidence-backed baseline checks.'}
-                  </p>
-                </div>
-              )}
-            </div>
+            </details>
           </section>
         </div>
       </main>
+    </div>
+  );
+}
+
+function AssessmentSectionHeading({
+  domainKey,
+  headingId,
+  title,
+  description,
+}: {
+  domainKey: AssessmentDomainKey;
+  headingId: string;
+  title: string;
+  description: string;
+}) {
+  const styles = ASSESSMENT_DOMAIN_STYLES[domainKey];
+
+  return (
+    <div className="flex min-w-0 items-start gap-3">
+      <span
+        aria-hidden="true"
+        className={`inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-md border font-mono text-[10px] font-semibold tracking-wide ${styles.borderClass} ${styles.surfaceClass} ${styles.textClass}`}
+      >
+        {styles.code}
+      </span>
+      <div className="min-w-0">
+        <h2 id={headingId} className="text-sm font-semibold text-text-primary">{title}</h2>
+        <p className="mt-0.5 text-xs text-text-muted">{description}</p>
+      </div>
     </div>
   );
 }
@@ -2761,6 +2898,7 @@ function FindingDrillDown({
   runId: string | null;
 }) {
   const domain = ASSESSMENT_DOMAINS.find(candidate => candidate.key === finding.domain);
+  const domainStyles = domain ? ASSESSMENT_DOMAIN_STYLES[domain.key] : null;
   const evidenceSources = finding.evidenceSources ?? [];
   const expectedState = finding.expectedState
     || 'Run the assessment again to attach the expected baseline to this historical finding.';
@@ -2770,7 +2908,18 @@ function FindingDrillDown({
       <details className="group">
         <summary className="list-none cursor-pointer rounded-md focus:outline-none focus-visible:ring-2 focus-visible:ring-accent">
           <span className="flex items-start justify-between gap-3">
-            <span className="text-sm font-medium text-text-primary">{finding.title}</span>
+            <span className="flex min-w-0 items-start gap-2">
+              {domainStyles && (
+                <span
+                  aria-hidden="true"
+                  title={domainStyles.fullName}
+                  className={`inline-flex h-6 w-6 shrink-0 items-center justify-center rounded border font-mono text-[9px] font-semibold tracking-wide ${domainStyles.borderClass} ${domainStyles.surfaceClass} ${domainStyles.textClass}`}
+                >
+                  {domainStyles.code}
+                </span>
+              )}
+              <span className="pt-0.5 text-sm font-medium text-text-primary">{finding.title}</span>
+            </span>
             <span className={`shrink-0 text-[10px] font-semibold uppercase ${severityClass(finding.severity)}`}>
               {finding.severity}
             </span>

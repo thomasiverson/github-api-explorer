@@ -15,6 +15,12 @@
   --warning: #d29922;
   --danger: #f85149;
   --info: #58a6ff;
+  --domain-identity: #a78bfa;
+  --domain-repositories: #58a6ff;
+  --domain-security: #2dd4bf;
+  --domain-actions: #f2cc60;
+  --domain-copilot: #db61a2;
+  --domain-billing: #56d4dd;
   --method-get: #3fb950;
   --method-post: #58a6ff;
   --method-put: #d29922;
@@ -38,6 +44,12 @@
   --warning: #9a6700;
   --danger: #d1242f;
   --info: #0969da;
+  --domain-identity: #8250df;
+  --domain-repositories: #0969da;
+  --domain-security: #087f5b;
+  --domain-actions: #9a6700;
+  --domain-copilot: #bf3989;
+  --domain-billing: #0a7ea4;
   --method-get: #1a7f37;
   --method-post: #0969da;
   --method-put: #9a6700;
@@ -61,6 +73,12 @@
   --color-warning: var(--warning);
   --color-danger: var(--danger);
   --color-info: var(--info);
+  --color-domain-identity: var(--domain-identity);
+  --color-domain-repositories: var(--domain-repositories);
+  --color-domain-security: var(--domain-security);
+  --color-domain-actions: var(--domain-actions);
+  --color-domain-copilot: var(--domain-copilot);
+  --color-domain-billing: var(--domain-billing);
   --color-method-get: var(--method-get);
   --color-method-post: var(--method-post);
   --color-method-put: var(--method-put);
