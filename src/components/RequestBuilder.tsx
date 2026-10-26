@@ -481,6 +481,7 @@ export function RequestBuilder() {
     ? parsedJsonLines?.rows.length || 0
     : batchValues.split('\n').filter(line => line.trim()).length;
   const batchHasErrors = (parsedJsonLines?.errors.length || 0) > 0;
+  const batchAllowed = selectedEndpoint.remediationContext?.batchAllowed ?? true;
 
   return (
     <div className="flex-1 flex flex-col bg-canvas min-w-0 overflow-x-hidden">
@@ -531,10 +532,14 @@ export function RequestBuilder() {
               setShowBatch(nextShowBatch);
               if (nextShowBatch) setActiveTab('params');
             }}
-            disabled={!activeEnv || !hasBatchTargets}
+            disabled={!activeEnv || !hasBatchTargets || !batchAllowed}
             className={`px-2.5 py-1.5 border text-sm rounded-md transition-colors shrink-0
               ${showBatch ? 'border-accent text-accent bg-accent/10' : 'border-border text-text-secondary hover:bg-surface disabled:opacity-50'}`}
-            title={hasBatchTargets ? 'Batch execute with multiple request values' : 'This request has no batchable values'}
+            title={!batchAllowed
+              ? 'Batch execution is disabled for assessment remediation requests'
+              : hasBatchTargets
+                ? 'Batch execute with multiple request values'
+                : 'This request has no batchable values'}
           >
             Batch
           </button>
@@ -543,15 +548,30 @@ export function RequestBuilder() {
 
       {/* Scrollable content area */}
       <div className="flex-1 overflow-y-auto min-h-0">
+        {selectedEndpoint.remediationContext && (
+          <div className="mx-3 mt-3 rounded-md border border-warning/50 bg-warning/10 px-3 py-2.5">
+            <p className="text-xs font-semibold text-text-primary">
+              Prepared from an assessment finding
+            </p>
+            <p className="mt-1 text-[11px] text-text-secondary">
+              Nothing has been sent. Review the target, parameters, and request body before
+              selecting Send.
+              {selectedEndpoint.remediationContext.previewOnly
+                ? ' This recipe is preview-only in the assessment; sending remains a separate, explicit API Explorer action.'
+                : ''}
+            </p>
+          </div>
+        )}
+
         {/* Endpoint info */}
         {selectedEndpoint.summary && (
           <div className="px-3 pt-2">
             <EndpointInfo
               summary={selectedEndpoint.summary}
               description={selectedEndpoint.description}
-              operationId={selectedEndpoint.operationId}
               category={selectedEndpoint.category}
               specVersion={selectedEndpoint.specVersion}
+              showDocs={!selectedEndpoint.remediationContext}
             />
           </div>
         )}
@@ -897,7 +917,7 @@ export function RequestBuilder() {
       </div>
       </div>{/* end scrollable content area */}
       {confirmState && selectedEndpoint && (() => {
-        const info = getConfirmMessage(selectedEndpoint.method, resolvedPath);
+        const info = getConfirmMessage(selectedEndpoint.method);
         return (
           <ConfirmDialog
             open={true}
@@ -950,8 +970,12 @@ function isValidJson(text: string): boolean {
   try { JSON.parse(text); return true; } catch { return false; }
 }
 
-function EndpointInfo({ summary, description, operationId, category, specVersion }: {
-  summary: string; description: string; operationId: string; category: string; specVersion: string;
+function EndpointInfo({ summary, description, category, specVersion, showDocs = true }: {
+  summary: string;
+  description: string;
+  category: string;
+  specVersion: string;
+  showDocs?: boolean;
 }) {
   const [collapsed, setCollapsed] = useState(false);
   const hasDescription = description && description.trim().length > 0;
@@ -971,13 +995,15 @@ function EndpointInfo({ summary, description, operationId, category, specVersion
     <div className="mt-2">
       <div className="flex items-start gap-2">
         <p className="text-xs font-medium text-text-primary flex-1">{summary}</p>
-        <a href={docsUrl} target="_blank" rel="noopener noreferrer"
-          className="text-[11px] text-accent hover:underline shrink-0 flex items-center gap-0.5">
-          Docs
-          <svg width="10" height="10" viewBox="0 0 16 16" fill="currentColor">
-            <path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z" />
-          </svg>
-        </a>
+        {showDocs && (
+          <a href={docsUrl} target="_blank" rel="noopener noreferrer"
+            className="text-[11px] text-accent hover:underline shrink-0 flex items-center gap-0.5">
+            Docs
+            <svg width="10" height="10" viewBox="0 0 16 16" fill="currentColor">
+              <path d="M3.75 2h3.5a.75.75 0 0 1 0 1.5h-3.5a.25.25 0 0 0-.25.25v8.5c0 .138.112.25.25.25h8.5a.25.25 0 0 0 .25-.25v-3.5a.75.75 0 0 1 1.5 0v3.5A1.75 1.75 0 0 1 12.25 14h-8.5A1.75 1.75 0 0 1 2 12.25v-8.5C2 2.784 2.784 2 3.75 2Zm6.854-1h4.146a.25.25 0 0 1 .25.25v4.146a.25.25 0 0 1-.427.177L13.03 4.03 9.28 7.78a.751.751 0 0 1-1.042-.018.751.751 0 0 1-.018-1.042l3.75-3.75-1.543-1.543A.25.25 0 0 1 10.604 1Z" />
+            </svg>
+          </a>
+        )}
       </div>
       {hasDescription && (
         <div className="mt-1.5">

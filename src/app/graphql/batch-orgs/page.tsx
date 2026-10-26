@@ -304,7 +304,7 @@ export default function BatchCreateOrgsPage() {
       let hasNext = true;
 
       while (hasNext) {
-        const res = await fetch('/api/graphql', {
+        const res: Response = await fetch('/api/graphql', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({

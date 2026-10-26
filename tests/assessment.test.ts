@@ -1,0 +1,2191 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import {
+  compareAssessmentSnapshots,
+  collectEnterpriseActionsEvidence,
+  collectEnterpriseActionsPolicy,
+  collectBillingGovernance,
+  collectCopilotGovernance,
+  collectEnterpriseBudgets,
+  collectEnterpriseCopilotSeats,
+  collectEnterpriseIdentity,
+  collectEnterpriseOrganizations,
+  collectEnterpriseScim,
+  collectEnterpriseSecurityDefaults,
+  collectOrganizationAccess,
+  collectOrganizationRepositories,
+  collectOrganizationTeams,
+  collectRepositoryAccess,
+  collectRepositoryRules,
+  collectRepositorySecurity,
+  collectRulesetDetails,
+  evaluateAssessmentBaseline,
+  formatScimRoleLabel,
+  type AssessmentDomain,
+  type AssessmentFinding,
+  type AssessmentSeverity,
+} from '../src/lib/assessment';
+
+test('collects and normalizes paginated enterprise organizations', async () => {
+  const firstPage = Array.from({ length: 100 }, (_, index) => ({
+    databaseId: index + 1,
+    id: `ORG_${index + 1}`,
+    login: `org-${index + 1}`,
+    description: index === 0 ? 'Primary organization' : null,
+  }));
+  const requestedCursors: unknown[] = [];
+
+  const organizations = await collectEnterpriseOrganizations(async (_query, variables) => {
+    requestedCursors.push(variables.cursor);
+    return {
+      enterprise: {
+        organizations: variables.cursor === null
+          ? { nodes: firstPage, pageInfo: { hasNextPage: true, endCursor: 'next-page' } }
+          : { nodes: [{ databaseId: 101, id: 'ORG_101', login: 'org-101', description: null }], pageInfo: { hasNextPage: false, endCursor: null } },
+      },
+    };
+  }, 'acme');
+
+  assert.equal(organizations.length, 101);
+  assert.deepEqual(requestedCursors, [null, 'next-page']);
+  assert.deepEqual(organizations[0], {
+    githubId: 1,
+    nodeId: 'ORG_1',
+    login: 'org-1',
+    description: 'Primary organization',
+  });
+});
+
+test('rejects malformed organization inventory responses', async () => {
+  await assert.rejects(
+    () => collectEnterpriseOrganizations(async () => ({ enterprise: { organizations: [] } }), 'acme'),
+    /invalid organization inventory response/
+  );
+  await assert.rejects(
+    () => collectEnterpriseOrganizations(async () => ({
+      enterprise: {
+        organizations: {
+          nodes: [{ id: 'ORG_1' }],
+          pageInfo: { hasNextPage: false, endCursor: null },
+        },
+      },
+    }), 'acme'),
+    /incomplete organization record/
+  );
+});
+
+test('collects paginated enterprise members and owners', async () => {
+  const calls: Array<{ query: string; cursor: unknown }> = [];
+  const identity = await collectEnterpriseIdentity(async (query, variables) => {
+    calls.push({ query, cursor: variables.cursor });
+    if (query.includes('EnterpriseMembers')) {
+      return {
+        enterprise: {
+          members: variables.cursor === null
+            ? {
+                nodes: [{ login: 'member-one', name: 'Member One' }],
+                pageInfo: { hasNextPage: true, endCursor: 'members-next' },
+              }
+            : {
+                nodes: [{ login: 'OWNER-ONE', name: null }],
+                pageInfo: { hasNextPage: false, endCursor: null },
+              },
+        },
+      };
+    }
+    return {
+      enterprise: {
+        ownerInfo: {
+          admins: {
+            nodes: [{ login: 'owner-one' }],
+            pageInfo: { hasNextPage: false, endCursor: null },
+          },
+        },
+      },
+    };
+  }, 'acme');
+
+  assert.deepEqual(calls.map(call => call.cursor), [null, 'members-next', null]);
+  assert.deepEqual(identity, {
+    members: [
+      { login: 'member-one', name: 'Member One', isOwner: false },
+      { login: 'OWNER-ONE', name: null, isOwner: true },
+    ],
+    ownerLogins: ['owner-one'],
+  });
+});
+
+test('rejects malformed enterprise identity responses', async () => {
+  await assert.rejects(
+    () => collectEnterpriseIdentity(async () => ({ enterprise: { members: null } }), 'acme'),
+    /invalid member inventory response/
+  );
+});
+
+test('collects paginated organization access evidence and preserves partial failures', async () => {
+  const adminPages: number[] = [];
+  const result = await collectOrganizationAccess({
+    getOrganization: async organizationLogin => ({
+      status: 200,
+      data: {
+        default_repository_permission: organizationLogin === 'org-one' ? 'read' : 'none',
+        members_can_create_repositories: true,
+        members_can_create_public_repositories: organizationLogin === 'org-one',
+        members_can_create_private_repositories: true,
+        members_can_create_internal_repositories: true,
+        members_can_fork_private_repositories: false,
+        two_factor_requirement_enabled: false,
+      },
+    }),
+    getAdministrators: async (organizationLogin, page) => {
+      if (organizationLogin === 'org-one') {
+        adminPages.push(page);
+        return {
+          status: 200,
+          data: page === 1
+            ? Array.from({ length: 100 }, (_, index) => ({ login: `admin-${index}` }))
+            : [{ login: 'admin-100' }],
+        };
+      }
+      return { status: 200, data: [] };
+    },
+    getOutsideCollaborators: async organizationLogin => (
+      organizationLogin === 'org-two'
+        ? { status: 403, data: { message: 'Resource protected by SAML' } }
+        : { status: 200, data: [{ login: 'external-one' }] }
+    ),
+  }, ['org-one', 'org-two']);
+
+  assert.deepEqual(adminPages, [1, 2]);
+  assert.equal(result.items[0].adminLogins?.length, 101);
+  assert.deepEqual(result.items[0].outsideCollaboratorLogins, ['external-one']);
+  assert.equal(result.items[1].outsideCollaboratorLogins, null);
+  assert.deepEqual(result.failures, [{
+    organizationLogin: 'org-two',
+    check: 'outside-collaborators',
+    error: 'GitHub returned 403 for outside collaborators: Resource protected by SAML',
+  }]);
+});
+
+test('collects direct collaborators and team grants with normalized permissions', async () => {
+  const directPages: number[] = [];
+  const repository = {
+    githubId: 1,
+    nodeId: 'REPO_1',
+    organizationLogin: 'acme',
+    nameWithOwner: 'acme/repository',
+    visibility: 'PRIVATE',
+    isArchived: false,
+    isFork: false,
+    updatedAt: '2026-09-01T00:00:00Z',
+  };
+  const result = await collectRepositoryAccess({
+    getDirectCollaborators: async (_owner, _repo, page) => {
+      directPages.push(page);
+      return {
+        status: 200,
+        data: page === 1
+          ? Array.from({ length: 100 }, (_, index) => ({
+              login: `reader-${index}`,
+              role_name: 'read',
+              permissions: { pull: true },
+            }))
+          : [{
+              login: 'custom-maintainer',
+              role_name: 'custom-maintainer',
+              permissions: { pull: true, push: true, maintain: true },
+            }],
+      };
+    },
+    getTeamGrants: async () => ({
+      status: 200,
+      data: [{ slug: 'platform', name: 'Platform', permission: 'push' }],
+    }),
+  }, [repository]);
+
+  assert.deepEqual(directPages, [1, 2]);
+  assert.equal(result.items[0].directCollaborators?.length, 101);
+  assert.deepEqual(result.items[0].directCollaborators?.at(-1), {
+    login: 'custom-maintainer',
+    roleName: 'custom-maintainer',
+    permission: 'maintain',
+  });
+  assert.deepEqual(result.items[0].teamGrants, [{
+    slug: 'platform',
+    name: 'Platform',
+    permission: 'push',
+  }]);
+  assert.deepEqual(result.failures, []);
+});
+
+test('collects paginated enterprise SCIM users', async () => {
+  const startIndexes: number[] = [];
+  const scim = await collectEnterpriseScim(async startIndex => {
+    startIndexes.push(startIndex);
+    const firstPage = Array.from({ length: 100 }, (_, index) => ({
+      id: `scim-${index}`,
+      userName: `user-${index}@example.com`,
+      displayName: null,
+      active: true,
+      roles: [{ value: 'user', primary: true }],
+    }));
+    return {
+      status: 200,
+      data: {
+        totalResults: 101,
+        Resources: startIndex === 1
+          ? firstPage
+          : [{
+              id: 'scim-100',
+              userName: 'user-100@example.com',
+              displayName: 'User 100',
+              active: false,
+              roles: [],
+            }],
+      },
+    };
+  });
+
+  assert.deepEqual(startIndexes, [1, 101]);
+  assert.equal(scim.totalResults, 101);
+  assert.equal(scim.identities.length, 101);
+  assert.deepEqual(scim.identities.find(identity => identity.scimId === 'scim-100'), {
+    scimId: 'scim-100',
+    userName: 'user-100@example.com',
+    displayName: 'User 100',
+    active: false,
+    roles: [],
+  });
+});
+
+test('formats GitHub SCIM role aliases as readable role names', () => {
+  assert.equal(formatScimRoleLabel('27d9891d-2c17-4f45-a262-781a0e55c80a'), 'User');
+  assert.equal(
+    formatScimRoleLabel('981df190-8801-4618-a08a-d91f6206c954'),
+    'Enterprise owner'
+  );
+  assert.equal(formatScimRoleLabel('billing_manager'), 'Billing manager');
+  assert.equal(formatScimRoleLabel('custom-role'), 'custom-role');
+});
+
+test('collects repositories across organizations with pagination', async () => {
+  const calls: Array<{ login: unknown; cursor: unknown }> = [];
+  const result = await collectOrganizationRepositories(async (_query, variables) => {
+    calls.push({ login: variables.login, cursor: variables.cursor });
+    const hasNextPage = variables.login === 'org-one' && variables.cursor === null;
+    return {
+      organization: {
+        repositories: {
+          nodes: [{
+            databaseId: calls.length,
+            id: `REPO_${calls.length}`,
+            nameWithOwner: `${variables.login}/repo-${calls.length}`,
+            visibility: 'PRIVATE',
+            isArchived: false,
+            isFork: false,
+            updatedAt: '2026-01-01T00:00:00Z',
+          }],
+          pageInfo: { hasNextPage, endCursor: hasNextPage ? 'repo-next' : null },
+        },
+      },
+    };
+  }, ['org-one', 'org-two']);
+
+  assert.deepEqual(calls, [
+    { login: 'org-one', cursor: null },
+    { login: 'org-one', cursor: 'repo-next' },
+    { login: 'org-two', cursor: null },
+  ]);
+  assert.equal(result.items.length, 3);
+  assert.equal(result.items[0].organizationLogin, 'org-one');
+  assert.deepEqual(result.failures, []);
+});
+
+test('collects teams across organizations', async () => {
+  const result = await collectOrganizationTeams(async () => ({
+    organization: {
+      teams: {
+        nodes: [{
+          databaseId: 42,
+          id: 'TEAM_42',
+          slug: 'platform',
+          name: 'Platform',
+          privacy: 'VISIBLE',
+        }],
+        pageInfo: { hasNextPage: false, endCursor: null },
+      },
+    },
+  }), ['org-one']);
+
+  assert.deepEqual(result, { items: [{
+    githubId: 42,
+    nodeId: 'TEAM_42',
+    organizationLogin: 'org-one',
+    slug: 'platform',
+    name: 'Platform',
+    privacy: 'VISIBLE',
+  }], failures: [] });
+});
+
+test('records inaccessible organizations without discarding collected resources', async () => {
+  const result = await collectOrganizationRepositories(async (_query, variables) => {
+    if (variables.login === 'saml-protected') {
+      throw new Error('Resource protected by organization SAML enforcement');
+    }
+    return {
+      organization: {
+        repositories: {
+          nodes: [{
+            databaseId: 1,
+            id: 'REPO_1',
+            nameWithOwner: 'accessible/repo',
+            visibility: 'INTERNAL',
+            isArchived: false,
+            isFork: false,
+            updatedAt: '2026-01-01T00:00:00Z',
+          }],
+          pageInfo: { hasNextPage: false, endCursor: null },
+        },
+      },
+    };
+  }, ['saml-protected', 'accessible']);
+
+  assert.equal(result.items.length, 1);
+  assert.deepEqual(result.failures, [{
+    organizationLogin: 'saml-protected',
+    error: 'Resource protected by organization SAML enforcement',
+  }]);
+});
+
+test('collects enterprise security defaults and Actions policy', async () => {
+  const securityDefaults = await collectEnterpriseSecurityDefaults(async () => [{
+    default_for_new_repos: 'public',
+    configuration: {
+      id: 17,
+      name: 'GitHub recommended',
+      advanced_security: 'enabled',
+      dependency_graph: 'enabled',
+      dependabot_alerts: 'enabled',
+      code_scanning_default_setup: 'enabled',
+      secret_scanning: 'enabled',
+      secret_scanning_push_protection: 'enabled',
+      enforcement: 'unenforced',
+    },
+  }]);
+  const actionsPolicy = await collectEnterpriseActionsPolicy(async () => ({
+    enabled_organizations: 'all',
+    allowed_actions: 'selected',
+    sha_pinning_required: true,
+  }));
+
+  assert.deepEqual(securityDefaults, [{
+    defaultForNewRepositories: 'public',
+    configurationId: 17,
+    configurationName: 'GitHub recommended',
+    advancedSecurity: 'enabled',
+    dependencyGraph: 'enabled',
+    dependabotAlerts: 'enabled',
+    codeScanningDefaultSetup: 'enabled',
+    secretScanning: 'enabled',
+    secretScanningPushProtection: 'enabled',
+    enforcement: 'unenforced',
+  }]);
+  assert.deepEqual(actionsPolicy, {
+    enabledOrganizations: 'all',
+    allowedActions: 'selected',
+    shaPinningRequired: true,
+  });
+});
+
+test('rejects malformed security and Actions policy responses', async () => {
+  await assert.rejects(
+    () => collectEnterpriseSecurityDefaults(async () => ({ configuration: {} })),
+    /invalid enterprise security defaults response/
+  );
+  await assert.rejects(
+    () => collectEnterpriseActionsPolicy(async () => ({ allowed_actions: 'all' })),
+    /incomplete enterprise Actions policy response/
+  );
+});
+
+test('collects selected Actions policy and paginated runner evidence', async () => {
+  const runnerGroupPages: number[] = [];
+  const firstPageGroups = Array.from({ length: 100 }, (_, index) => ({
+    id: index + 1,
+    name: `Group ${index + 1}`,
+    visibility: 'selected',
+    default: index === 0,
+    allows_public_repositories: false,
+    restricted_to_workflows: true,
+    selected_workflows: ['acme/workflows/.github/workflows/build.yml@refs/heads/main'],
+  }));
+
+  const evidence = await collectEnterpriseActionsEvidence({
+    getSelectedActions: async () => ({
+      status: 200,
+      data: {
+        github_owned_allowed: true,
+        verified_allowed: false,
+        patterns_allowed: ['acme/*'],
+      },
+    }),
+    getWorkflowPermissions: async () => ({
+      status: 200,
+      data: {
+        default_workflow_permissions: 'read',
+        can_approve_pull_request_reviews: false,
+      },
+    }),
+    getForkPullRequestPolicy: async () => ({
+      status: 200,
+      data: {
+        run_workflows_from_fork_pull_requests: false,
+        send_write_tokens_to_workflows: false,
+        send_secrets_and_variables: false,
+        require_approval_for_fork_pr_workflows: false,
+      },
+    }),
+    getSelfHostedRunnerPolicy: async () => ({
+      status: 200,
+      data: { disable_self_hosted_runners_for_all_orgs: false },
+    }),
+    getRunnerGroups: async page => {
+      runnerGroupPages.push(page);
+      return {
+        status: 200,
+        data: {
+          total_count: 101,
+          runner_groups: page === 1
+            ? firstPageGroups
+            : [{
+                ...firstPageGroups[0],
+                id: 101,
+                name: 'Group 101',
+              }],
+        },
+      };
+    },
+    getRunners: async () => ({
+      status: 200,
+      data: {
+        total_count: 1,
+        runners: [{
+          id: 501,
+          runner_group_id: 1,
+          name: 'runner-1',
+          os: 'linux',
+          status: 'online',
+          busy: false,
+          ephemeral: true,
+          version: '2.329.0',
+          labels: [{ id: 1, name: 'self-hosted', type: 'read-only' }],
+        }],
+      },
+    }),
+  }, 'selected');
+
+  assert.deepEqual(runnerGroupPages, [1, 2]);
+  assert.equal(evidence.runnerGroups?.length, 101);
+  assert.deepEqual(evidence.selectedActions, {
+    githubOwnedAllowed: true,
+    verifiedAllowed: false,
+    patternsAllowed: ['acme/*'],
+  });
+  assert.deepEqual(evidence.runners, [{
+    githubId: 501,
+    runnerGroupId: 1,
+    name: 'runner-1',
+    os: 'linux',
+    status: 'online',
+    busy: false,
+    ephemeral: true,
+    version: '2.329.0',
+    labels: ['self-hosted'],
+  }]);
+  assert.deepEqual(evidence.failures, []);
+});
+
+test('retains available Actions evidence when individual checks fail', async () => {
+  let selectedActionsRequested = false;
+  const evidence = await collectEnterpriseActionsEvidence({
+    getSelectedActions: async () => {
+      selectedActionsRequested = true;
+      return { status: 409, data: { message: 'Conflict' } };
+    },
+    getWorkflowPermissions: async () => ({
+      status: 403,
+      data: { message: 'Resource protected by SAML' },
+    }),
+    getForkPullRequestPolicy: async () => ({
+      status: 200,
+      data: {
+        run_workflows_from_fork_pull_requests: false,
+        send_write_tokens_to_workflows: false,
+        send_secrets_and_variables: false,
+        require_approval_for_fork_pr_workflows: false,
+      },
+    }),
+    getSelfHostedRunnerPolicy: async () => ({
+      status: 200,
+      data: { disable_self_hosted_runners_for_all_orgs: true },
+    }),
+    getRunnerGroups: async () => ({
+      status: 200,
+      data: { total_count: 0, runner_groups: [] },
+    }),
+    getRunners: async () => {
+      throw new Error('Runner inventory permission denied');
+    },
+  }, 'all');
+
+  assert.equal(selectedActionsRequested, false);
+  assert.equal(evidence.selectedActions, null);
+  assert.equal(evidence.workflowPermissions, null);
+  assert.equal(evidence.runnerGroups?.length, 0);
+  assert.equal(evidence.runners, null);
+  assert.equal(evidence.selfHostedRunnerPolicy?.disabledForAllOrganizations, true);
+  assert.deepEqual(evidence.failures.map(failure => failure.check), [
+    'workflow-permissions',
+    'self-hosted-runners',
+  ]);
+  assert.match(evidence.failures[0].error, /403.*SAML/);
+});
+
+test('collects repository-level security features, Dependabot alerts, and configurations', async () => {
+  const repositories = [
+    {
+      githubId: 1,
+      nodeId: 'REPO_1',
+      organizationLogin: 'org-one',
+      nameWithOwner: 'org-one/protected',
+      visibility: 'PRIVATE',
+      isArchived: false,
+      isFork: false,
+      updatedAt: '2026-09-01T00:00:00Z',
+    },
+    {
+      githubId: 2,
+      nodeId: 'REPO_2',
+      organizationLogin: 'org-one',
+      nameWithOwner: 'org-one/unprotected',
+      visibility: 'INTERNAL',
+      isArchived: false,
+      isFork: false,
+      updatedAt: '2026-09-01T00:00:00Z',
+    },
+  ];
+  const result = await collectRepositorySecurity({
+    getRepository: async (_owner, repo) => ({
+      status: 200,
+      data: {
+        security_and_analysis: {
+          code_security: { status: repo === 'protected' ? 'enabled' : 'disabled' },
+          secret_scanning: { status: repo === 'protected' ? 'enabled' : 'disabled' },
+          secret_scanning_push_protection: {
+            status: repo === 'protected' ? 'enabled' : 'disabled',
+          },
+          dependabot_security_updates: { status: repo === 'protected' ? 'enabled' : 'disabled' },
+        },
+      },
+    }),
+    getCodeScanningDefaultSetup: async (_owner, repo) => repo === 'protected'
+      ? { status: 200, data: { state: 'configured' } }
+      : {
+          status: 403,
+          data: { message: 'Code Security must be enabled for this repository to use code scanning.' },
+        },
+    checkDependabotAlerts: async (_owner, repo) => repo === 'protected'
+      ? { status: 204, data: null }
+      : { status: 404, data: { message: 'Vulnerability alerts are disabled.' } },
+    getConfiguration: async (_owner, repo) => repo === 'protected'
+      ? {
+          status: 200,
+          data: {
+            status: 'enforced',
+            configuration: {
+              id: 17,
+              name: 'Enterprise baseline',
+              enforcement: 'enforced',
+            },
+          },
+        }
+      : { status: 204, data: null },
+  }, repositories);
+
+  assert.deepEqual(result.failures, []);
+  assert.deepEqual(result.items[0], {
+    nameWithOwner: 'org-one/protected',
+    visibility: 'PRIVATE',
+    isArchived: false,
+    isFork: false,
+    defaultBranch: null,
+    codeSecurity: 'enabled',
+    codeScanningDefaultSetup: 'configured',
+    secretScanning: 'enabled',
+    secretScanningPushProtection: 'enabled',
+    dependabotAlerts: 'enabled',
+    dependabotSecurityUpdates: 'enabled',
+    configurationStatus: 'enforced',
+    configurationId: 17,
+    configurationName: 'Enterprise baseline',
+    configurationEnforcement: 'enforced',
+  });
+  assert.equal(result.items[1].dependabotAlerts, 'disabled');
+  assert.equal(result.items[1].codeScanningDefaultSetup, 'unavailable');
+  assert.equal(result.items[1].configurationStatus, 'none');
+});
+
+test('retains repository security evidence when individual checks are unavailable', async () => {
+  const result = await collectRepositorySecurity({
+    getRepository: async () => ({ status: 403, data: { message: 'Resource protected by SAML' } }),
+    getCodeScanningDefaultSetup: async () => ({
+      status: 503,
+      data: { message: 'Service unavailable' },
+    }),
+    checkDependabotAlerts: async () => ({ status: 404, data: { message: 'Not Found' } }),
+    getConfiguration: async () => {
+      throw new Error('Configuration permission denied');
+    },
+  }, [{
+    githubId: 1,
+    nodeId: 'REPO_1',
+    organizationLogin: 'org-one',
+    nameWithOwner: 'org-one/partial',
+    visibility: 'PRIVATE',
+    isArchived: false,
+    isFork: false,
+    updatedAt: '2026-09-01T00:00:00Z',
+  }]);
+
+  assert.equal(result.items.length, 1);
+  assert.equal(result.items[0].codeSecurity, null);
+  assert.equal(result.items[0].codeScanningDefaultSetup, null);
+  assert.equal(result.items[0].dependabotAlerts, null);
+  assert.equal(result.items[0].configurationStatus, null);
+  assert.deepEqual(result.failures.map(failure => failure.check), [
+    'features',
+    'code-scanning-default-setup',
+    'dependabot-alerts',
+    'configuration',
+  ]);
+  assert.match(result.failures[0].error, /403.*SAML/);
+  assert.match(result.failures[1].error, /503.*Service unavailable/);
+  assert.match(result.failures[2].error, /404.*Not Found/);
+});
+
+test('collects paginated effective rules and combines them with classic branch protection', async () => {
+  const requestedPages: number[] = [];
+  const repository = {
+    nameWithOwner: 'acme/protected',
+    visibility: 'PRIVATE',
+    isArchived: false,
+    isFork: false,
+    defaultBranch: 'main',
+    codeSecurity: null,
+    codeScanningDefaultSetup: null,
+    secretScanning: null,
+    secretScanningPushProtection: null,
+    dependabotAlerts: null,
+    dependabotSecurityUpdates: null,
+    configurationStatus: null,
+    configurationId: null,
+    configurationName: null,
+    configurationEnforcement: null,
+  };
+  const result = await collectRepositoryRules({
+    getEffectiveRules: async (_owner, _repo, _branch, page) => {
+      requestedPages.push(page);
+      return page === 1
+        ? {
+            status: 200,
+            data: Array.from({ length: 100 }, () => ({
+              type: 'required_status_checks',
+              ruleset_id: 23,
+              ruleset_source_type: 'Organization',
+              ruleset_source: 'acme',
+            })),
+          }
+        : {
+            status: 200,
+            data: [
+              {
+                type: 'pull_request',
+                ruleset_id: 23,
+                ruleset_source_type: 'Organization',
+                ruleset_source: 'acme',
+                parameters: { required_approving_review_count: 2 },
+              },
+              { type: 'non_fast_forward', ruleset_id: 23 },
+              { type: 'deletion', ruleset_id: 23 },
+            ],
+          };
+    },
+    getClassicProtection: async () => ({
+      status: 200,
+      data: {
+        required_pull_request_reviews: { required_approving_review_count: 1 },
+        required_status_checks: null,
+        allow_force_pushes: { enabled: true },
+        allow_deletions: { enabled: true },
+        enforce_admins: { enabled: true },
+      },
+    }),
+  }, [repository]);
+
+  assert.deepEqual(requestedPages, [1, 2]);
+  assert.deepEqual(result.failures, []);
+  assert.deepEqual(result.items[0], {
+    nameWithOwner: 'acme/protected',
+    visibility: 'PRIVATE',
+    isArchived: false,
+    isFork: false,
+    defaultBranch: 'main',
+    branchExists: true,
+    classicProtection: true,
+    hasProtection: true,
+    activeRulesetIds: [23],
+    activeRulesetSources: ['Organization: acme'],
+    activeRulesets: [{ githubId: 23, sourceType: 'Organization', source: 'acme' }],
+    ruleTypes: ['deletion', 'non_fast_forward', 'pull_request', 'required_status_checks'],
+    requiresPullRequest: true,
+    requiredApprovingReviewCount: 2,
+    requiresStatusChecks: true,
+    blocksForcePushes: true,
+    blocksDeletions: true,
+    enforcesAdmins: true,
+  });
+});
+
+test('distinguishes unprotected, nonexistent, and partially available default branches', async () => {
+  const repository = (name: string) => ({
+    nameWithOwner: `acme/${name}`,
+    visibility: 'PRIVATE',
+    isArchived: false,
+    isFork: false,
+    defaultBranch: 'main',
+    codeSecurity: null,
+    codeScanningDefaultSetup: null,
+    secretScanning: null,
+    secretScanningPushProtection: null,
+    dependabotAlerts: null,
+    dependabotSecurityUpdates: null,
+    configurationStatus: null,
+    configurationId: null,
+    configurationName: null,
+    configurationEnforcement: null,
+  });
+  const result = await collectRepositoryRules({
+    getEffectiveRules: async (_owner, repo) => repo === 'partial'
+      ? { status: 403, data: { message: 'Resource protected by SAML' } }
+      : { status: 200, data: [] },
+    getClassicProtection: async (_owner, repo) => {
+      if (repo === 'unprotected') {
+        return { status: 404, data: { message: 'Branch not protected' } };
+      }
+      if (repo === 'branchless') {
+        return { status: 404, data: { message: 'Branch not found' } };
+      }
+      return {
+        status: 200,
+        data: {
+          required_pull_request_reviews: { required_approving_review_count: 1 },
+          required_status_checks: {},
+          allow_force_pushes: { enabled: false },
+          allow_deletions: { enabled: false },
+          enforce_admins: { enabled: true },
+        },
+      };
+    },
+  }, [
+    repository('unprotected'),
+    repository('branchless'),
+    repository('partial'),
+  ]);
+
+  assert.deepEqual(result.items.map(item => ({
+    name: item.nameWithOwner,
+    branchExists: item.branchExists,
+    hasProtection: item.hasProtection,
+  })), [
+    { name: 'acme/unprotected', branchExists: true, hasProtection: false },
+    { name: 'acme/branchless', branchExists: false, hasProtection: null },
+    { name: 'acme/partial', branchExists: true, hasProtection: true },
+  ]);
+  assert.equal(result.items[2].requiresPullRequest, true);
+  assert.equal(result.items[2].requiredApprovingReviewCount, 1);
+  assert.equal(result.items[2].requiresStatusChecks, true);
+  assert.deepEqual(result.failures, [{
+    nameWithOwner: 'acme/partial',
+    check: 'effective-rules',
+    error: 'GitHub returned 403 for effective branch rules: Resource protected by SAML',
+  }]);
+});
+
+test('deduplicates active rulesets and collects bypass actors from their declared source', async () => {
+  const rulesRepository = (
+    nameWithOwner: string,
+    reference: { githubId: number; sourceType: string; source: string }
+  ) => ({
+    nameWithOwner,
+    visibility: 'PRIVATE',
+    isArchived: false,
+    isFork: false,
+    defaultBranch: 'main',
+    branchExists: true,
+    classicProtection: false,
+    hasProtection: true,
+    activeRulesetIds: [reference.githubId],
+    activeRulesetSources: [`${reference.sourceType}: ${reference.source}`],
+    activeRulesets: [reference],
+    ruleTypes: ['pull_request'],
+    requiresPullRequest: true,
+    requiredApprovingReviewCount: 1,
+    requiresStatusChecks: false,
+    blocksForcePushes: false,
+    blocksDeletions: false,
+    enforcesAdmins: false,
+  });
+  const requestedIds: number[] = [];
+  const sharedReference = {
+    githubId: 23,
+    sourceType: 'Organization',
+    source: 'acme',
+  };
+  const result = await collectRulesetDetails(async reference => {
+    requestedIds.push(reference.githubId);
+    if (reference.githubId === 99) {
+      return { status: 403, data: { message: 'Resource protected by SAML' } };
+    }
+    return {
+      status: 200,
+      data: {
+        id: 23,
+        name: 'Default branch baseline',
+        target: 'branch',
+        source_type: 'Organization',
+        source: 'acme',
+        enforcement: 'active',
+        conditions: {
+          ref_name: { include: ['~DEFAULT_BRANCH'], exclude: ['refs/heads/generated'] },
+        },
+        rules: [{ type: 'pull_request' }, { type: 'required_status_checks' }],
+        bypass_actors: [
+          { actor_id: null, actor_type: 'OrganizationAdmin', bypass_mode: 'always' },
+          { actor_id: 42, actor_type: 'Team', bypass_mode: 'pull_request' },
+        ],
+      },
+    };
+  }, [
+    rulesRepository('acme/one', sharedReference),
+    rulesRepository('acme/two', sharedReference),
+    rulesRepository('acme/partial', {
+      githubId: 99,
+      sourceType: 'Repository',
+      source: 'acme/partial',
+    }),
+  ]);
+
+  assert.deepEqual(requestedIds, [23, 99]);
+  assert.deepEqual(result.items, [{
+    githubId: 23,
+    name: 'Default branch baseline',
+    target: 'branch',
+    sourceType: 'Organization',
+    source: 'acme',
+    enforcement: 'active',
+    conditions: [{
+      type: 'ref_name',
+      include: ['~DEFAULT_BRANCH'],
+      exclude: ['refs/heads/generated'],
+    }],
+    ruleTypes: ['pull_request', 'required_status_checks'],
+    appliedRepositories: ['acme/one', 'acme/two'],
+    bypassActors: [
+      { actorId: null, actorType: 'OrganizationAdmin', bypassMode: 'always' },
+      { actorId: 42, actorType: 'Team', bypassMode: 'pull_request' },
+    ],
+  }]);
+  assert.deepEqual(result.failures, [{
+    githubId: 99,
+    sourceType: 'Repository',
+    source: 'acme/partial',
+    error: 'GitHub returned 403 for ruleset details: Resource protected by SAML',
+  }]);
+});
+
+test('collects and deduplicates paginated enterprise Copilot seats', async () => {
+  const requestedPages: number[] = [];
+  const firstPage = Array.from({ length: 100 }, (_, index) => ({
+    created_at: '2026-01-01T00:00:00Z',
+    assignee: { login: `user-${index + 1}` },
+    pending_cancellation_date: null,
+    plan_type: 'business',
+    last_authenticated_at: null,
+    last_activity_at: index === 0 ? '2026-08-01T00:00:00Z' : null,
+    last_activity_editor: index === 0 ? 'vscode' : null,
+    organization: { login: 'org-one' },
+    assigning_team: null,
+  }));
+
+  const inventory = await collectEnterpriseCopilotSeats(async page => {
+    requestedPages.push(page);
+    return {
+      total_seats: 100,
+      seats: page === 1
+        ? firstPage
+        : [{
+            ...firstPage[0],
+            created_at: '2026-02-01T00:00:00Z',
+            last_authenticated_at: '2026-09-01T00:00:00Z',
+            last_activity_at: '2026-09-02T00:00:00Z',
+            last_activity_editor: 'jetbrains',
+            organization: { login: 'org-two' },
+            assigning_team: { slug: 'platform', type: 'organization' },
+          }],
+    };
+  });
+
+  assert.deepEqual(requestedPages, [1, 2]);
+  assert.equal(inventory.totalSeats, 100);
+  assert.equal(inventory.rawAssignmentCount, 101);
+  assert.equal(inventory.seats.length, 100);
+  assert.deepEqual(inventory.seats.find(seat => seat.login === 'user-1'), {
+    login: 'user-1',
+    planType: 'business',
+    createdAt: '2026-01-01T00:00:00Z',
+    lastAuthenticatedAt: '2026-09-01T00:00:00Z',
+    lastActivityAt: '2026-09-02T00:00:00Z',
+    lastActivityEditor: 'jetbrains',
+    pendingCancellationDate: null,
+    assignmentCount: 2,
+    assignmentSources: [
+      { organization: 'org-one', team: null, teamType: null },
+      { organization: 'org-two', team: 'platform', teamType: 'organization' },
+    ],
+  });
+});
+
+test('collects paginated enterprise budgets', async () => {
+  const requestedPages: number[] = [];
+  const budgets = await collectEnterpriseBudgets(async page => {
+    requestedPages.push(page);
+    return {
+      budgets: [{
+        id: `budget-${page}`,
+        budget_type: 'BundlePricing',
+        budget_product_sku: 'ai_credits',
+        budget_scope: page === 1 ? 'enterprise' : 'user',
+        budget_amount: page * 100,
+        prevent_further_usage: true,
+        budget_entity_name: page === 1 ? 'acme' : 'octocat',
+        budget_alerting: {
+          will_alert: page === 1,
+          alert_recipients: page === 1 ? ['owner'] : [],
+        },
+        consumed_amount: page === 1 ? null : 12.5,
+      }],
+      has_next_page: page === 1,
+      total_count: 2,
+    };
+  });
+
+  assert.deepEqual(requestedPages, [1, 2]);
+  assert.deepEqual(budgets, [
+    {
+      id: 'budget-1',
+      budgetType: 'BundlePricing',
+      productSku: 'ai_credits',
+      scope: 'enterprise',
+      amount: 100,
+      consumedAmount: null,
+      preventsFurtherUsage: true,
+      alertingEnabled: true,
+      alertRecipientCount: 1,
+      alertRecipients: ['owner'],
+      entityName: 'acme',
+      user: null,
+      expiresAt: null,
+    },
+    {
+      id: 'budget-2',
+      budgetType: 'BundlePricing',
+      productSku: 'ai_credits',
+      scope: 'user',
+      amount: 200,
+      consumedAmount: 12.5,
+      preventsFurtherUsage: true,
+      alertingEnabled: false,
+      alertRecipientCount: 0,
+      alertRecipients: [],
+      entityName: 'octocat',
+      user: null,
+      expiresAt: null,
+    },
+  ]);
+});
+
+test('collects organization Copilot policy with granular failures', async () => {
+  const evidence = await collectCopilotGovernance({
+    getContentExclusion: async () => ({ status: 200, data: {} }),
+    getOrganizationSettings: async organizationLogin => (
+      organizationLogin === 'org-two'
+        ? { status: 403, data: { message: 'Forbidden' } }
+        : {
+            status: 200,
+            data: {
+              seat_breakdown: {
+                total: 4,
+                added_this_cycle: 1,
+                pending_cancellation: 0,
+                pending_invitation: 0,
+                active_this_cycle: 3,
+                inactive_this_cycle: 1,
+              },
+              plan_type: 'enterprise',
+              seat_management_setting: 'assign_selected',
+              public_code_suggestions: 'block',
+              ide_chat: 'enabled',
+              platform_chat: 'enabled',
+              cli: 'disabled',
+            },
+          }
+    ),
+    getCodingAgentPermissions: async organizationLogin => ({
+      status: 200,
+      data: { enabled_repositories: organizationLogin === 'org-one' ? 'selected' : 'none' },
+    }),
+  }, ['org-one', 'org-two']);
+
+  assert.equal(evidence.contentExclusionRuleCount, 0);
+  assert.deepEqual(evidence.organizations[0], {
+    organizationLogin: 'org-one',
+    seatTotal: 4,
+    seatsAddedThisCycle: 1,
+    seatsPendingCancellation: 0,
+    seatsPendingInvitation: 0,
+    activeSeatsThisCycle: 3,
+    inactiveSeatsThisCycle: 1,
+    planType: 'enterprise',
+    seatManagementSetting: 'assign_selected',
+    publicCodeSuggestions: 'block',
+    ideChat: 'enabled',
+    platformChat: 'enabled',
+    cli: 'disabled',
+    codingAgentRepositoryScope: 'selected',
+  });
+  assert.equal(evidence.organizations[1].seatTotal, null);
+  assert.equal(evidence.organizations[1].codingAgentRepositoryScope, 'none');
+  assert.deepEqual(evidence.failures, [{
+    scope: 'org-two',
+    check: 'organization-settings',
+    error: 'GitHub returned 403 for organization Copilot settings: Forbidden',
+  }]);
+});
+
+test('collects cost centers, effective budgets, user states, and usage independently', async () => {
+  const costCenterPages: number[] = [];
+  const evidence = await collectBillingGovernance({
+    getCostCenters: async () => ({
+      status: 200,
+      data: {
+        costCenters: [
+          {
+            id: 'center-1',
+            name: 'Engineering',
+            state: 'active',
+            azure_subscription: null,
+            ai_credit_pool_enabled: false,
+            resources: [],
+          },
+          {
+            id: 'center-2',
+            name: 'Research',
+            state: 'active',
+            azure_subscription: null,
+            ai_credit_pool_enabled: false,
+            resources: [],
+          },
+        ],
+      },
+    }),
+    getCostCenter: async (costCenterId, page) => {
+      if (costCenterId === 'center-2') {
+        return { status: 403, data: { message: 'Forbidden' } };
+      }
+      costCenterPages.push(page);
+      return {
+        status: 200,
+        data: {
+          id: 'center-1',
+          name: 'Engineering',
+          state: 'active',
+          azure_subscription: null,
+          ai_credit_pool_enabled: false,
+          resources: page === 1
+            ? [{ type: 'User', name: 'octocat' }]
+            : [{ type: 'Team', name: 'platform' }],
+          has_next_page: page === 1,
+        },
+      };
+    },
+    getEffectiveBudget: async user => ({
+      status: 200,
+      data: {
+        user,
+        budgets: [{ id: 'enterprise-budget' }],
+        effective_budget: user === 'octocat'
+          ? { id: 'user-budget', budget_amount: 100, consumed_amount: 12.5 }
+          : null,
+        has_next_page: false,
+      },
+    }),
+    getBudgetUserStates: async (_budgetId, page) => ({
+      status: 200,
+      data: {
+        user_states: page === 1
+          ? [{
+              user: 'octocat',
+              consumed_amount: 12.5,
+              target_amount: 100,
+              override_budget_id: 'user-budget',
+            }]
+          : [],
+        has_next_page: false,
+      },
+    }),
+    getUsageSummary: async () => ({
+      status: 200,
+      data: {
+        timePeriod: { year: 2026, month: 9 },
+        usageItems: [{
+          product: 'Copilot',
+          sku: 'copilot_ai_unit',
+          unitType: 'ai-units',
+          grossQuantity: 3,
+          grossAmount: 3,
+          discountQuantity: 1,
+          discountAmount: 1,
+          netQuantity: 2,
+          netAmount: 2,
+        }],
+      },
+    }),
+  }, [{
+    id: 'multi-budget',
+    budgetType: 'ProductPricing',
+    productSku: 'ai_credits',
+    scope: 'multi_user_customer',
+    amount: 100,
+    consumedAmount: null,
+    preventsFurtherUsage: true,
+    alertingEnabled: false,
+    alertRecipientCount: 0,
+    alertRecipients: [],
+    entityName: 'acme',
+    user: null,
+    expiresAt: null,
+  }], ['octocat', 'hubot']);
+
+  assert.deepEqual(costCenterPages, [1, 2]);
+  assert.deepEqual(evidence.costCenters[0].resources, [
+    { type: 'Team', name: 'platform' },
+    { type: 'User', name: 'octocat' },
+  ]);
+  assert.equal(evidence.costCenters[1].resources, null);
+  assert.equal(evidence.effectiveBudgets[0].user, 'hubot');
+  assert.equal(evidence.effectiveBudgets[0].budgetId, null);
+  assert.equal(evidence.effectiveBudgets[1].budgetId, 'user-budget');
+  assert.equal(evidence.multiUserBudgetStates[0].overrideBudgetId, 'user-budget');
+  assert.equal(evidence.usage?.items[0].netAmount, 2);
+  assert.deepEqual(evidence.failures, [{
+    scope: 'Research',
+    check: 'cost-center-resources',
+    error: 'GitHub returned 403 for billing cost center details: Forbidden',
+  }]);
+});
+
+test('rejects malformed Copilot seat and budget responses', async () => {
+  await assert.rejects(
+    () => collectEnterpriseCopilotSeats(async () => ({ seats: [] })),
+    /incomplete enterprise Copilot seats response/
+  );
+  await assert.rejects(
+    () => collectEnterpriseBudgets(async () => ({ budgets: [] })),
+    /incomplete enterprise budgets response/
+  );
+});
+
+test('evaluates evidence-backed identity and repository baseline findings', () => {
+  const evaluation = evaluateAssessmentBaseline({
+    organizations: [
+      { githubId: 1, nodeId: 'ORG_1', login: 'org-one', description: null },
+    ],
+    members: [
+      { login: 'only-owner', name: null, isOwner: true },
+    ],
+    ownerCount: 1,
+    repositories: [
+      {
+        githubId: 1,
+        nodeId: 'REPO_1',
+        organizationLogin: 'org-one',
+        nameWithOwner: 'org-one/stale-public',
+        visibility: 'PUBLIC',
+        isArchived: false,
+        isFork: false,
+        updatedAt: '2024-01-01T00:00:00Z',
+      },
+      {
+        githubId: 2,
+        nodeId: 'REPO_2',
+        organizationLogin: 'org-one',
+        nameWithOwner: 'org-one/archived',
+        visibility: 'PRIVATE',
+        isArchived: true,
+        isFork: false,
+        updatedAt: '2024-01-01T00:00:00Z',
+      },
+    ],
+    teams: [],
+    now: new Date('2026-09-10T00:00:00Z'),
+  });
+
+  assert.equal(evaluation.healthScore, 83);
+  assert.equal(evaluation.assessedDomainCount, 2);
+  assert.deepEqual(evaluation.domainScores, {
+    identity: 80,
+    repositories: 85,
+  });
+  assert.deepEqual(
+    evaluation.findings.map(finding => finding.ruleKey),
+    [
+      'enterprise-owner-single-point-of-failure',
+      'stale-active-repositories',
+      'public-repository-review',
+    ]
+  );
+  assert.equal(
+    evaluation.findings[0].expectedState,
+    'At least two separately managed, active enterprise owners are assigned.'
+  );
+  assert.deepEqual(evaluation.findings[0].evidenceSources, [{
+    collectorKey: 'identity',
+    label: 'Enterprise member and owner inventory',
+    endpoint: 'GraphQL Enterprise.members',
+  }]);
+  assert.equal(evaluation.findings[0].remediation.controlLevel, 'Enterprise');
+  assert.equal(evaluation.findings[0].remediation.effort, 'Moderate');
+  assert.equal(evaluation.findings[0].remediation.steps.length, 3);
+  assert.match(evaluation.findings[0].remediation.verification, /at least two enterprise owners/);
+  assert.deepEqual(evaluation.metrics, {
+    activeRepositories: 1,
+    archivedRepositories: 1,
+    forkRepositories: 0,
+    internalRepositories: 0,
+    privateRepositories: 1,
+    publicRepositories: 1,
+    staleActiveRepositories: 1,
+  });
+});
+
+test('does not report baseline findings when collected evidence passes', () => {
+  const evaluation = evaluateAssessmentBaseline({
+    organizations: [],
+    members: [
+      { login: 'owner-one', name: null, isOwner: true },
+      { login: 'owner-two', name: null, isOwner: true },
+    ],
+    ownerCount: 2,
+    repositories: [{
+      githubId: 1,
+      nodeId: 'REPO_1',
+      organizationLogin: 'org-one',
+      nameWithOwner: 'org-one/current',
+      visibility: 'PRIVATE',
+      isArchived: false,
+      isFork: false,
+      updatedAt: '2026-09-01T00:00:00Z',
+    }],
+    teams: [],
+    now: new Date('2026-09-10T00:00:00Z'),
+  });
+
+  assert.equal(evaluation.healthScore, 100);
+  assert.deepEqual(evaluation.findings, []);
+});
+
+test('evaluates enterprise security defaults and Actions policy', () => {
+  const evaluation = evaluateAssessmentBaseline({
+    organizations: [],
+    members: [
+      { login: 'owner-one', name: null, isOwner: true },
+      { login: 'owner-two', name: null, isOwner: true },
+    ],
+    ownerCount: 2,
+    repositories: [],
+    teams: [],
+    securityDefaults: [{
+      defaultForNewRepositories: 'public',
+      configurationId: 17,
+      configurationName: 'GitHub recommended',
+      advancedSecurity: 'enabled',
+      dependencyGraph: 'enabled',
+      dependabotAlerts: 'enabled',
+      codeScanningDefaultSetup: 'enabled',
+      secretScanning: 'enabled',
+      secretScanningPushProtection: 'enabled',
+      enforcement: 'unenforced',
+    }],
+    actionsPolicy: {
+      enabledOrganizations: 'all',
+      allowedActions: 'all',
+      shaPinningRequired: false,
+    },
+    now: new Date('2026-09-10T00:00:00Z'),
+  });
+
+  assert.equal(evaluation.assessedDomainCount, 4);
+  assert.equal(evaluation.healthScore, 93);
+  assert.deepEqual(evaluation.domainScores, {
+    identity: 100,
+    repositories: 100,
+    security: 90,
+    actions: 80,
+  });
+  assert.deepEqual(
+    evaluation.findings.map(finding => finding.ruleKey),
+    [
+      'security-defaults-incomplete-visibility-coverage',
+      'actions-unrestricted-sources',
+      'actions-sha-pinning-not-required',
+    ]
+  );
+});
+
+test('evaluates workflow permissions and self-hosted runner trust boundaries', () => {
+  const evaluation = evaluateAssessmentBaseline({
+    organizations: [],
+    members: [
+      { login: 'owner-one', name: null, isOwner: true },
+      { login: 'owner-two', name: null, isOwner: true },
+    ],
+    ownerCount: 2,
+    repositories: [],
+    teams: [],
+    actionsPolicy: {
+      enabledOrganizations: 'all',
+      allowedActions: 'selected',
+      shaPinningRequired: true,
+    },
+    actionsEvidence: {
+      selectedActions: {
+        githubOwnedAllowed: true,
+        verifiedAllowed: false,
+        patternsAllowed: ['*'],
+      },
+      workflowPermissions: {
+        defaultWorkflowPermissions: 'write',
+        canApprovePullRequestReviews: true,
+      },
+      forkPullRequestPolicy: {
+        runWorkflowsFromForkPullRequests: true,
+        sendWriteTokensToWorkflows: true,
+        sendSecretsAndVariables: true,
+        requireApprovalForForkPullRequestWorkflows: false,
+      },
+      selfHostedRunnerPolicy: {
+        disabledForAllOrganizations: false,
+      },
+      runnerGroups: [{
+        githubId: 1,
+        name: 'Default',
+        visibility: 'all',
+        isDefault: true,
+        allowsPublicRepositories: true,
+        restrictedToWorkflows: false,
+        selectedWorkflows: [],
+      }],
+      runners: [{
+        githubId: 101,
+        runnerGroupId: 1,
+        name: 'retired-runner',
+        os: 'linux',
+        status: 'offline',
+        busy: false,
+        ephemeral: false,
+        version: null,
+        labels: ['self-hosted', 'linux'],
+      }],
+      failures: [],
+    },
+    now: new Date('2026-09-10T00:00:00Z'),
+  });
+
+  assert.equal(evaluation.assessedDomainCount, 3);
+  assert.equal(evaluation.healthScore, 68);
+  assert.deepEqual(evaluation.domainScores, {
+    identity: 100,
+    repositories: 100,
+    actions: 5,
+  });
+  assert.deepEqual(
+    evaluation.findings.map(finding => finding.ruleKey),
+    [
+      'actions-selected-policy-broad-patterns',
+      'actions-default-workflow-write-permissions',
+      'actions-workflows-can-approve-pull-requests',
+      'actions-private-fork-workflows-receive-privileged-data',
+      'actions-runner-groups-allow-public-repositories',
+      'actions-runner-groups-broadly-accessible',
+      'actions-self-hosted-runners-offline',
+    ]
+  );
+  assert.equal(evaluation.metrics.selfHostedRunnerCount, 1);
+  assert.equal(evaluation.metrics.offlineSelfHostedRunnerCount, 1);
+  assert.equal(evaluation.metrics.runnerGroupCount, 1);
+  assert.equal(evaluation.metrics.publicRepositoryRunnerGroupCount, 1);
+  assert.equal(evaluation.metrics.broadlyAccessibleRunnerGroupCount, 1);
+});
+
+test('evaluates measured repository security coverage without treating unknown states as disabled', () => {
+  const evaluation = evaluateAssessmentBaseline({
+    organizations: [],
+    members: [
+      { login: 'owner-one', name: null, isOwner: true },
+      { login: 'owner-two', name: null, isOwner: true },
+    ],
+    ownerCount: 2,
+    repositories: [],
+    teams: [],
+    repositorySecurity: [
+      {
+        nameWithOwner: 'org-one/unprotected',
+        visibility: 'PRIVATE',
+        isArchived: false,
+        isFork: false,
+        defaultBranch: 'main',
+        codeSecurity: 'disabled',
+        codeScanningDefaultSetup: 'unavailable',
+        secretScanning: 'disabled',
+        secretScanningPushProtection: 'disabled',
+        dependabotAlerts: 'disabled',
+        dependabotSecurityUpdates: 'disabled',
+        configurationStatus: 'none',
+        configurationId: null,
+        configurationName: null,
+        configurationEnforcement: null,
+      },
+      {
+        nameWithOwner: 'org-one/unknown',
+        visibility: 'INTERNAL',
+        isArchived: false,
+        isFork: false,
+        defaultBranch: 'main',
+        codeSecurity: null,
+        codeScanningDefaultSetup: null,
+        secretScanning: null,
+        secretScanningPushProtection: null,
+        dependabotAlerts: null,
+        dependabotSecurityUpdates: null,
+        configurationStatus: null,
+        configurationId: null,
+        configurationName: null,
+        configurationEnforcement: null,
+      },
+      {
+        nameWithOwner: 'org-one/archived',
+        visibility: 'PRIVATE',
+        isArchived: true,
+        isFork: false,
+        defaultBranch: 'main',
+        codeSecurity: 'disabled',
+        codeScanningDefaultSetup: 'unavailable',
+        secretScanning: 'disabled',
+        secretScanningPushProtection: 'disabled',
+        dependabotAlerts: 'disabled',
+        dependabotSecurityUpdates: 'disabled',
+        configurationStatus: 'none',
+        configurationId: null,
+        configurationName: null,
+        configurationEnforcement: null,
+      },
+    ],
+    now: new Date('2026-09-10T00:00:00Z'),
+  });
+
+  assert.equal(evaluation.assessedDomainCount, 3);
+  assert.equal(evaluation.healthScore, 95);
+  assert.deepEqual(evaluation.findings.map(finding => finding.ruleKey), [
+    'repository-security-core-features-disabled',
+    'repository-security-configuration-unassigned',
+  ]);
+  assert.deepEqual(evaluation.findings[0].affectedResources, ['org-one/unprotected']);
+  assert.deepEqual(evaluation.findings[1].affectedResources, ['org-one/unprotected']);
+  assert.equal(evaluation.metrics.eligibleSecurityRepositories, 2);
+  assert.equal(evaluation.metrics.repositorySecurityEvidence, 1);
+  assert.equal(evaluation.metrics.repositorySecurityUnknownRepositories, 1);
+  assert.equal(evaluation.metrics.codeSecurityEnabledRepositories, 0);
+  assert.equal(evaluation.metrics.codeScanningDefaultSetupRepositories, 0);
+  assert.equal(evaluation.metrics.securityConfigurationAppliedRepositories, 0);
+});
+
+test('evaluates default branch controls without treating unknown or nonexistent branches as gaps', () => {
+  const repositoryRules = [
+    {
+      nameWithOwner: 'acme/unprotected',
+      branchExists: true,
+      classicProtection: false,
+      hasProtection: false,
+      requiresPullRequest: false,
+      requiredApprovingReviewCount: null,
+      requiresStatusChecks: false,
+      blocksForcePushes: false,
+      blocksDeletions: false,
+      enforcesAdmins: false,
+    },
+    {
+      nameWithOwner: 'acme/incomplete',
+      branchExists: true,
+      classicProtection: true,
+      hasProtection: true,
+      requiresPullRequest: false,
+      requiredApprovingReviewCount: 0,
+      requiresStatusChecks: false,
+      blocksForcePushes: false,
+      blocksDeletions: false,
+      enforcesAdmins: true,
+    },
+    {
+      nameWithOwner: 'acme/unknown',
+      branchExists: null,
+      classicProtection: null,
+      hasProtection: null,
+      requiresPullRequest: null,
+      requiredApprovingReviewCount: null,
+      requiresStatusChecks: null,
+      blocksForcePushes: null,
+      blocksDeletions: null,
+      enforcesAdmins: null,
+    },
+    {
+      nameWithOwner: 'acme/branchless',
+      branchExists: false,
+      classicProtection: false,
+      hasProtection: null,
+      requiresPullRequest: null,
+      requiredApprovingReviewCount: null,
+      requiresStatusChecks: null,
+      blocksForcePushes: null,
+      blocksDeletions: null,
+      enforcesAdmins: null,
+    },
+  ].map(repository => ({
+    visibility: 'PRIVATE',
+    isArchived: false,
+    isFork: false,
+    defaultBranch: 'main',
+    activeRulesetIds: [],
+    activeRulesetSources: [],
+    activeRulesets: [],
+    ruleTypes: [],
+    ...repository,
+  }));
+  const evaluation = evaluateAssessmentBaseline({
+    organizations: [],
+    members: [
+      { login: 'owner-one', name: null, isOwner: true },
+      { login: 'owner-two', name: null, isOwner: true },
+    ],
+    ownerCount: 2,
+    repositories: [],
+    teams: [],
+    repositoryRules,
+    now: new Date('2026-09-10T00:00:00Z'),
+  });
+
+  assert.equal(evaluation.healthScore, 78);
+  assert.deepEqual(evaluation.findings.map(finding => finding.ruleKey), [
+    'default-branch-protection-missing',
+    'default-branch-review-controls-incomplete',
+    'default-branch-status-checks-missing',
+    'default-branch-history-controls-incomplete',
+  ]);
+  assert.deepEqual(evaluation.metrics, {
+    activeRepositories: 0,
+    archivedRepositories: 0,
+    forkRepositories: 0,
+    internalRepositories: 0,
+    privateRepositories: 0,
+    publicRepositories: 0,
+    staleActiveRepositories: 0,
+    classicProtectedDefaultBranches: 1,
+    defaultBranchProtectionUnknownRepositories: 1,
+    defaultBranchRepositories: 2,
+    defaultBranchesRequiringPullRequests: 0,
+    defaultBranchesRequiringStatusChecks: 0,
+    protectedDefaultBranches: 1,
+    repositoriesWithoutDefaultBranches: 1,
+    rulesetProtectedDefaultBranches: 0,
+  });
+});
+
+test('evaluates identity access without duplicating privileged outside-collaborator penalties', () => {
+  const evaluation = evaluateAssessmentBaseline({
+    organizations: [],
+    members: [
+      { login: 'acme_admin', name: null, isOwner: true },
+      { login: 'owner-one', name: null, isOwner: true },
+      { login: 'member-one', name: null, isOwner: false },
+      { login: 'writer-one', name: null, isOwner: false },
+    ],
+    ownerCount: 2,
+    repositories: [],
+    teams: [],
+    setupAccountLogin: 'acme_admin',
+    organizationAccess: [{
+      organizationLogin: 'acme-org',
+      defaultRepositoryPermission: 'write',
+      membersCanCreateRepositories: true,
+      membersCanCreatePublicRepositories: true,
+      membersCanCreatePrivateRepositories: true,
+      membersCanCreateInternalRepositories: true,
+      membersCanForkPrivateRepositories: false,
+      twoFactorRequirementEnabled: false,
+      adminLogins: ['owner-one'],
+      outsideCollaboratorLogins: ['external-one'],
+    }],
+    repositoryAccess: [{
+      nameWithOwner: 'acme-org/repository',
+      visibility: 'PRIVATE',
+      isArchived: false,
+      isFork: false,
+      directCollaborators: [
+        { login: 'external-one', roleName: 'admin', permission: 'admin' },
+        { login: 'member-one', roleName: 'maintain', permission: 'maintain' },
+        { login: 'writer-one', roleName: 'write', permission: 'write' },
+      ],
+      teamGrants: [{ slug: 'platform', name: 'Platform', permission: 'push' }],
+    }],
+    scim: {
+      totalResults: 2,
+      identities: [
+        {
+          scimId: '1',
+          userName: 'owner@example.com',
+          displayName: 'Owner',
+          active: true,
+          roles: ['user'],
+        },
+        {
+          scimId: '2',
+          userName: 'former@example.com',
+          displayName: 'Former',
+          active: false,
+          roles: ['user'],
+        },
+      ],
+    },
+    now: new Date('2026-09-10T00:00:00Z'),
+  });
+
+  assert.equal(evaluation.healthScore, 70);
+  assert.deepEqual(evaluation.findings.map(finding => finding.ruleKey), [
+    'organization-default-repository-write',
+    'organization-public-repository-creation-enabled',
+    'outside-collaborator-review',
+    'outside-collaborator-privileged-repository-access',
+    'direct-privileged-repository-access',
+    'direct-write-repository-access-review',
+  ]);
+  assert.deepEqual(
+    evaluation.findings.find(
+      finding => finding.ruleKey === 'direct-privileged-repository-access'
+    )?.affectedResources,
+    ['acme-org/repository:member-one (maintain)']
+  );
+  assert.equal(evaluation.metrics.humanEnterpriseMembers, 3);
+  assert.equal(evaluation.metrics.scimIdentities, 2);
+  assert.equal(evaluation.metrics.activeScimIdentities, 1);
+  assert.equal(evaluation.metrics.inactiveScimIdentities, 1);
+  assert.equal(evaluation.metrics.directRepositoryGrantCount, 3);
+  assert.equal(evaluation.metrics.teamRepositoryGrantCount, 1);
+});
+
+test('flags unconditional ruleset bypass while excluding pull-request-only and disabled exceptions', () => {
+  const evaluation = evaluateAssessmentBaseline({
+    organizations: [],
+    members: [
+      { login: 'owner-one', name: null, isOwner: true },
+      { login: 'owner-two', name: null, isOwner: true },
+    ],
+    ownerCount: 2,
+    repositories: [],
+    teams: [],
+    rulesets: [
+      {
+        githubId: 1,
+        name: 'Organization baseline',
+        target: 'branch',
+        sourceType: 'Organization',
+        source: 'acme',
+        enforcement: 'active',
+        conditions: [],
+        ruleTypes: ['pull_request'],
+        appliedRepositories: ['acme/repository'],
+        bypassActors: [
+          { actorId: null, actorType: 'OrganizationAdmin', bypassMode: 'always' },
+          { actorId: 42, actorType: 'Team', bypassMode: 'always' },
+          { actorId: 7, actorType: 'Integration', bypassMode: 'pull_request' },
+        ],
+      },
+      {
+        githubId: 2,
+        name: 'Disabled enterprise policy',
+        target: 'branch',
+        sourceType: 'Enterprise',
+        source: 'acme-enterprise',
+        enforcement: 'disabled',
+        conditions: [],
+        ruleTypes: ['deletion'],
+        appliedRepositories: [],
+        bypassActors: [
+          { actorId: null, actorType: 'EnterpriseOwner', bypassMode: 'always' },
+        ],
+      },
+    ],
+    now: new Date('2026-09-10T00:00:00Z'),
+  });
+
+  assert.equal(evaluation.healthScore, 93);
+  assert.deepEqual(evaluation.findings.map(finding => finding.ruleKey), [
+    'ruleset-broad-unconditional-bypass',
+    'ruleset-scoped-unconditional-bypass-review',
+  ]);
+  assert.equal(evaluation.metrics.activeRulesetCount, 1);
+  assert.equal(evaluation.metrics.rulesetsWithBypassActors, 1);
+  assert.equal(evaluation.metrics.rulesetBypassActorCount, 3);
+  assert.equal(evaluation.metrics.unconditionalBypassActorCount, 2);
+  assert.equal(evaluation.metrics.pullRequestBypassActorCount, 1);
+});
+
+test('evaluates Copilot seat utilization and enterprise budget controls', () => {
+  const evaluation = evaluateAssessmentBaseline({
+    organizations: [],
+    members: [
+      { login: 'owner-one', name: null, isOwner: true },
+      { login: 'owner-two', name: null, isOwner: true },
+    ],
+    ownerCount: 2,
+    repositories: [],
+    teams: [],
+    copilotSeats: {
+      totalSeats: 4,
+      rawAssignmentCount: 5,
+      seats: [
+        {
+          login: 'active-user',
+          planType: 'business',
+          createdAt: '2026-01-01T00:00:00Z',
+          lastAuthenticatedAt: '2026-09-09T00:00:00Z',
+          lastActivityAt: '2026-09-09T00:00:00Z',
+          lastActivityEditor: 'vscode',
+          pendingCancellationDate: null,
+          assignmentCount: 2,
+          assignmentSources: [{ organization: 'org-one', team: null, teamType: null }],
+        },
+        {
+          login: 'inactive-user',
+          planType: 'business',
+          createdAt: '2026-01-01T00:00:00Z',
+          lastAuthenticatedAt: null,
+          lastActivityAt: null,
+          lastActivityEditor: null,
+          pendingCancellationDate: null,
+          assignmentCount: 1,
+          assignmentSources: [{ organization: 'org-one', team: null, teamType: null }],
+        },
+        {
+          login: 'new-user',
+          planType: 'business',
+          createdAt: '2026-09-01T00:00:00Z',
+          lastAuthenticatedAt: null,
+          lastActivityAt: null,
+          lastActivityEditor: null,
+          pendingCancellationDate: null,
+          assignmentCount: 1,
+          assignmentSources: [{ organization: 'org-one', team: null, teamType: null }],
+        },
+        {
+          login: 'departing-user',
+          planType: 'business',
+          createdAt: '2026-01-01T00:00:00Z',
+          lastAuthenticatedAt: null,
+          lastActivityAt: null,
+          lastActivityEditor: null,
+          pendingCancellationDate: '2026-09-30',
+          assignmentCount: 1,
+          assignmentSources: [{ organization: 'org-one', team: null, teamType: null }],
+        },
+      ],
+    },
+    budgets: [
+      {
+        id: 'enterprise-budget',
+        budgetType: 'BundlePricing',
+        productSku: 'ai_credits',
+        scope: 'enterprise',
+        amount: 5000,
+        consumedAmount: null,
+        preventsFurtherUsage: true,
+        alertingEnabled: true,
+        alertRecipientCount: 1,
+        alertRecipients: ['owner-one'],
+        entityName: 'acme',
+        user: null,
+        expiresAt: null,
+      },
+      {
+        id: 'unenforced-budget',
+        budgetType: 'BundlePricing',
+        productSku: 'ai_credits',
+        scope: 'cost_center',
+        amount: 500,
+        consumedAmount: null,
+        preventsFurtherUsage: false,
+        alertingEnabled: true,
+        alertRecipientCount: 1,
+        alertRecipients: ['owner-one'],
+        entityName: 'research',
+        user: null,
+        expiresAt: null,
+      },
+      {
+        id: 'unalerted-budget',
+        budgetType: 'BundlePricing',
+        productSku: 'ai_credits',
+        scope: 'multi_user_customer',
+        amount: 400,
+        consumedAmount: null,
+        preventsFurtherUsage: true,
+        alertingEnabled: false,
+        alertRecipientCount: 0,
+        alertRecipients: [],
+        entityName: 'acme',
+        user: null,
+        expiresAt: null,
+      },
+      {
+        id: 'user-budget',
+        budgetType: 'BundlePricing',
+        productSku: 'ai_credits',
+        scope: 'user',
+        amount: 100,
+        consumedAmount: 10,
+        preventsFurtherUsage: true,
+        alertingEnabled: false,
+        alertRecipientCount: 0,
+        alertRecipients: [],
+        entityName: 'octocat',
+        user: 'octocat',
+        expiresAt: null,
+      },
+    ],
+    now: new Date('2026-09-10T00:00:00Z'),
+  });
+
+  assert.equal(evaluation.assessedDomainCount, 4);
+  assert.equal(evaluation.healthScore, 94);
+  assert.deepEqual(
+    evaluation.findings.map(finding => finding.ruleKey),
+    [
+      'copilot-inactive-seats',
+      'billing-budget-enforcement-disabled',
+      'billing-budget-alerting-disabled',
+    ]
+  );
+  assert.equal(evaluation.metrics.copilotSeats, 4);
+  assert.equal(evaluation.metrics.activeCopilotSeats, 1);
+  assert.equal(evaluation.metrics.inactiveCopilotSeats, 1);
+  assert.equal(evaluation.metrics.duplicateCopilotAssignments, 1);
+  assert.equal(evaluation.metrics.budgets, 4);
+  assert.equal(evaluation.metrics.enforcingBudgets, 3);
+  assert.equal(evaluation.metrics.alertingBudgets, 2);
+  assert.equal(evaluation.metrics.userLevelBudgets, 2);
+});
+
+test('evaluates Copilot policy and billing ownership depth conservatively', () => {
+  const evaluation = evaluateAssessmentBaseline({
+    organizations: [],
+    members: [
+      { login: 'owner-one', name: null, isOwner: true },
+      { login: 'owner-two', name: null, isOwner: true },
+    ],
+    ownerCount: 2,
+    repositories: [],
+    teams: [],
+    copilotEvidence: {
+      contentExclusionRuleCount: 0,
+      organizations: [
+        {
+          organizationLogin: 'licensed-org',
+          seatTotal: 4,
+          seatsAddedThisCycle: 0,
+          seatsPendingCancellation: 0,
+          seatsPendingInvitation: 0,
+          activeSeatsThisCycle: 3,
+          inactiveSeatsThisCycle: 1,
+          planType: 'enterprise',
+          seatManagementSetting: 'assign_all',
+          publicCodeSuggestions: 'allow',
+          ideChat: 'enabled',
+          platformChat: 'enabled',
+          cli: 'enabled',
+          codingAgentRepositoryScope: 'all',
+        },
+        {
+          organizationLogin: 'unlicensed-org',
+          seatTotal: 0,
+          seatsAddedThisCycle: 0,
+          seatsPendingCancellation: 0,
+          seatsPendingInvitation: 0,
+          activeSeatsThisCycle: 0,
+          inactiveSeatsThisCycle: 0,
+          planType: 'enterprise',
+          seatManagementSetting: 'unconfigured',
+          publicCodeSuggestions: 'allow',
+          ideChat: 'enabled',
+          platformChat: 'enabled',
+          cli: 'enabled',
+          codingAgentRepositoryScope: 'all',
+        },
+      ],
+      failures: [],
+    },
+    budgets: [{
+      id: 'orphan-budget',
+      budgetType: 'ProductPricing',
+      productSku: 'ai_credits',
+      scope: 'cost_center',
+      amount: 500,
+      consumedAmount: null,
+      preventsFurtherUsage: true,
+      alertingEnabled: true,
+      alertRecipientCount: 1,
+      alertRecipients: ['owner-one'],
+      entityName: 'Missing',
+      user: null,
+      expiresAt: null,
+    }],
+    billingEvidence: {
+      costCenters: [{
+        id: 'empty-center',
+        name: 'Empty',
+        state: 'active',
+        azureSubscription: null,
+        aiCreditPoolEnabled: false,
+        aiCreditPoolTargetAmount: null,
+        aiCreditPoolCurrentAmount: null,
+        resources: [],
+      }],
+      effectiveBudgets: [
+        {
+          user: 'owner-one',
+          budgetId: null,
+          amount: null,
+          consumedAmount: null,
+          applicableBudgetIds: ['orphan-budget'],
+        },
+        {
+          user: 'owner-two',
+          budgetId: 'user-budget',
+          amount: 100,
+          consumedAmount: 10,
+          applicableBudgetIds: ['user-budget'],
+        },
+      ],
+      multiUserBudgetStates: [],
+      usage: {
+        year: 2026,
+        month: 9,
+        day: null,
+        items: [{
+          product: 'Copilot',
+          sku: 'copilot_for_business',
+          unitType: 'user-months',
+          grossQuantity: 2,
+          grossAmount: 38,
+          discountQuantity: 0,
+          discountAmount: 0,
+          netQuantity: 2,
+          netAmount: 38,
+        }],
+      },
+      failures: [],
+    },
+    now: new Date('2026-09-10T00:00:00Z'),
+  });
+
+  assert.equal(evaluation.assessedDomainCount, 4);
+  assert.equal(evaluation.healthScore, 91);
+  assert.deepEqual(evaluation.findings.map(finding => finding.ruleKey), [
+    'copilot-assign-all-seat-management',
+    'copilot-public-code-suggestions-review',
+    'copilot-coding-agent-all-repositories',
+    'billing-empty-active-cost-centers',
+    'billing-budget-cost-center-not-found',
+  ]);
+  assert.equal(evaluation.metrics.copilotOrganizationsWithSeats, 1);
+  assert.equal(evaluation.metrics.copilotOrganizationsAllowingPublicCode, 1);
+  assert.equal(evaluation.metrics.copilotOrganizationsWithBroadCodingAgentAccess, 1);
+  assert.equal(evaluation.metrics.activeCostCenters, 1);
+  assert.equal(evaluation.metrics.emptyActiveCostCenters, 1);
+  assert.equal(evaluation.metrics.effectiveUserBudgets, 1);
+  assert.equal(evaluation.metrics.usersWithoutEffectiveBudgets, 1);
+  assert.equal(evaluation.metrics.billingNetAmount, 38);
+});
+
+  test('compares scores, finding lifecycle, severity, and affected resources', () => {
+    const comparison = compareAssessmentSnapshots(
+      {
+        id: 'previous-run',
+        metrics: { healthScore: 70 },
+        domainScores: { identity: 70 },
+        collectors: [
+          { collector_key: 'identity', status: 'completed' },
+          { collector_key: 'security', status: 'completed' },
+          { collector_key: 'billing', status: 'completed' },
+        ],
+        findings: [
+          comparisonFinding('shared', 'high', ['alpha', 'beta'], 'identity'),
+          comparisonFinding('changed', 'low', ['stable-resource'], 'identity'),
+          comparisonFinding('resolved', 'medium', ['repository-one'], 'security'),
+          comparisonFinding('uncertain', 'low', ['budget-one'], 'billing'),
+        ],
+      },
+      {
+        id: 'current-run',
+        metrics: { healthScore: 80 },
+        domainScores: { identity: 80 },
+        collectors: [
+          { collector_key: 'identity', status: 'completed' },
+          { collector_key: 'security', status: 'completed' },
+          { collector_key: 'billing', status: 'failed' },
+        ],
+        findings: [
+          comparisonFinding('shared', 'medium', ['beta', 'gamma'], 'identity'),
+          {
+            ...comparisonFinding('changed', 'low', ['stable-resource'], 'identity'),
+            summary: 'Observed state changed.',
+          },
+          comparisonFinding('new', 'low', ['delta'], 'identity'),
+        ],
+      }
+    );
+
+    assert.equal(comparison.scoreComparable, true);
+    assert.equal(comparison.scoreDelta, 10);
+    assert.deepEqual(comparison.domainChanges, [{
+      domain: 'identity',
+      previousScore: 70,
+      currentScore: 80,
+      delta: 10,
+    }]);
+    assert.deepEqual(
+      Object.fromEntries(comparison.findingChanges.map(change => [change.ruleKey, change.status])),
+      {
+        new: 'new',
+        shared: 'improved',
+        changed: 'changed',
+        resolved: 'resolved',
+        uncertain: 'unverified',
+      }
+    );
+    const shared = comparison.findingChanges.find(change => change.ruleKey === 'shared');
+    assert.deepEqual(shared?.addedResources, ['gamma']);
+    assert.deepEqual(shared?.removedResources, ['alpha']);
+    assert.equal(shared?.previousFinding?.severity, 'high');
+    assert.equal(shared?.finding.severity, 'medium');
+    assert.ok(comparison.notes.some(note => note.includes('current run')));
+    assert.ok(comparison.notes.some(note => note.includes('could not be verified')));
+  });
+
+  test('does not report resolutions from partial, failed, or missing collector evidence', () => {
+    const previousFindings = [
+      comparisonFinding('partial-rule', 'medium', ['one'], 'partial-collector'),
+      comparisonFinding('failed-rule', 'medium', ['two'], 'failed-collector'),
+      comparisonFinding('missing-rule', 'medium', ['three'], 'missing-collector'),
+    ];
+    const comparison = compareAssessmentSnapshots(
+      {
+        id: 'previous-run',
+        metrics: { healthScore: 75 },
+        domainScores: { security: 75 },
+        collectors: [
+          { collector_key: 'partial-collector', status: 'completed' },
+          { collector_key: 'failed-collector', status: 'completed' },
+          { collector_key: 'missing-collector', status: 'completed' },
+        ],
+        findings: previousFindings,
+      },
+      {
+        id: 'current-run',
+        metrics: { healthScore: 100 },
+        domainScores: { security: 100, identity: 100 },
+        collectors: [
+          { collector_key: 'partial-collector', status: 'partial' },
+          { collector_key: 'failed-collector', status: 'failed' },
+        ],
+        findings: [],
+      }
+    );
+
+    assert.equal(comparison.scoreComparable, false);
+    assert.equal(comparison.scoreDelta, null);
+    assert.ok(comparison.findingChanges.every(change => change.status === 'unverified'));
+    assert.deepEqual(
+      Object.fromEntries(comparison.findingChanges.map(change => [change.ruleKey, change.evidenceConfidence])),
+      {
+        'partial-rule': 'partial',
+        'failed-rule': 'unavailable',
+        'missing-rule': 'unavailable',
+      }
+    );
+  });
+
+  function comparisonFinding(
+    ruleKey: string,
+    severity: AssessmentSeverity,
+    affectedResources: string[],
+    domainOrCollector: AssessmentDomain | string
+  ): AssessmentFinding {
+    const domain = (
+      ['identity', 'repositories', 'security', 'actions', 'copilot', 'billing'] as string[]
+    ).includes(domainOrCollector)
+      ? domainOrCollector as AssessmentDomain
+      : 'security';
+    const collectorKey = domainOrCollector;
+    return {
+      ruleKey,
+      domain,
+      severity,
+      title: `${ruleKey} finding`,
+      summary: 'Observed state',
+      recommendation: 'Recommended outcome',
+      affectedResources,
+      expectedState: 'Expected state',
+      evidenceSources: [{
+        collectorKey,
+        label: `${collectorKey} evidence`,
+        endpoint: 'GET /evidence',
+      }],
+      remediation: {
+        controlLevel: 'Enterprise',
+        effort: 'Low',
+        settingsPath: 'Enterprise settings',
+        apiEndpoint: null,
+        steps: ['Review the control.'],
+        rollback: 'Restore the prior state.',
+        verification: 'Run the assessment again.',
+      },
+    };
+  }

@@ -1,6 +1,6 @@
 import { Octokit } from '@octokit/rest';
 import { createAppAuth } from '@octokit/auth-app';
-import { getActiveEnvironment, getCredential } from './db';
+import { getCredential, getDb } from './db';
 
 export interface AuthResult {
   octokit: Octokit;
@@ -9,8 +9,6 @@ export interface AuthResult {
 }
 
 export function createOctokit(environmentId: string): AuthResult {
-  // We import db functions inline since this runs server-side only
-  const { getDb } = require('./db');
   const db = getDb();
 
   const env = db.prepare('SELECT * FROM environments WHERE id = ?').get(environmentId) as {

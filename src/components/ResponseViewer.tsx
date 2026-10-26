@@ -302,6 +302,7 @@ function JsonArray({ data, depth }: { data: unknown[]; depth: number }) {
 
 // URL pattern for detecting links in values
 const URL_REGEX = /https?:\/\/[^\s"',}\]]+/g;
+const HAS_URL_REGEX = /https?:\/\/[^\s"',}\]]+/;
 const IMAGE_EXTENSIONS = /\.(png|jpg|jpeg|gif|svg|ico|webp)(\?.*)?$/i;
 
 function PreviewRenderer({ data }: { data: unknown }) {
@@ -341,9 +342,8 @@ function PreviewObject({ data, depth = 0 }: { data: Record<string, unknown>; dep
   for (const [key, value] of entries) {
     if (typeof value === 'string' && IMAGE_EXTENSIONS.test(value)) {
       imageEntries.push([key, value]);
-    } else if (typeof value === 'string' && URL_REGEX.test(value)) {
+    } else if (typeof value === 'string' && HAS_URL_REGEX.test(value)) {
       urlEntries.push([key, value]);
-      URL_REGEX.lastIndex = 0; // reset regex state
     } else if (value !== null && typeof value === 'object') {
       nestedEntries.push([key, value]);
     } else {
@@ -461,12 +461,12 @@ function PreviewValue({ value }: { value: unknown }) {
   }
   const str = String(value);
   // Check if the string itself contains URLs — render them clickable inline
-  if (URL_REGEX.test(str)) {
-    URL_REGEX.lastIndex = 0;
+  if (HAS_URL_REGEX.test(str)) {
+    const urlRegex = new RegExp(URL_REGEX.source, URL_REGEX.flags);
     const parts: React.ReactNode[] = [];
     let lastIndex = 0;
     let match: RegExpExecArray | null;
-    while ((match = URL_REGEX.exec(str)) !== null) {
+    while ((match = urlRegex.exec(str)) !== null) {
       if (match.index > lastIndex) {
         parts.push(<span key={`t${lastIndex}`}>{str.slice(lastIndex, match.index)}</span>);
       }

@@ -26,7 +26,7 @@ npm run import-api
 npm run dev
 ```
 
-Open **http://localhost:3000**, go to **Settings**, add an environment with your PAT, and start exploring.
+Open **http://localhost:43117**, go to **Settings**, add an environment with your PAT, and start exploring.
 
 ## Tech Stack
 

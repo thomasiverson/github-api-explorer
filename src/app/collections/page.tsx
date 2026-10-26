@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useEffect } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import { TopBar } from '@/components/TopBar';
 import { useApp } from '@/components/AppContext';
 import { ConfirmDialog, isDestructiveMethod, getConfirmMessage } from '@/components/ConfirmDialog';
@@ -48,20 +48,12 @@ export default function CollectionsPage() {
     bulk?: boolean;
   } | null>(null);
 
-  useEffect(() => { loadCollections(); }, []);
-
-  useEffect(() => {
-    setRunResults([]);
-    setExpandedItems(new Set());
-    if (selectedId) loadItems(selectedId);
-  }, [selectedId]);
-
-  async function loadCollections() {
+  const loadCollections = useCallback(async () => {
     const res = await fetch('/api/collections');
     const data = await res.json();
     setCollections(data);
     return data as Collection[];
-  }
+  }, []);
 
   async function createColl() {
     if (!newName.trim()) return;
@@ -113,7 +105,7 @@ export default function CollectionsPage() {
     loadCollections();
   }
 
-  async function loadItems(collId: string) {
+  const loadItems = useCallback(async (collId: string) => {
     const res = await fetch('/api/collections', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -123,7 +115,17 @@ export default function CollectionsPage() {
     setItems(data);
     const coll = collections.find(c => c.id === collId);
     if (coll) { setEditingName(coll.name); setEditingDesc(coll.description); }
-  }
+  }, [collections]);
+
+  /* eslint-disable react-hooks/set-state-in-effect */
+  useEffect(() => { void loadCollections(); }, [loadCollections]);
+
+  useEffect(() => {
+    setRunResults([]);
+    setExpandedItems(new Set());
+    if (selectedId) void loadItems(selectedId);
+  }, [loadItems, selectedId]);
+  /* eslint-enable react-hooks/set-state-in-effect */
 
   async function deleteItem(id: string) {
     await fetch('/api/collections', {
@@ -436,7 +438,7 @@ export default function CollectionsPage() {
         </div>
       </div>
       {confirmState && (() => {
-        const info = getConfirmMessage(confirmState.method, confirmState.path);
+        const info = getConfirmMessage(confirmState.method);
         return (
           <ConfirmDialog
             open={true}
