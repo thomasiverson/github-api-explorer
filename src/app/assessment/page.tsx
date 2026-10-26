@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { TopBar } from '@/components/TopBar';
 import { useApp } from '@/components/AppContext';
+import { AssessmentRemediationPanel } from '@/components/AssessmentRemediationPanel';
 import {
   ASSESSMENT_COLLECTOR_KEYS,
   compareAssessmentSnapshots,
@@ -53,13 +54,33 @@ const ASSESSMENT_DOMAINS = [
 const PACING_PROFILES: Array<{
   key: AssessmentPacingProfile;
   label: string;
-  range: string;
+  scale: string;
   cadence: string;
 }> = [
-  { key: 'immediate', label: 'Immediate', range: 'Up to 25%', cadence: 'No intentional delay' },
-  { key: 'measured', label: 'Measured', range: '25–75%', cadence: '1.5 seconds between requests' },
-  { key: 'overnight', label: 'Overnight', range: '75–200%', cadence: '5 seconds between requests' },
-  { key: 'extended', label: 'Extended', range: 'Over 200%', cadence: '15 seconds between requests' },
+  {
+    key: 'immediate',
+    label: 'Immediate',
+    scale: 'Rough guide: up to 10 orgs / 100 repos',
+    cadence: 'No intentional delay',
+  },
+  {
+    key: 'measured',
+    label: 'Measured',
+    scale: 'Rough guide: 11–40 orgs / 101–300 repos',
+    cadence: '1.5 seconds between requests',
+  },
+  {
+    key: 'overnight',
+    label: 'Overnight',
+    scale: 'Rough guide: 41–100 orgs / 301–900 repos',
+    cadence: '5 seconds between requests',
+  },
+  {
+    key: 'extended',
+    label: 'Extended',
+    scale: 'Rough guide: 101+ orgs / 901+ repos',
+    cadence: '15 seconds between requests',
+  },
 ];
 
 type AssessmentDomainKey = (typeof ASSESSMENT_DOMAINS)[number]['key'];
@@ -753,7 +774,7 @@ export default function AssessmentPage() {
       : readiness?.currentWindowFits === false
         ? '! A rate-limit reset pause may be required'
         : readiness?.currentWindowFits === true
-          ? `✔ Fits current window · ${currentRestCapacity?.toLocaleString() ?? '--'} REST available`
+          ? `✔ Fits available allowance · ${currentRestCapacity?.toLocaleString() ?? '--'} REST available`
           : 'Allowance has not been confirmed';
   const budgetById = new Map((budgets ?? []).map(budget => [budget.id, budget]));
   const budgetStateCountById = new Map<string, number>();
@@ -956,6 +977,11 @@ export default function AssessmentPage() {
                   }`}>
                     {assessmentControlsGuidance}
                   </span>
+                  {!assessmentControlsExpanded && !assessmentIsRunning && (
+                    <span className="mt-0.5 block pl-6 text-[11px] text-accent">
+                      Open controls to choose Immediate, Measured, Overnight, or Extended pacing.
+                    </span>
+                  )}
                   {projectedRestCapacityPercent !== null && (
                     <span className="mt-2 block pl-6">
                       <span
@@ -1030,7 +1056,7 @@ export default function AssessmentPage() {
                           Assessment readiness
                         </h3>
                         <p className="text-xs text-text-muted mt-0.5">
-                          Projected API demand compared with GitHub&apos;s currently available allowance.
+                          Choose how quickly the assessment should use GitHub&apos;s available API allowance.
                         </p>
                       </div>
                       {isLoadingReadiness ? (
@@ -1053,97 +1079,135 @@ export default function AssessmentPage() {
                 </div>
               ) : isLoadingReadiness || !readiness ? (
                 <div className="px-4 py-5 text-xs text-text-secondary" role="status">
-                  Reading the current REST and GraphQL rate windows...
+                  Reading the current REST and GraphQL allowance...
                 </div>
               ) : (
                 <>
-                  <div
-                    className="grid grid-cols-2 lg:grid-cols-4 gap-px bg-border"
-                    role="radiogroup"
-                    aria-label="Assessment pacing profile"
-                  >
-                    {PACING_PROFILES.map(profile => {
-                      const selected = profile.key === effectivePacingProfile;
-                      const recommended = profile.key === readinessProfile;
-                      return (
-                        <button
-                          type="button"
-                          key={profile.key}
-                          role="radio"
-                          aria-checked={selected}
-                          disabled={assessmentIsRunning && !assessmentIsPaused}
-                          onClick={() => setSelectedPacingProfile(profile.key)}
-                          className={`px-3 py-2.5 ${selected ? 'bg-accent-emphasis text-white' : 'bg-surface text-text-secondary'}`}
-                        >
-                          <span className="block text-xs font-semibold">
-                            {selected ? '✔ ' : ''}{profile.label}
-                            {recommended ? ' · Recommended' : ''}
-                          </span>
-                          <span className={`block text-[10px] mt-0.5 ${selected ? 'text-white/80' : 'text-text-muted'}`}>
-                            {profile.range} of one usable window
-                          </span>
-                          <span className={`block text-[10px] mt-0.5 ${selected ? 'text-white/80' : 'text-text-muted'}`}>
-                            {profile.cadence}
-                          </span>
-                        </button>
-                      );
-                    })}
+                  <div className="border-b border-border bg-canvas p-4">
+                    <div className="overflow-hidden rounded-lg border border-border">
+                      <div className="border-b border-border bg-surface px-4 py-3">
+                        <p className="text-xs font-semibold text-text-primary">
+                          Select one pacing profile, then select Run assessment
+                        </p>
+                        <p className="mt-1 text-[11px] leading-relaxed text-text-secondary">
+                          Match either your total organization count or repository count to a row below.
+                          If the two counts land in different rows, choose the slower profile. The live
+                          recommendation is more accurate because it also includes members, prior-run demand,
+                          and the GitHub allowance remaining now.
+                        </p>
+                      </div>
+                      <div
+                        className="grid grid-cols-2 gap-px bg-border lg:grid-cols-4"
+                        role="radiogroup"
+                        aria-label="Assessment pacing profile"
+                      >
+                        {PACING_PROFILES.map(profile => {
+                          const selected = profile.key === effectivePacingProfile;
+                          const recommended = profile.key === readinessProfile;
+                          return (
+                            <button
+                              type="button"
+                              key={profile.key}
+                              role="radio"
+                              aria-checked={selected}
+                              disabled={assessmentIsRunning && !assessmentIsPaused}
+                              onClick={() => setSelectedPacingProfile(profile.key)}
+                              className={`cursor-pointer px-3 py-2.5 text-left transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent disabled:cursor-not-allowed disabled:opacity-50 ${
+                                selected
+                                  ? 'bg-accent-emphasis text-white'
+                                  : 'bg-surface text-text-secondary hover:bg-canvas'
+                              }`}
+                            >
+                              <span className="block text-xs font-semibold">
+                                {selected ? '✔ ' : ''}{profile.label}
+                                {recommended ? ' · Recommended' : ''}
+                              </span>
+                              <span className={`mt-1 block text-[10px] font-medium ${selected ? 'text-white' : 'text-text-primary'}`}>
+                                {profile.scale}
+                              </span>
+                              <span className={`block text-[10px] mt-0.5 ${selected ? 'text-white/80' : 'text-text-muted'}`}>
+                                {profile.cadence}
+                              </span>
+                              <span className={`mt-1.5 block text-[10px] font-semibold ${selected ? 'text-white' : 'text-accent'}`}>
+                                {selected ? 'Selected' : `Select ${profile.label}`}
+                              </span>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
                   </div>
 
-                  <div className="grid grid-cols-2 xl:grid-cols-4 gap-px bg-border">
-                    <ReadinessSignal
-                      label="Projected demand"
-                      value={readiness.estimatedTotalRequests === null
-                        ? 'Calibration needed'
-                        : `~${readiness.estimatedTotalRequests.toLocaleString()} requests`}
-                      detail={readiness.estimatedRestRequests === null
-                        ? 'No completed inventory is available'
-                        : `REST ${readiness.estimatedRestRequests.toLocaleString()} · GraphQL ${(readiness.estimatedGraphqlRequests ?? 0).toLocaleString()}`}
-                    />
-                    <ReadinessSignal
-                      label="Usable now"
-                      value={currentRestCapacity === null
-                        ? 'REST unavailable'
-                        : `${currentRestCapacity.toLocaleString()} REST requests`}
-                      detail={currentGraphqlCapacity === null
-                        ? `${readiness.restRateLimit?.reserve.toLocaleString() ?? 0} REST reserved`
-                        : `${currentGraphqlCapacity.toLocaleString()} GraphQL · ${readiness.restRateLimit?.reserve.toLocaleString() ?? 0} REST reserved`}
-                    />
-                    <ReadinessSignal
-                      label="Expected runtime"
-                      value={formatEstimatedDuration(selectedEstimatedDurationMs)}
-                      detail={readiness.estimatedRateWindows === null
-                        ? 'Rate windows unknown'
-                        : `${effectivePacingLabel} profile · ${readiness.estimatedRateWindows} estimated rate ${readiness.estimatedRateWindows === 1 ? 'window' : 'windows'}`}
-                    />
-                    <ReadinessSignal
-                      label="Start guidance"
-                      value={readiness.currentWindowFits === false
-                        ? '! Reset pause possible'
-                        : readiness.currentWindowFits === true
-                          ? '✔ Fits current window'
-                          : 'Allowance unconfirmed'}
-                      detail={readiness.windowLoadPercent === null
-                        ? 'Run once to calibrate'
-                        : `${readiness.windowLoadPercent}% of one full usable window`}
-                      caution={readiness.currentWindowFits === false}
-                    />
-                  </div>
-
-                  <div className="px-4 py-3 border-t border-border bg-surface">
-                    <p className="text-xs text-text-secondary">{readiness.rationale}</p>
-                    <details className="mt-2">
-                      <summary className="text-[11px] text-accent cursor-pointer">How this recommendation is calculated</summary>
-                      <p className="text-[11px] text-text-muted mt-2 max-w-4xl">
-                        {readiness.estimateSource === 'previous-run'
-                          ? 'Projected requests use the latest completed run plus a 15% growth and pagination buffer.'
-                          : readiness.estimateSource === 'inventory'
-                            ? 'Projected requests use stored organization, repository, and member counts plus a 25% uncertainty buffer.'
-                            : 'No prior request or inventory evidence is available yet.'}
-                        {' '}The recommended band compares that projection with the full REST and GraphQL windows after preserving the safety reserve. Your selected profile is enforced between requests, while the request governor independently enforces GitHub reset waits.
+                  <section aria-labelledby="assessment-estimate-heading">
+                    <div className="border-b border-border bg-panel px-4 py-3">
+                      <h4 id="assessment-estimate-heading" className="text-xs font-semibold text-text-primary">
+                        Current assessment estimate
+                      </h4>
+                      <p className="mt-0.5 text-[11px] text-text-muted">
+                        These values describe the whole assessment using the selected
+                        {' '}{effectivePacingLabel} profile. They do not correspond to the columns above.
                       </p>
-                    </details>
-                  </div>
+                    </div>
+                    <div className="grid grid-cols-2 gap-px bg-border xl:grid-cols-4">
+                      <ReadinessSignal
+                        label="Projected demand"
+                        value={readiness.estimatedTotalRequests === null
+                          ? 'Calibration needed'
+                          : `~${readiness.estimatedTotalRequests.toLocaleString()} requests`}
+                        detail={readiness.estimatedRestRequests === null
+                          ? 'No completed inventory is available'
+                          : `REST ${readiness.estimatedRestRequests.toLocaleString()} · GraphQL ${(readiness.estimatedGraphqlRequests ?? 0).toLocaleString()}`}
+                      />
+                      <ReadinessSignal
+                        label="Usable now"
+                        value={currentRestCapacity === null
+                          ? 'REST unavailable'
+                          : `${currentRestCapacity.toLocaleString()} REST requests`}
+                        detail={currentGraphqlCapacity === null
+                          ? `${readiness.restRateLimit?.reserve.toLocaleString() ?? 0} REST reserved`
+                          : `${currentGraphqlCapacity.toLocaleString()} GraphQL · ${readiness.restRateLimit?.reserve.toLocaleString() ?? 0} REST reserved`}
+                      />
+                      <ReadinessSignal
+                        label="Expected runtime"
+                        value={formatEstimatedDuration(selectedEstimatedDurationMs)}
+                        detail={readiness.estimatedRateWindows === null
+                          ? 'Runtime will calibrate after the first run'
+                          : `${effectivePacingLabel} pacing with its configured delay between requests`}
+                      />
+                      <ReadinessSignal
+                        label="Start guidance"
+                        value={readiness.currentWindowFits === false
+                          ? '! Reset pause possible'
+                          : readiness.currentWindowFits === true
+                            ? '✔ Fits available allowance'
+                            : 'Allowance unconfirmed'}
+                        detail={readiness.currentWindowFits === false
+                          ? 'GitHub may pause the run until more requests are available'
+                          : readiness.currentWindowFits === true
+                            ? 'The projected requests can start without an allowance reset'
+                            : 'Run once to calibrate'}
+                        caution={readiness.currentWindowFits === false}
+                      />
+                    </div>
+
+                    <div className="border-t border-border bg-surface px-4 py-3">
+                      <p className="text-xs text-text-secondary">{readiness.rationale}</p>
+                      <details className="mt-2">
+                        <summary className="text-[11px] text-accent cursor-pointer">How this recommendation is calculated</summary>
+                        <p className="text-[11px] text-text-muted mt-2 max-w-4xl">
+                          {readiness.estimateSource === 'previous-run'
+                            ? 'Projected requests use the latest completed run plus a 15% growth and pagination buffer.'
+                            : readiness.estimateSource === 'inventory'
+                              ? 'Projected requests use stored organization, repository, and member counts plus a 25% uncertainty buffer.'
+                              : 'No prior request or inventory evidence is available yet.'}
+                          {' '}The recommendation compares that projection with the REST and GraphQL
+                          allowance available after preserving the safety reserve. Your selected profile
+                          controls the delay between requests, while the request governor independently
+                          pauses when GitHub requires a reset wait.
+                        </p>
+                      </details>
+                    </div>
+                  </section>
                 </>
               )}
                   </section>
@@ -1160,7 +1224,8 @@ export default function AssessmentPage() {
                             API request ledger
                           </h3>
                           <p className="text-xs text-text-muted mt-0.5">
-                            Every assessment request passes through the rate-limit safety governor.
+                            Monitor requests sent, remaining allowance, enforced waits, and retries.
+                            Select pacing in Assessment readiness above.
                           </p>
                         </div>
                         <span className={`text-xs font-medium ${assessmentHasActiveRun ? 'text-warning' : 'text-success'}`}>
@@ -2802,6 +2867,7 @@ export default function AssessmentPage() {
                         collectors={snapshot?.collectors ?? []}
                         completedAt={snapshot?.completedAt ?? null}
                         runId={snapshot?.id ?? null}
+                        environment={activeEnv}
                       />
                     ))}
                   </div>
@@ -2891,11 +2957,18 @@ function FindingDrillDown({
   collectors,
   completedAt,
   runId,
+  environment,
 }: {
   finding: AssessmentFinding;
   collectors: AssessmentCollectorResult[];
   completedAt: string | null;
   runId: string | null;
+  environment: {
+    id: string;
+    base_url: string;
+    enterprise_slug: string;
+    org_name: string;
+  } | null;
 }) {
   const domain = ASSESSMENT_DOMAINS.find(candidate => candidate.key === finding.domain);
   const domainStyles = domain ? ASSESSMENT_DOMAIN_STYLES[domain.key] : null;
@@ -3027,7 +3100,7 @@ function FindingDrillDown({
                   Remediation playbook
                 </span>
                 <span className="ml-2 text-[10px] text-text-muted">
-                  Advisory only · {finding.remediation.controlLevel} · {finding.remediation.effort} effort
+                  {finding.remediation.controlLevel} · {finding.remediation.effort} effort
                 </span>
               </summary>
               <div className="border-t border-border px-3 py-3">
@@ -3075,6 +3148,11 @@ function FindingDrillDown({
                     <p className="mt-1 text-xs text-text-secondary">{finding.remediation.verification}</p>
                   </div>
                 </div>
+
+                <AssessmentRemediationPanel
+                  finding={finding}
+                  environment={environment}
+                />
               </div>
             </details>
           )}
@@ -3731,7 +3809,7 @@ function formatCheckpointProgress(
 function formatRateLimitReset(reset: number): string {
   const date = new Date(reset * 1_000);
   return Number.isNaN(date.getTime())
-    ? 'at the next GitHub window'
+    ? 'after GitHub resets the allowance'
     : date.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
 }
 

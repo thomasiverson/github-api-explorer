@@ -10,6 +10,7 @@
  */
 
 import { v4 as uuidv4 } from 'uuid';
+import { findRemediationCatalogGaps } from './assessment-remediation';
 
 export interface OpenApiSpec {
   paths: Record<string, OpenApiPathItem>;
@@ -392,7 +393,7 @@ export async function importOpenApiSpec(
     replaceEndpoints: (specVersion: string, endpoints: ImportedEndpoint[]) => void;
   },
   specVersion = 'api.github.com'
-): Promise<{ count: number; categories: number }> {
+): Promise<{ count: number; categories: number; remediationWarnings: string[] }> {
   console.log(`Fetching OpenAPI spec for ${specVersion}...`);
   const spec = await fetchOpenApiSpec(specVersion);
 
@@ -404,9 +405,19 @@ export async function importOpenApiSpec(
   db.replaceEndpoints(specVersion, endpoints);
 
   const categories = new Set(endpoints.map(e => e.category)).size;
+  const product = specVersion === 'api.github.com' ? 'ghec' : 'ghes';
+  const remediationWarnings = findRemediationCatalogGaps(endpoints, product).map(gap => (
+    `${gap.method} ${gap.path} (${gap.ruleKeys.join(', ')})`
+  ));
   console.log(`Done! Imported ${endpoints.length} endpoints across ${categories} categories.`);
+  if (remediationWarnings.length > 0) {
+    console.warn(
+      `Remediation catalog review required for ${remediationWarnings.length} missing routes:\n`
+      + remediationWarnings.join('\n')
+    );
+  }
 
-  return { count: endpoints.length, categories };
+  return { count: endpoints.length, categories, remediationWarnings };
 }
 
 const CLOUD_SENTINEL_ROUTES = [

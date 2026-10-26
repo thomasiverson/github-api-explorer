@@ -71,7 +71,7 @@ src/
 
 | Command | Purpose |
 |---|---|
-| `npm run dev` | Start dev server (http://localhost:3000) |
+| `npm run dev` | Start dev server (http://localhost:43117) |
 | `npm run build` | Production build |
 | `npm run lint` | ESLint check |
 | `npm test` | Regression tests |

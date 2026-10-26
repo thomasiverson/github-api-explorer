@@ -3,9 +3,9 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "next dev",
+    "dev": "next dev --port 43117",
     "build": "next build",
-    "start": "next start",
+    "start": "next start --port 43117",
     "lint": "eslint",
     "test": "tsx --test tests/**/*.test.ts",
     "import-api": "tsx scripts/import-openapi.ts",

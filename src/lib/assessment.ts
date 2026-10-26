@@ -1369,7 +1369,11 @@ const REMEDIATION_PLAYBOOKS = {
   },
 } satisfies Record<string, AssessmentRemediationPlaybook>;
 
-type AssessmentFindingRuleKey = keyof typeof FINDING_EVIDENCE_DEFINITIONS;
+export type AssessmentFindingRuleKey = keyof typeof FINDING_EVIDENCE_DEFINITIONS;
+
+export const ASSESSMENT_FINDING_RULE_KEYS = Object.freeze(
+  Object.keys(FINDING_EVIDENCE_DEFINITIONS) as AssessmentFindingRuleKey[]
+);
 
 const FINDING_REMEDIATION_PLAYBOOKS = {
   'enterprise-owner-inventory-empty': REMEDIATION_PLAYBOOKS.enterpriseOwners,

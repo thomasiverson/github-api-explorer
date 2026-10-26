@@ -8,22 +8,69 @@ import { RequestBuilder } from '@/components/RequestBuilder';
 import { ResponseViewer } from '@/components/ResponseViewer';
 import { ResizablePanels } from '@/components/ResizablePanels';
 import { useApp } from '@/components/AppContext';
+import {
+  getAssessmentRemediationDefinition,
+  parseRemediationHandoff,
+} from '@/lib/assessment-remediation';
 import type { HttpMethod } from '@/lib/types';
 
-function ReplayHandler() {
+function RequestHandoffHandler() {
   const { selectEndpoint, setResponse } = useApp();
   const searchParams = useSearchParams();
 
   useEffect(() => {
     const replayId = searchParams.get('replay');
-    if (!replayId) return;
+    const remediation = searchParams.get('remediation');
+    if (!replayId && !remediation) return;
 
-    (async () => {
+    if (remediation) {
+      const parsed = parseRemediationHandoff(remediation);
+      if (parsed.ok) {
+        const definition = getAssessmentRemediationDefinition(parsed.value.ruleKey);
+        selectEndpoint({
+          operationId: '',
+          category: 'Assessment remediation',
+          method: parsed.value.method,
+          path: parsed.value.path,
+          summary: parsed.value.label,
+          description: definition?.rationale ?? '',
+          specVersion: definition?.apiVersion ?? '',
+          pathParams: extractPathParams(parsed.value.path),
+          queryParams: [],
+          bodySchema: null,
+          initialPathValues: parsed.value.pathValues,
+          initialBody: parsed.value.body === undefined
+            ? undefined
+            : JSON.stringify(parsed.value.body, null, 2),
+          remediationContext: {
+            ruleKey: parsed.value.ruleKey,
+            targetLabel: parsed.value.label,
+            previewOnly: definition?.previewRecipe?.execution === 'preview-only',
+            batchAllowed: definition?.previewRecipe?.batchAllowed ?? false,
+          },
+        });
+        setResponse(null);
+      } else {
+        setResponse({
+          status: 400,
+          statusText: 'Invalid remediation handoff',
+          headers: {},
+          body: { error: parsed.error },
+          timing: 0,
+          rateLimit: null,
+          nextPageUrl: null,
+        });
+      }
+      window.history.replaceState({}, '', '/');
+      return;
+    }
+
+    if (!replayId) return;
+    void (async () => {
       const res = await fetch(`/api/history?id=${encodeURIComponent(replayId)}`);
       const entry = await res.json();
       if (!entry) return;
 
-      // Extract param values from the resolved URL
       const pathParamDefs = extractPathParams(entry.path);
       const pathValues = extractPathValues(entry.path, entry.resolved_url);
       const queryValues = extractQueryValues(entry.resolved_url);
@@ -73,7 +120,7 @@ export default function Home() {
 
   return (
     <div className="h-full flex flex-col">
-      <Suspense fallback={null}><ReplayHandler /></Suspense>
+      <Suspense fallback={null}><RequestHandoffHandler /></Suspense>
       <TopBar />
       <ResizablePanels
         left={<Sidebar />}

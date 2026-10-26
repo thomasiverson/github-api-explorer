@@ -250,12 +250,12 @@ function describeRecommendation(
     ? 'The estimate includes a 15% buffer over the latest completed run.'
     : 'The estimate includes a 25% buffer over the stored inventory model.';
   const profileText = profile === 'immediate'
-    ? 'The projected load is below 25% of one usable rate window.'
+    ? 'Projected API demand is low, so no intentional delay is needed.'
     : profile === 'measured'
-      ? 'The projected load uses 25–75% of one usable rate window.'
+      ? 'Projected API demand is moderate, so requests should be spaced out.'
       : profile === 'overnight'
-        ? 'The projected load may span up to two usable rate windows.'
-        : 'The projected load exceeds two usable rate windows.';
+        ? 'Projected API demand is high, so the assessment should run unattended with slower pacing.'
+        : 'Projected API demand is very high, so the slowest pacing is recommended.';
   const fitText = currentWindowFits === false
     ? ' Current allowance is lower than the projection, so the governor may pause for reset.'
     : '';

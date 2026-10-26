@@ -47,7 +47,10 @@ export default function SettingsPage() {
         throw new Error(data.error || `Import failed with HTTP ${res.status}`);
       }
       await loadVersions();
-      setImportStatus(`Imported ${version} successfully (${data.count} endpoints)`);
+      const remediationNote = data.remediationWarnings?.length
+        ? `; ${data.remediationWarnings.length} remediation targets need review`
+        : '';
+      setImportStatus(`Imported ${version} successfully (${data.count} endpoints${remediationNote})`);
     } catch (err) {
       setImportStatus(`Import failed: ${err instanceof Error ? err.message : 'Unknown error'}`);
     }
@@ -160,7 +163,12 @@ export default function SettingsPage() {
       if (data.error) {
         setImportStatus(`Error: ${data.error}`);
       } else {
-        setImportStatus(`Imported ${data.count} endpoints across ${data.categories} categories (${data.total} total)`);
+        const remediationNote = data.remediationWarnings?.length
+          ? `; ${data.remediationWarnings.length} remediation targets need review`
+          : '';
+        setImportStatus(
+          `Imported ${data.count} endpoints across ${data.categories} categories (${data.total} total${remediationNote})`
+        );
       }
     } catch (err: unknown) {
       setImportStatus(`Failed: ${err instanceof Error ? err.message : 'Unknown error'}`);

@@ -18,6 +18,12 @@ interface EndpointSelection {
   initialPathValues?: Record<string, string>;
   initialQueryValues?: Record<string, string>;
   initialBody?: string;
+  remediationContext?: {
+    ruleKey: string;
+    targetLabel: string;
+    previewOnly: boolean;
+    batchAllowed: boolean;
+  };
 }
 
 type ResponseData = ExecuteResponse;
